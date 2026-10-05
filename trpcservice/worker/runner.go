@@ -21,6 +21,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/preprocess"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/profile"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/inflight"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/artifact"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
@@ -78,6 +79,9 @@ type RunnerExecutor struct {
 	ConfirmationTTL   time.Duration
 	EventDrainTimeout time.Duration
 	Telemetry         telemetry.Provider
+	// Barrier is an opt-in fault-injection seam used by takeover acceptance
+	// tests. A nil barrier leaves production execution unchanged.
+	Barrier inflight.Barrier
 }
 
 func (w RunnerExecutor) Execute(ctx context.Context, envelope runtime.ExecutionEnvelope) error {
@@ -624,6 +628,11 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	resultDigest := sha256.Sum256(outbound.Content)
 	if err := resultStore.PutResult(ctx, messaging.ResultRecord{TenantID: envelope.TenantID, RequestID: envelope.RequestID, ResultRef: resultRef, ContentDigest: hex.EncodeToString(resultDigest[:]), Content: outbound.Content, ContentType: outbound.ContentType, KeyVersion: payload.KeyVersion}); err != nil {
 		return err
+	}
+	if w.Barrier != nil {
+		if err := w.Barrier.Wait(ctx, inflight.PointP2BeforeTerminalCommit); err != nil {
+			return err
+		}
 	}
 	if beforeCommit != nil {
 		if err := beforeCommit(ctx); err != nil {
