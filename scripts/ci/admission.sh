@@ -4,8 +4,8 @@
 set -euo pipefail
 
 case "${1:-}" in
-  ""|--race|--demo) ;;
-  *) echo "usage: $0 [--race|--demo]" >&2; exit 2 ;;
+  ""|--race) ;;
+  *) echo "usage: $0 [--race]" >&2; exit 2 ;;
 esac
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -63,8 +63,3 @@ go build ./...
 go vet ./...
 go test -count=1 ./...
 git diff --check
-
-if [[ "${1:-}" == "--demo" ]]; then
-  echo "Running credential-free final acceptance path"
-  bash scripts/compose/quickstart.sh --demo
-fi

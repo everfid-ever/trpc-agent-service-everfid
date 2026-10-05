@@ -86,7 +86,7 @@ Demo acceptance complete
   Schema: empty database applied the consolidated migration 000001
   Chat: /v1/chat returned the deterministic fake response
   Stream: /v1/chat emitted the deterministic fake delta sequence over SSE
-  Coverage: docs/runbook/demo-fake-coverage.md
+  Scope: docs/feature/reliability-failover/README.md
   Stop: docker rm -f ${demo_container} && docker compose -p ${demo_project} -f deploy/compose/docker-compose.backend-smoke.yml down -v
 EOF
 }
