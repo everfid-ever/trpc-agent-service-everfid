@@ -617,6 +617,11 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	if err != nil {
 		return fmt.Errorf("render outbound result: %w", err)
 	}
+	if w.Barrier != nil {
+		if err := w.Barrier.Wait(ctx, inflight.PointP2BeforeTerminalCommit); err != nil {
+			return err
+		}
+	}
 	resultRef, err := encodeResultRef(ctx, w.EncodeResult, envelope, string(outbound.Content))
 	if err != nil {
 		return err
@@ -628,11 +633,6 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	resultDigest := sha256.Sum256(outbound.Content)
 	if err := resultStore.PutResult(ctx, messaging.ResultRecord{TenantID: envelope.TenantID, RequestID: envelope.RequestID, ResultRef: resultRef, ContentDigest: hex.EncodeToString(resultDigest[:]), Content: outbound.Content, ContentType: outbound.ContentType, KeyVersion: payload.KeyVersion}); err != nil {
 		return err
-	}
-	if w.Barrier != nil {
-		if err := w.Barrier.Wait(ctx, inflight.PointP2BeforeTerminalCommit); err != nil {
-			return err
-		}
 	}
 	if beforeCommit != nil {
 		if err := beforeCommit(ctx); err != nil {

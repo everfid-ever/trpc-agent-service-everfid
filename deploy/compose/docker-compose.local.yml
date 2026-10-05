@@ -328,6 +328,7 @@ services:
       TRPC_LISTEN_ADDRESS: ":8080"
       TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
       TRPC_WEBUI_LOCAL_INSTANCE_ID: node-a
+      TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED: "true"
       TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
       TRPC_OTEL_ENDPOINT: http://otel-collector:4318
       TRPC_OTEL_ALLOW_INSECURE: "true"
@@ -362,6 +363,7 @@ services:
       TRPC_LISTEN_ADDRESS: ":8080"
       TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
       TRPC_WEBUI_LOCAL_INSTANCE_ID: node-b
+      TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED: "true"
       TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
       TRPC_OTEL_ENDPOINT: http://otel-collector:4318
       TRPC_OTEL_ALLOW_INSECURE: "true"

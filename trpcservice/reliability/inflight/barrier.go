@@ -8,10 +8,10 @@ import (
 )
 
 // Point identifies a durable-work boundary. P2 is intentionally after model
-// execution and result persistence, but before the fenced terminal commit.
+// and tool execution but before terminal result persistence and commit.
 type Point string
 
-const PointP2BeforeTerminalCommit Point = "p2_before_terminal_commit"
+const PointP2BeforeTerminalCommit Point = "p2_executed_before_commit"
 
 // Barrier is injected only by test compositions. Production callers may keep
 // it nil, which has no effect on execution.
@@ -20,10 +20,10 @@ type Barrier interface {
 }
 
 type Snapshot struct {
-	Point    Point
-	Armed    bool
-	Hit      bool
-	Released bool
+	Point    Point `json:"point"`
+	Armed    bool  `json:"armed"`
+	Hit      bool  `json:"hit"`
+	Released bool  `json:"released"`
 }
 
 type gate struct {
@@ -45,6 +45,15 @@ func (c *Controller) Arm(point Point) <-chan struct{} {
 	defer c.mu.Unlock()
 	if c.gates == nil {
 		c.gates = make(map[Point]*gate)
+	}
+	if existing := c.gates[point]; existing != nil {
+		select {
+		case <-existing.release:
+			// A released run is complete and may be armed again.
+		default:
+			// Do not strand a worker already waiting at this point.
+			return existing.hit
+		}
 	}
 	g := &gate{hit: make(chan struct{}), release: make(chan struct{})}
 	c.gates[point] = g

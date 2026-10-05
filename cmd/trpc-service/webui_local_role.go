@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -67,6 +68,7 @@ import (
 	providerpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/provider/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/relay"
 	relayredis "github.com/liuzengh/trpc-agent-service/trpcservice/relay/redis"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/inflight"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/secrets"
 	secretfs "github.com/liuzengh/trpc-agent-service/trpcservice/secrets/filesystem"
@@ -125,6 +127,7 @@ type webUILocalConfig struct {
 	RedisEnvironment, SecretRoot, APIKeyFile, SkillStagingRoot, QdrantEndpoint string
 	RouteKey, Token, InstanceID, ClamAVAddress                                 string
 	ExclusiveRuntime                                                           bool
+	FailoverTestEnabled                                                        bool
 	FeishuEnabled                                                              bool
 	FeishuAppID, FeishuAppSecret                                               string
 	FeishuVerificationToken, FeishuEncryptKey, FeishuBotOpenID                 string
@@ -327,12 +330,16 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		return &serviceagent.Bundle{AppName: snapshot.AppName, Root: root, Memory: memoryService, Artifact: artifactService, Plugins: plugins}, closeServices, nil
 	})
 	defer bundles.Close(context.Background())
+	var failoverBarrier *inflight.Controller
+	if configValue.FailoverTestEnabled {
+		failoverBarrier = &inflight.Controller{}
+	}
 	executor := worker.RunnerExecutor{Tasks: tasks, Profiles: profiles, Bundles: bundles,
 		Sessions: sessionpostgres.NewWithTelemetry(db, telemetryProvider), SDKSessions: sdkSessions, Payloads: payloads, Artifacts: artifacts,
 		Inputs: worker.JSONTextInputDecoder{}, EventDrainTimeout: 30 * time.Second,
 		Progress:   progressPublisher,
 		Governance: governance.Service{Repository: governanceStore, Ledger: governanceStore, Decisions: governanceStore}, Confirmations: governanceStore,
-		ContinuationTools: agentFactory, Telemetry: telemetryProvider}
+		ContinuationTools: agentFactory, Telemetry: telemetryProvider, Barrier: failoverBarrier}
 	workerConsumer := worker.Consumer{WorkerID: configValue.instanceName("worker"), Shards: []broker.Shard{0, 1, 2, 3}, Broker: streamBroker,
 		Leases: leases, Sessions: sessionpostgres.NewWithTelemetry(db, telemetryProvider), Parker: tasks, Statuses: tasks, Executor: executor,
 		LeaseTTL: 30 * time.Second, RenewInterval: 10 * time.Second, RetryWait: 250 * time.Millisecond,
@@ -402,6 +409,9 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		}
 		writer.WriteHeader(http.StatusOK)
 	})
+	if failoverBarrier != nil {
+		registerWebUILocalFailoverTestEndpoints(mux, configValue.Token, failoverBarrier)
+	}
 	server := &http.Server{Addr: configValue.ListenAddress, Handler: mux, ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 
@@ -526,6 +536,7 @@ func loadWebUILocalConfig(getenv func(string) string) (webUILocalConfig, error) 
 		InstanceID:              valueOr(getenv("TRPC_WEBUI_LOCAL_INSTANCE_ID"), "standalone"),
 		ClamAVAddress:           valueOr(getenv("TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS"), "clamav:3310"),
 		ExclusiveRuntime:        strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_EXCLUSIVE_RUNTIME")), "true"),
+		FailoverTestEnabled:     strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED")), "true"),
 		FeishuEnabled:           strings.EqualFold(strings.TrimSpace(getenv("TRPC_FEISHU_LOCAL_ENABLED")), "true"),
 		FeishuAppID:             strings.TrimSpace(getenv("FEISHU_APP_ID")),
 		FeishuAppSecret:         strings.TrimSpace(getenv("FEISHU_APP_SECRET")),
@@ -575,6 +586,64 @@ func validWebUILocalInstanceID(value string) bool {
 
 func (value webUILocalConfig) instanceName(component string) string {
 	return "webui-local-" + component + "-" + value.InstanceID
+}
+
+// registerWebUILocalFailoverTestEndpoints exposes an opt-in control plane for
+// the Compose takeover checks. Callers must not register it in normal local or
+// production roles: its only purpose is to hold a worker at P2 so SIGKILL can
+// exercise durable recovery after model/tool execution and before final result
+// persistence and commit.
+func registerWebUILocalFailoverTestEndpoints(mux *http.ServeMux, token string, barrier *inflight.Controller) {
+	if mux == nil || barrier == nil {
+		return
+	}
+	authorized := func(request *http.Request) bool {
+		provided := request.Header.Get("X-TRPC-Local-Token")
+		return subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
+	}
+	writeSnapshot := func(writer http.ResponseWriter, snapshot inflight.Snapshot) {
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(snapshot)
+	}
+	serve := func(writer http.ResponseWriter, request *http.Request, action func() inflight.Snapshot) {
+		if !authorized(request) {
+			http.Error(writer, "forbidden", http.StatusForbidden)
+			return
+		}
+		writeSnapshot(writer, action())
+	}
+	mux.HandleFunc("/test/failover/p2/arm", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			writer.Header().Set("Allow", http.MethodPost)
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		serve(writer, request, func() inflight.Snapshot {
+			barrier.Arm(inflight.PointP2BeforeTerminalCommit)
+			return barrier.Snapshot(inflight.PointP2BeforeTerminalCommit)
+		})
+	})
+	mux.HandleFunc("/test/failover/p2/status", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			writer.Header().Set("Allow", http.MethodGet)
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		serve(writer, request, func() inflight.Snapshot {
+			return barrier.Snapshot(inflight.PointP2BeforeTerminalCommit)
+		})
+	})
+	mux.HandleFunc("/test/failover/p2/release", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			writer.Header().Set("Allow", http.MethodPost)
+			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		serve(writer, request, func() inflight.Snapshot {
+			barrier.Release(inflight.PointP2BeforeTerminalCommit)
+			return barrier.Snapshot(inflight.PointP2BeforeTerminalCommit)
+		})
+	})
 }
 
 // acquireWebUILocalRuntimeLock prevents the standalone local compositions

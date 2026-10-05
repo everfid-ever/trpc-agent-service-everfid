@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,6 +17,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	governancememory "github.com/liuzengh/trpc-agent-service/trpcservice/governance/inmemory"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/migration/knowledgedriver"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/inflight"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/secrets"
 	secretfs "github.com/liuzengh/trpc-agent-service/trpcservice/secrets/filesystem"
 	serviceknowledge "github.com/liuzengh/trpc-agent-service/trpcservice/storage/knowledge"
@@ -48,7 +51,7 @@ func TestLoadWebUILocalConfigDefaultsAndRejectsUnsafeInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	if value.ListenAddress != ":8080" || value.RouteKey != webUILocalRouteKey || value.Token != webUILocalToken || value.InstanceID != "standalone" ||
-		value.APIKeyFile != "/run/secrets/deepseek_api_key" || value.ExclusiveRuntime {
+		value.APIKeyFile != "/run/secrets/deepseek_api_key" || value.ExclusiveRuntime || value.FailoverTestEnabled {
 		t.Fatalf("unexpected defaults: %+v", value)
 	}
 	exclusive := cloneEnvironment(base)
@@ -56,6 +59,12 @@ func TestLoadWebUILocalConfigDefaultsAndRejectsUnsafeInput(t *testing.T) {
 	configured, err := loadWebUILocalConfig(mapEnvironment(exclusive))
 	if err != nil || !configured.ExclusiveRuntime {
 		t.Fatalf("exclusive config=%+v err=%v", configured, err)
+	}
+	failover := cloneEnvironment(base)
+	failover["TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED"] = "true"
+	configured, err = loadWebUILocalConfig(mapEnvironment(failover))
+	if err != nil || !configured.FailoverTestEnabled {
+		t.Fatalf("failover config=%+v err=%v", configured, err)
 	}
 	for _, item := range []struct{ name, value string }{
 		{"TRPC_WEBUI_LOCAL_TOKEN", "short"},
@@ -106,6 +115,50 @@ func TestLoadWebUILocalConfigDefaultsAndRejectsUnsafeInput(t *testing.T) {
 	configured, err = loadWebUILocalConfig(mapEnvironment(wecom))
 	if err != nil || !configured.WeComEnabled || configured.WeComCorpID != "ww_local" || configured.WeComAgentID != 1000002 {
 		t.Fatalf("configured=%+v err=%v", configured, err)
+	}
+}
+
+func TestWebUILocalFailoverTestEndpointsRequireTokenAndControlP2(t *testing.T) {
+	mux := http.NewServeMux()
+	barrier := &inflight.Controller{}
+	registerWebUILocalFailoverTestEndpoints(mux, "test-token-which-is-long", barrier)
+
+	request := httptest.NewRequest(http.MethodPost, "/test/failover/p2/arm", nil)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("unauthenticated arm status=%d", response.Code)
+	}
+	request = httptest.NewRequest(http.MethodPost, "/test/failover/p2/arm", nil)
+	request.Header.Set("X-TRPC-Local-Token", "test-token-which-is-long")
+	response = httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !barrier.Snapshot(inflight.PointP2BeforeTerminalCommit).Armed {
+		t.Fatalf("arm status=%d snapshot=%+v", response.Code, barrier.Snapshot(inflight.PointP2BeforeTerminalCommit))
+	}
+
+	blocked := make(chan error, 1)
+	go func() { blocked <- barrier.Wait(context.Background(), inflight.PointP2BeforeTerminalCommit) }()
+	for deadline := time.Now().Add(time.Second); !barrier.Snapshot(inflight.PointP2BeforeTerminalCommit).Hit; {
+		if time.Now().After(deadline) {
+			t.Fatal("P2 barrier was not hit")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	request = httptest.NewRequest(http.MethodPost, "/test/failover/p2/release", nil)
+	request.Header.Set("X-TRPC-Local-Token", "test-token-which-is-long")
+	response = httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("release status=%d", response.Code)
+	}
+	select {
+	case err := <-blocked:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("P2 barrier was not released")
 	}
 }
 
