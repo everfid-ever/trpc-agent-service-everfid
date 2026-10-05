@@ -110,6 +110,7 @@ go run ./cmd/local-webui-load \
 bash scripts/ci/admission.sh
 bash scripts/e2e/backend-adapter.sh
 bash scripts/e2e/dependency-recovery.sh
+bash scripts/e2e/node-takeover.sh
 ```
 
 随后按 getting-started 的步骤串行完成 WebUI、Feishu 与 WeCom 的 real-account smoke。每次只启动一个 standalone IM profile。

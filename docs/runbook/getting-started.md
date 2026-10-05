@@ -56,6 +56,7 @@ DeepSeek 是唯一默认启用的外部调用。API Key 只用于本机容器中
    bash scripts/ci/admission.sh
    bash scripts/e2e/backend-adapter.sh
    bash scripts/e2e/dependency-recovery.sh
+   bash scripts/e2e/node-takeover.sh
    ```
 
 6. 只有需要真实 IM 验收时，才停止 WebUI standalone runtime，改按第 4 节或第 5 节配置飞书/企业微信。每种 IM 都必须使用开发者自己的应用凭据和新的临时 HTTPS tunnel；Quick Tunnel 重启会更换域名，因此需把新的完整回调 URL 重新保存到平台后台。

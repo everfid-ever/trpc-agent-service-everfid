@@ -34,6 +34,7 @@
 | 渠道真机联调 | [channel-live-validation.md](channel-live-validation.md) | 对应渠道的真实凭据与回调/接收模式 | request ID、回复消息 ID 与 terminal audit ID 的真实往返 | 人工发布门禁 | 否 | 需人工 |
 | CodeExec Worker | `docker compose -f deploy/compose/docker-compose.local.yml --profile codeexec up worker-codeexec` | Docker Desktop、`.env.local` 中经 digest 审核的 `TRPC_CODE_EXECUTORS` | 专用 image、bubblewrap、私有 workspace；ToolRef 与治理许可齐备 | 本地 | 本地 | 需人工 |
 | 依赖短断恢复 | `bash scripts/e2e/dependency-recovery.sh` | Docker Desktop、DeepSeek Key | PostgreSQL/Redis 中断期间节点 unready，恢复后无需重启重新 ready | 本地 + 真实模型 | 本地 | 需人工 |
+| 双节点非优雅终止接管 | `bash scripts/e2e/node-takeover.sh` | Docker Desktop、DeepSeek Key | 经 node-a/node-b 任一节点接收的消息，在该节点被 `SIGKILL` 后由另一节点完成一次 durable reply；节点重加后反向故障同样通过 | 本地 + 真实模型 | 本地 | 需人工 |
 | Feishu 文本/群聊 | 依据 [getting-started.md](getting-started.md) 第 3 节启动 `feishu-local` 并配置 tunnel | DeepSeek Key、`feishu.env`、Feishu 应用、临时 HTTPS URL | callback 验签成功；私聊收到回复；群聊仅 @ 机器人时处理 | 真实外部 | 否 | 需人工 |
 | Feishu 图片 | 在同一 Feishu p2p 会话发送一张新的 JPEG/PNG/GIF/WebP（≤10 MiB） | 同上、ClamAV healthy、视觉模型 | 回复基于图片内容；日志显示媒体下载、扫描和 prepared input | 真实外部 | 否 | 需人工 |
 | WeCom 文本/图片 | 依据 [getting-started.md](getting-started.md) 第 4 节启动 `wecom-local` 并配置 tunnel | DeepSeek Key、`wecom.env`、WeCom 自建应用、临时 HTTPS URL | callback URL 验证成功，消息收到官方 Reply API 回复；图片经扫描后进入视觉模型 | 真实外部 | 否 | 需人工 |

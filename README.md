@@ -76,6 +76,7 @@ cp deploy/compose/.env.local.example deploy/compose/.env.local
 | 飞书单聊、群聊、图片 | DeepSeek Key、secrets/feishu.env、临时公网 HTTPS tunnel | docker compose -f deploy/compose/docker-compose.local.yml --profile feishu-local up -d --build |
 | 企业微信回调与回复 | DeepSeek Key、secrets/wecom.env、临时公网 HTTPS tunnel | docker compose -f deploy/compose/docker-compose.local.yml --profile wecom-local up -d --build |
 | PostgreSQL/Redis 短断恢复 | DeepSeek Key | bash scripts/e2e/dependency-recovery.sh |
+| 双节点非优雅终止接管 | DeepSeek Key | bash scripts/e2e/node-takeover.sh |
 | PostgreSQL、Redis、Qdrant、Vault adapter | Docker Desktop | bash scripts/e2e/backend-adapter.sh |
 
 完整的密钥文件格式、飞书/企业微信回调地址、群聊验证、媒体限制和排障步骤见 [本地运行手册](docs/runbook/getting-started.md)。
@@ -99,6 +100,9 @@ bash scripts/e2e/backend-adapter.sh
 
 # PostgreSQL / Redis 短断后无需重启的恢复能力
 bash scripts/e2e/dependency-recovery.sh
+
+# WebUI 双节点在任一节点被非优雅终止后的双向接管能力
+bash scripts/e2e/node-takeover.sh
 ```
 
 真实 IM 和模型调用只在开发者显式提供本机密钥后运行；测试密钥、图片和回调内容不得提交至仓库。每项验证的成功证据与资源边界见 [可靠性、发布与容量手册](docs/runbook/reliability-release-capacity.md)。
