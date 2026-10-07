@@ -122,6 +122,22 @@ func TestLoadWebUILocalConfigDefaultsAndRejectsUnsafeInput(t *testing.T) {
 	if err != nil || !configured.WeComEnabled || configured.WeComCorpID != "ww_local" || configured.WeComAgentID != 1000002 {
 		t.Fatalf("configured=%+v err=%v", configured, err)
 	}
+	secondary := cloneEnvironment(wecom)
+	secondary["TRPC_WECOM_SECONDARY_LOCAL_ENABLED"] = "true"
+	secondary["WECOM_SECONDARY_CORP_ID"] = "ww_secondary"
+	secondary["WECOM_SECONDARY_APP_SECRET"] = "secondary-corp-secret"
+	secondary["WECOM_SECONDARY_CALLBACK_TOKEN"] = "secondary-callback-token"
+	secondary["WECOM_SECONDARY_ENCODING_AES_KEY"] = "secondary-encoding-aes-key"
+	secondary["WECOM_SECONDARY_AGENT_ID"] = "1000003"
+	configured, err = loadWebUILocalConfig(mapEnvironment(secondary))
+	if err != nil || !configured.WeComSecondaryEnabled || configured.WeComSecondaryCorpID != "ww_secondary" || configured.WeComSecondaryAgentID != 1000003 {
+		t.Fatalf("secondary configured=%+v err=%v", configured, err)
+	}
+	secondary["WECOM_SECONDARY_CORP_ID"] = wecom["WECOM_CORP_ID"]
+	secondary["WECOM_SECONDARY_AGENT_ID"] = wecom["WECOM_AGENT_ID"]
+	if _, err := loadWebUILocalConfig(mapEnvironment(secondary)); err == nil {
+		t.Fatal("secondary WeCom accepted the primary Corp/Agent tuple")
+	}
 }
 
 func TestWebUILocalProcessStartIDIsFreshHex(t *testing.T) {
@@ -351,10 +367,27 @@ func TestEnsureWebUILocalToolControlPlaneUpgradesOnce(t *testing.T) {
 	if err != nil || snapshot.ConfigVersion != wecomConfigVersion || root.Version != wecomTenantVersion {
 		t.Fatalf("non-idempotent WeCom binding root=%#v snapshot=%#v err=%v", root, snapshot, err)
 	}
+	secondaryWeCom := wecom
+	secondaryWeCom.WeComSecondaryEnabled = true
+	secondaryWeCom.WeComSecondaryCorpID = "ww_secondary"
+	secondaryWeCom.WeComSecondaryAppSecret = "wecom-secondary-corp-secret"
+	secondaryWeCom.WeComSecondaryCallbackToken = "wecom-secondary-callback-token"
+	secondaryWeCom.WeComSecondaryEncodingAESKey = "wecom-secondary-encoding-aes-key"
+	secondaryWeCom.WeComSecondaryAgentID = 1000003
+	root, snapshot, err = ensureWebUILocalWeComSecondaryBinding(ctx, configs, root, snapshot, secondaryWeCom)
+	if err != nil || len(snapshot.Payload.ChannelBindings) != 3 || snapshot.Payload.ChannelBindings[2].BindingID != wecomSecondaryBindingID ||
+		snapshot.Payload.ChannelBindings[2].ExternalAccountID != secondaryWeCom.WeComSecondaryCorpID {
+		t.Fatalf("secondary WeCom binding snapshot=%#v err=%v", snapshot, err)
+	}
+	secondaryConfigVersion, secondaryTenantVersion := snapshot.ConfigVersion, root.Version
+	root, snapshot, err = ensureWebUILocalWeComSecondaryBinding(ctx, configs, root, snapshot, secondaryWeCom)
+	if err != nil || snapshot.ConfigVersion != secondaryConfigVersion || root.Version != secondaryTenantVersion {
+		t.Fatalf("non-idempotent secondary WeCom binding root=%#v snapshot=%#v err=%v", root, snapshot, err)
+	}
 	wecomRotated := wecom
 	wecomRotated.WeComCorpID = "ww_rotated"
 	root, snapshot, err = ensureWebUILocalWeComBinding(ctx, configs, root, snapshot, wecomRotated)
-	if err != nil || snapshot.ConfigVersion != wecomConfigVersion+1 || root.Version != wecomTenantVersion+1 ||
+	if err != nil || snapshot.ConfigVersion != secondaryConfigVersion+1 || root.Version != secondaryTenantVersion+1 ||
 		snapshot.Payload.ChannelBindings[1].ExternalAccountID != wecomRotated.WeComCorpID {
 		t.Fatalf("rotated WeCom binding root=%#v snapshot=%#v err=%v", root, snapshot, err)
 	}

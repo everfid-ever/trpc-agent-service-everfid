@@ -400,6 +400,7 @@ services:
       TRPC_REDIS_ADDRESS: redis:6379
       TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-bootstrap
       TRPC_WECOM_LOCAL_ENABLED: "true"
+      TRPC_WECOM_SECONDARY_LOCAL_ENABLED: "true"
       TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
       TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
     secrets:
@@ -436,6 +437,7 @@ services:
       TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-node-a
       TRPC_WEBUI_LOCAL_STATUS_ENABLED: "true"
       TRPC_WECOM_LOCAL_ENABLED: "true"
+      TRPC_WECOM_SECONDARY_LOCAL_ENABLED: "true"
       TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
       TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
       TRPC_OTEL_ENDPOINT: http://otel-collector:4318
@@ -475,6 +477,7 @@ services:
       TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-node-b
       TRPC_WEBUI_LOCAL_STATUS_ENABLED: "true"
       TRPC_WECOM_LOCAL_ENABLED: "true"
+      TRPC_WECOM_SECONDARY_LOCAL_ENABLED: "true"
       TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
       TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
       TRPC_OTEL_ENDPOINT: http://otel-collector:4318

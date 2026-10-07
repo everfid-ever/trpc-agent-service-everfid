@@ -119,6 +119,8 @@ const (
 	feishuLocalRouteKey        = "local-feishu"
 	wecomLocalBindingID        = "local-wecom"
 	wecomLocalRouteKey         = "local-wecom"
+	wecomSecondaryBindingID    = "local-wecom-secondary"
+	wecomSecondaryRouteKey     = "local-wecom-secondary"
 	payloadKeyRef              = "secret://local/payload-key"
 	webUILocalInstruction      = "You are a concise and helpful assistant. When the user asks to create, save, or record a note, call webui_create_note. Never claim that a note was created before the tool result is available. When an image content part is present, it was securely attached to this request: analyze its visible content directly and do not claim that the image or attachment was unavailable."
 )
@@ -137,18 +139,23 @@ type webUILocalConfig struct {
 	WeComCorpID, WeComAppSecret                                                string
 	WeComCallbackToken, WeComEncodingAESKey                                    string
 	WeComAgentID                                                               int64
+	WeComSecondaryEnabled                                                      bool
+	WeComSecondaryCorpID, WeComSecondaryAppSecret                              string
+	WeComSecondaryCallbackToken, WeComSecondaryEncodingAESKey                  string
+	WeComSecondaryAgentID                                                      int64
 }
 
 type webUILocalBootstrap struct {
-	Tenant       tenant.Tenant
-	Config       configdomain.Snapshot
-	Route        ingress.BindingRoute
-	FeishuRoute  ingress.BindingRoute
-	WeComRoute   ingress.BindingRoute
-	SecretRoot   string
-	PayloadKey   *payloadkey.Resolver
-	SecretStore  *secretfs.Provider
-	ProviderRepo *providerpostgres.Repository
+	Tenant              tenant.Tenant
+	Config              configdomain.Snapshot
+	Route               ingress.BindingRoute
+	FeishuRoute         ingress.BindingRoute
+	WeComRoute          ingress.BindingRoute
+	WeComSecondaryRoute ingress.BindingRoute
+	SecretRoot          string
+	PayloadKey          *payloadkey.Resolver
+	SecretStore         *secretfs.Provider
+	ProviderRepo        *providerpostgres.Repository
 }
 
 func runWebUILocalRole(parent context.Context, getenv func(string) string, logger *roleLogger) error {
@@ -541,29 +548,34 @@ func runWebUILocalBootstrap(parent context.Context, getenv func(string) string, 
 func loadWebUILocalConfig(getenv func(string) string) (webUILocalConfig, error) {
 	value := webUILocalConfig{PostgresDSN: strings.TrimSpace(getenv("TRPC_POSTGRES_DSN")),
 		RedisAddress: strings.TrimSpace(getenv("TRPC_REDIS_ADDRESS")), ListenAddress: valueOr(getenv("TRPC_LISTEN_ADDRESS"), ":8080"),
-		RedisEnvironment:        valueOr(getenv("TRPC_REDIS_ENVIRONMENT"), "local-runtime"),
-		SecretRoot:              valueOr(getenv("TRPC_WEBUI_LOCAL_SECRET_ROOT"), "/tmp/trpc-webui-secrets"),
-		SkillStagingRoot:        valueOr(getenv("TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT"), "/tmp/trpc-webui-skills"),
-		QdrantEndpoint:          valueOr(getenv("TRPC_WEBUI_LOCAL_QDRANT_ENDPOINT"), "http://qdrant:6333"),
-		APIKeyFile:              valueOr(getenv("TRPC_WEBUI_DEEPSEEK_KEY_FILE"), "/run/secrets/deepseek_api_key"),
-		RouteKey:                valueOr(getenv("TRPC_WEBUI_LOCAL_ROUTE_KEY"), webUILocalRouteKey),
-		Token:                   valueOr(getenv("TRPC_WEBUI_LOCAL_TOKEN"), webUILocalToken),
-		InstanceID:              valueOr(getenv("TRPC_WEBUI_LOCAL_INSTANCE_ID"), "standalone"),
-		ClamAVAddress:           valueOr(getenv("TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS"), "clamav:3310"),
-		ExclusiveRuntime:        strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_EXCLUSIVE_RUNTIME")), "true"),
-		FailoverTestEnabled:     strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED")), "true"),
-		StatusEnabled:           strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_STATUS_ENABLED")), "true"),
-		FeishuEnabled:           strings.EqualFold(strings.TrimSpace(getenv("TRPC_FEISHU_LOCAL_ENABLED")), "true"),
-		FeishuAppID:             strings.TrimSpace(getenv("FEISHU_APP_ID")),
-		FeishuAppSecret:         strings.TrimSpace(getenv("FEISHU_APP_SECRET")),
-		FeishuVerificationToken: strings.TrimSpace(getenv("FEISHU_VERIFICATION_TOKEN")),
-		FeishuEncryptKey:        strings.TrimSpace(getenv("FEISHU_ENCRYPT_KEY")),
-		FeishuBotOpenID:         strings.TrimSpace(getenv("FEISHU_BOT_OPEN_ID")),
-		WeComEnabled:            strings.EqualFold(strings.TrimSpace(getenv("TRPC_WECOM_LOCAL_ENABLED")), "true"),
-		WeComCorpID:             strings.TrimSpace(getenv("WECOM_CORP_ID")),
-		WeComAppSecret:          strings.TrimSpace(getenv("WECOM_APP_SECRET")),
-		WeComCallbackToken:      strings.TrimSpace(getenv("WECOM_CALLBACK_TOKEN")),
-		WeComEncodingAESKey:     strings.TrimSpace(getenv("WECOM_ENCODING_AES_KEY")),
+		RedisEnvironment:             valueOr(getenv("TRPC_REDIS_ENVIRONMENT"), "local-runtime"),
+		SecretRoot:                   valueOr(getenv("TRPC_WEBUI_LOCAL_SECRET_ROOT"), "/tmp/trpc-webui-secrets"),
+		SkillStagingRoot:             valueOr(getenv("TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT"), "/tmp/trpc-webui-skills"),
+		QdrantEndpoint:               valueOr(getenv("TRPC_WEBUI_LOCAL_QDRANT_ENDPOINT"), "http://qdrant:6333"),
+		APIKeyFile:                   valueOr(getenv("TRPC_WEBUI_DEEPSEEK_KEY_FILE"), "/run/secrets/deepseek_api_key"),
+		RouteKey:                     valueOr(getenv("TRPC_WEBUI_LOCAL_ROUTE_KEY"), webUILocalRouteKey),
+		Token:                        valueOr(getenv("TRPC_WEBUI_LOCAL_TOKEN"), webUILocalToken),
+		InstanceID:                   valueOr(getenv("TRPC_WEBUI_LOCAL_INSTANCE_ID"), "standalone"),
+		ClamAVAddress:                valueOr(getenv("TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS"), "clamav:3310"),
+		ExclusiveRuntime:             strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_EXCLUSIVE_RUNTIME")), "true"),
+		FailoverTestEnabled:          strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED")), "true"),
+		StatusEnabled:                strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_STATUS_ENABLED")), "true"),
+		FeishuEnabled:                strings.EqualFold(strings.TrimSpace(getenv("TRPC_FEISHU_LOCAL_ENABLED")), "true"),
+		FeishuAppID:                  strings.TrimSpace(getenv("FEISHU_APP_ID")),
+		FeishuAppSecret:              strings.TrimSpace(getenv("FEISHU_APP_SECRET")),
+		FeishuVerificationToken:      strings.TrimSpace(getenv("FEISHU_VERIFICATION_TOKEN")),
+		FeishuEncryptKey:             strings.TrimSpace(getenv("FEISHU_ENCRYPT_KEY")),
+		FeishuBotOpenID:              strings.TrimSpace(getenv("FEISHU_BOT_OPEN_ID")),
+		WeComEnabled:                 strings.EqualFold(strings.TrimSpace(getenv("TRPC_WECOM_LOCAL_ENABLED")), "true"),
+		WeComSecondaryEnabled:        strings.EqualFold(strings.TrimSpace(getenv("TRPC_WECOM_SECONDARY_LOCAL_ENABLED")), "true"),
+		WeComCorpID:                  strings.TrimSpace(getenv("WECOM_CORP_ID")),
+		WeComAppSecret:               strings.TrimSpace(getenv("WECOM_APP_SECRET")),
+		WeComCallbackToken:           strings.TrimSpace(getenv("WECOM_CALLBACK_TOKEN")),
+		WeComEncodingAESKey:          strings.TrimSpace(getenv("WECOM_ENCODING_AES_KEY")),
+		WeComSecondaryCorpID:         strings.TrimSpace(getenv("WECOM_SECONDARY_CORP_ID")),
+		WeComSecondaryAppSecret:      strings.TrimSpace(getenv("WECOM_SECONDARY_APP_SECRET")),
+		WeComSecondaryCallbackToken:  strings.TrimSpace(getenv("WECOM_SECONDARY_CALLBACK_TOKEN")),
+		WeComSecondaryEncodingAESKey: strings.TrimSpace(getenv("WECOM_SECONDARY_ENCODING_AES_KEY")),
 	}
 	if value.PostgresDSN == "" || value.RedisAddress == "" || strings.TrimSpace(value.Token) != value.Token || len(value.Token) < 16 ||
 		strings.TrimSpace(value.RouteKey) != value.RouteKey || value.RouteKey == "" || strings.TrimSpace(value.ClamAVAddress) != value.ClamAVAddress || value.ClamAVAddress == "" || !filepath.IsAbs(value.APIKeyFile) || !filepath.IsAbs(value.SecretRoot) ||
@@ -584,6 +596,23 @@ func loadWebUILocalConfig(getenv func(string) string) (webUILocalConfig, error) 
 			return webUILocalConfig{}, errors.New("WeCom local configuration is incomplete")
 		}
 		value.WeComAgentID = agentID
+	}
+	secondaryConfigured := value.WeComSecondaryCorpID != "" || strings.TrimSpace(getenv("WECOM_SECONDARY_AGENT_ID")) != "" || value.WeComSecondaryAppSecret != "" ||
+		value.WeComSecondaryCallbackToken != "" || value.WeComSecondaryEncodingAESKey != ""
+	if !value.WeComSecondaryEnabled && secondaryConfigured {
+		return webUILocalConfig{}, errors.New("secondary WeCom credentials require explicit enablement")
+	}
+	if value.WeComSecondaryEnabled {
+		if !value.WeComEnabled {
+			return webUILocalConfig{}, errors.New("secondary WeCom requires the primary WeCom local configuration")
+		}
+		agentID, agentIDErr := strconv.ParseInt(strings.TrimSpace(getenv("WECOM_SECONDARY_AGENT_ID")), 10, 64)
+		if agentIDErr != nil || agentID <= 0 || value.WeComSecondaryCorpID == "" || value.WeComSecondaryAppSecret == "" ||
+			value.WeComSecondaryCallbackToken == "" || value.WeComSecondaryEncodingAESKey == "" ||
+			(value.WeComSecondaryCorpID == value.WeComCorpID && agentID == value.WeComAgentID) {
+			return webUILocalConfig{}, errors.New("secondary WeCom local configuration is incomplete or incompatible")
+		}
+		value.WeComSecondaryAgentID = agentID
 	}
 	return value, nil
 }
@@ -823,6 +852,10 @@ func bootstrapWebUILocal(ctx context.Context, db *sql.DB, configValue webUILocal
 	if err != nil {
 		return webUILocalBootstrap{}, err
 	}
+	root, snapshot, err = ensureWebUILocalWeComSecondaryBinding(ctx, configs, root, snapshot, configValue)
+	if err != nil {
+		return webUILocalBootstrap{}, err
+	}
 	var binding configdomain.ChannelBinding
 	for _, candidate := range snapshot.Payload.ChannelBindings {
 		if candidate.BindingID == webUILocalBindingID && candidate.Channel == "webui" {
@@ -846,6 +879,7 @@ func bootstrapWebUILocal(ctx context.Context, db *sql.DB, configValue webUILocal
 		}
 	}
 	var wecomBinding configdomain.ChannelBinding
+	var wecomSecondaryBinding configdomain.ChannelBinding
 	if configValue.WeComEnabled {
 		for _, candidate := range snapshot.Payload.ChannelBindings {
 			if candidate.BindingID == wecomLocalBindingID && candidate.Channel == "wecom" {
@@ -855,6 +889,17 @@ func bootstrapWebUILocal(ctx context.Context, db *sql.DB, configValue webUILocal
 		}
 		if wecomBinding.BindingID == "" || wecomBinding.ExternalAccountID != configValue.WeComCorpID {
 			return webUILocalBootstrap{}, errors.New("existing WeCom local control plane is incompatible; recreate the Compose volume")
+		}
+		if configValue.WeComSecondaryEnabled {
+			for _, candidate := range snapshot.Payload.ChannelBindings {
+				if candidate.BindingID == wecomSecondaryBindingID && candidate.Channel == "wecom" {
+					wecomSecondaryBinding = candidate
+					break
+				}
+			}
+			if wecomSecondaryBinding.BindingID == "" || wecomSecondaryBinding.ExternalAccountID != configValue.WeComSecondaryCorpID {
+				return webUILocalBootstrap{}, errors.New("existing secondary WeCom local control plane is incompatible; recreate the Compose volume")
+			}
 		}
 	}
 	secretValues := []struct {
@@ -914,6 +959,26 @@ func bootstrapWebUILocal(ctx context.Context, db *sql.DB, configValue webUILocal
 					configValue.WeComCorpID, configValue.WeComAppSecret, configValue.WeComAgentID))},
 		)
 	}
+	if configValue.WeComSecondaryEnabled {
+		secretValues = append(secretValues,
+			struct {
+				scope secrets.Scope
+				ref   secrets.SecretRef
+				value []byte
+			}{scope: secrets.Scope{TenantID: webUILocalTenantID, Subject: wecomSecondaryBindingID, Purpose: secrets.PurposeChannelVerify,
+				ResourceID: wecomSecondaryBindingID, ResourceVersion: snapshot.ConfigVersion}, ref: wecomSecondaryBinding.SecretRef,
+				value: []byte(fmt.Sprintf(`{"token":%q,"encoding_aes_key":%q,"receive_id":%q,"agent_id":%d}`,
+					configValue.WeComSecondaryCallbackToken, configValue.WeComSecondaryEncodingAESKey, configValue.WeComSecondaryCorpID, configValue.WeComSecondaryAgentID))},
+			struct {
+				scope secrets.Scope
+				ref   secrets.SecretRef
+				value []byte
+			}{scope: secrets.Scope{TenantID: webUILocalTenantID, Subject: wecomSecondaryBindingID, Purpose: secrets.PurposeChannelSend,
+				ResourceID: wecomSecondaryBindingID, ResourceVersion: snapshot.ConfigVersion}, ref: wecomSecondaryBinding.SendSecretRef,
+				value: []byte(fmt.Sprintf(`{"corp_id":%q,"corp_secret":%q,"agent_id":%d}`,
+					configValue.WeComSecondaryCorpID, configValue.WeComSecondaryAppSecret, configValue.WeComSecondaryAgentID))},
+		)
+	}
 	for _, item := range secretValues {
 		if err := writeLocalSecret(configValue.SecretRoot, item.scope, item.ref, item.value); err != nil {
 			return webUILocalBootstrap{}, err
@@ -949,6 +1014,7 @@ func bootstrapWebUILocal(ctx context.Context, db *sql.DB, configValue webUILocal
 		}
 	}
 	var wecomRoute ingress.BindingRoute
+	var wecomSecondaryRoute ingress.BindingRoute
 	if configValue.WeComEnabled {
 		wecomRoute = ingress.BindingRoute{OpaqueBindingID: "wecom-local-binding-v1", Channel: "wecom",
 			RouteKeyDigest: wecomprotocol.RouteKeyDigest(wecomLocalRouteKey), TenantID: webUILocalTenantID, AgentAppID: webUILocalAppID,
@@ -959,9 +1025,20 @@ func bootstrapWebUILocal(ctx context.Context, db *sql.DB, configValue webUILocal
 		if err := ingresspostgres.New(db).PutBindingRoute(ctx, wecomRoute); err != nil {
 			return webUILocalBootstrap{}, err
 		}
+		if configValue.WeComSecondaryEnabled {
+			wecomSecondaryRoute = ingress.BindingRoute{OpaqueBindingID: "wecom-local-secondary-binding-v1", Channel: "wecom",
+				RouteKeyDigest: wecomprotocol.RouteKeyDigest(wecomSecondaryRouteKey), TenantID: webUILocalTenantID, AgentAppID: webUILocalAppID,
+				ChannelBindingID: wecomSecondaryBindingID, ExternalAccountID: configValue.WeComSecondaryCorpID, TenantVersion: root.Version,
+				BindingVersion: snapshot.ConfigVersion, SecretRef: wecomSecondaryBinding.SecretRef,
+				IdentitySecretRef: secrets.SecretRef{Ref: "secret://local/identity", Version: 1},
+				SessionSecretRef:  secrets.SecretRef{Ref: "secret://local/session", Version: 1}, Enabled: true}
+			if err := ingresspostgres.New(db).PutBindingRoute(ctx, wecomSecondaryRoute); err != nil {
+				return webUILocalBootstrap{}, err
+			}
+		}
 	}
 	return webUILocalBootstrap{Tenant: root, Config: snapshot, Route: route, SecretRoot: configValue.SecretRoot,
-		FeishuRoute: feishuRoute, WeComRoute: wecomRoute, PayloadKey: payloadResolver, SecretStore: secretStore, ProviderRepo: providers}, nil
+		FeishuRoute: feishuRoute, WeComRoute: wecomRoute, WeComSecondaryRoute: wecomSecondaryRoute, PayloadKey: payloadResolver, SecretStore: secretStore, ProviderRepo: providers}, nil
 }
 
 // ensureWebUILocalModel keeps the one local, capability-complete model
@@ -1426,6 +1503,56 @@ func ensureWebUILocalWeComBinding(ctx context.Context, configs configdomain.Repo
 	published, err := configs.Publish(ctx, configdomain.PublishInput{TenantID: webUILocalTenantID, ExpectedTenantVersion: root.Version,
 		Payload: payload, Metadata: tenant.ChangeMetadata{ActorType: "system", ActorID: "wecom-local", ReasonCode: "local_wecom_binding",
 			CorrelationID: "wecom-local-binding", TraceID: "wecom-local-binding"}})
+	if err != nil {
+		return tenant.Tenant{}, configdomain.Snapshot{}, err
+	}
+	return published.Tenant, published.Snapshot, nil
+}
+
+// ensureWebUILocalWeComSecondaryBinding publishes a separate channel binding
+// and secret references for the second Bot. It deliberately never shares the
+// primary binding ID, Corp/Agent tuple, or verification/send secret scopes.
+func ensureWebUILocalWeComSecondaryBinding(ctx context.Context, configs configdomain.Repository, root tenant.Tenant,
+	snapshot configdomain.Snapshot, value webUILocalConfig,
+) (tenant.Tenant, configdomain.Snapshot, error) {
+	if !value.WeComSecondaryEnabled {
+		return root, snapshot, nil
+	}
+	if ctx == nil || configs == nil || root.TenantID != webUILocalTenantID || snapshot.TenantID != webUILocalTenantID ||
+		value.WeComSecondaryCorpID == "" || value.WeComSecondaryAppSecret == "" || value.WeComSecondaryCallbackToken == "" ||
+		value.WeComSecondaryEncodingAESKey == "" || value.WeComSecondaryAgentID <= 0 ||
+		(value.WeComSecondaryCorpID == value.WeComCorpID && value.WeComSecondaryAgentID == value.WeComAgentID) {
+		return tenant.Tenant{}, configdomain.Snapshot{}, errors.New("invalid secondary WeCom local control plane")
+	}
+	payload := snapshot.Payload
+	for index, binding := range payload.ChannelBindings {
+		if binding.BindingID != wecomSecondaryBindingID {
+			continue
+		}
+		if binding.Channel != "wecom" || binding.AgentAppID != webUILocalAppID ||
+			binding.SecretRef != (secrets.SecretRef{Ref: "secret://local/wecom-secondary-verify", Version: 1}) ||
+			binding.SendSecretRef != (secrets.SecretRef{Ref: "secret://local/wecom-secondary-send", Version: 1}) {
+			return tenant.Tenant{}, configdomain.Snapshot{}, errors.New("existing secondary WeCom local binding is incompatible")
+		}
+		if binding.ExternalAccountID == value.WeComSecondaryCorpID {
+			return root, snapshot, nil
+		}
+		payload.ChannelBindings[index].ExternalAccountID = value.WeComSecondaryCorpID
+		published, err := configs.Publish(ctx, configdomain.PublishInput{TenantID: webUILocalTenantID, ExpectedTenantVersion: root.Version,
+			Payload: payload, Metadata: tenant.ChangeMetadata{ActorType: "system", ActorID: "wecom-local", ReasonCode: "local_wecom_secondary_corp_rotation",
+				CorrelationID: "wecom-local-secondary-corp-rotation", TraceID: "wecom-local-secondary-corp-rotation"}})
+		if err != nil {
+			return tenant.Tenant{}, configdomain.Snapshot{}, err
+		}
+		return published.Tenant, published.Snapshot, nil
+	}
+	payload.ChannelBindings = append(payload.ChannelBindings, configdomain.ChannelBinding{BindingID: wecomSecondaryBindingID, Channel: "wecom",
+		ExternalAccountID: value.WeComSecondaryCorpID, AgentAppID: webUILocalAppID,
+		SecretRef:     secrets.SecretRef{Ref: "secret://local/wecom-secondary-verify", Version: 1},
+		SendSecretRef: secrets.SecretRef{Ref: "secret://local/wecom-secondary-send", Version: 1}})
+	published, err := configs.Publish(ctx, configdomain.PublishInput{TenantID: webUILocalTenantID, ExpectedTenantVersion: root.Version,
+		Payload: payload, Metadata: tenant.ChangeMetadata{ActorType: "system", ActorID: "wecom-local", ReasonCode: "local_wecom_secondary_binding",
+			CorrelationID: "wecom-local-secondary-binding", TraceID: "wecom-local-secondary-binding"}})
 	if err != nil {
 		return tenant.Tenant{}, configdomain.Snapshot{}, err
 	}
