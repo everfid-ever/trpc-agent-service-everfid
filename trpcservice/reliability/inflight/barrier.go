@@ -11,7 +11,12 @@ import (
 // and tool execution but before terminal result persistence and commit.
 type Point string
 
-const PointP2BeforeTerminalCommit Point = "p2_executed_before_commit"
+const (
+	PointP1BeforeExecution        Point = "p1_persisted_before_execution"
+	PointP2BeforeTerminalCommit   Point = "p2_executed_before_commit"
+	PointP3BeforeReplyPublish     Point = "p3_result_committed_before_reply_publish"
+	PointP4BeforeProviderDelivery Point = "p4_delivery_claimed_before_provider_send"
+)
 
 // Barrier is injected only by test compositions. Production callers may keep
 // it nil, which has no effect on execution.

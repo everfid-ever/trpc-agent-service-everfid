@@ -4,11 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-if [[ "${1:-}" == "--demo" ]]; then
-  [[ $# -eq 1 ]] || { echo "usage: $0 [--demo]" >&2; exit 2; }
-  exec "$ROOT/scripts/compose/quickstart.sh" --demo
-fi
-[[ $# -eq 0 ]] || { echo "usage: $0 [--demo]" >&2; exit 2; }
+[[ $# -eq 0 ]] || { echo "usage: $0" >&2; exit 2; }
 
 compose_file="$ROOT/deploy/compose/docker-compose.local.yml"
 secret_file="$ROOT/deploy/compose/secrets/deepseek-api-key"
@@ -26,4 +22,3 @@ fi
 
 docker compose -f "$compose_file" --profile webui up -d --build
 echo "Local WebUI: http://localhost:${TRPC_LOCAL_WEBUI_PORT:-58081}/webui/"
-echo "Local Jaeger: http://localhost:${TRPC_LOCAL_JAEGER_PORT:-56686}/"

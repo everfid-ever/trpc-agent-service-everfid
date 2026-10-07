@@ -87,20 +87,7 @@ func TestLoadWebUILocalConfigDefaultsAndRejectsUnsafeInput(t *testing.T) {
 	feishu := cloneEnvironment(base)
 	feishu["TRPC_FEISHU_LOCAL_ENABLED"] = "true"
 	if _, err := loadWebUILocalConfig(mapEnvironment(feishu)); err == nil {
-		t.Fatal("incomplete Feishu local configuration accepted")
-	}
-	feishu["FEISHU_APP_ID"] = "cli_local"
-	feishu["FEISHU_APP_SECRET"] = "local-app-secret"
-	feishu["FEISHU_VERIFICATION_TOKEN"] = "local-verification-token"
-	feishu["FEISHU_ENCRYPT_KEY"] = "local-encrypt-key"
-	configured, err = loadWebUILocalConfig(mapEnvironment(feishu))
-	if err != nil || !configured.FeishuEnabled || configured.FeishuBotOpenID != "" {
-		t.Fatalf("configured=%+v err=%v", configured, err)
-	}
-	feishu["FEISHU_BOT_OPEN_ID"] = "ou_local_bot"
-	configured, err = loadWebUILocalConfig(mapEnvironment(feishu))
-	if err != nil || configured.FeishuBotOpenID != "ou_local_bot" {
-		t.Fatalf("configured=%+v err=%v", configured, err)
+		t.Fatal("removed Feishu runtime configuration accepted")
 	}
 	wecom := cloneEnvironment(base)
 	wecom["TRPC_WECOM_LOCAL_ENABLED"] = "true"
@@ -137,6 +124,26 @@ func TestLoadWebUILocalConfigDefaultsAndRejectsUnsafeInput(t *testing.T) {
 	secondary["WECOM_SECONDARY_AGENT_ID"] = wecom["WECOM_AGENT_ID"]
 	if _, err := loadWebUILocalConfig(mapEnvironment(secondary)); err == nil {
 		t.Fatal("secondary WeCom accepted the primary Corp/Agent tuple")
+	}
+}
+
+func TestBuildSecondaryWeComRouteUsesIndependentTenantAuthority(t *testing.T) {
+	value := webUILocalConfig{WeComSecondaryEnabled: true, WeComSecondaryCorpID: "ww_secondary"}
+	root := tenant.Tenant{TenantID: wecomSecondaryTenantID, Version: 7}
+	snapshot := configdomain.Snapshot{TenantID: wecomSecondaryTenantID, ConfigVersion: 9}
+	binding := configdomain.ChannelBinding{BindingID: wecomSecondaryBindingID, Channel: "wecom", AgentAppID: wecomSecondaryAppID,
+		ExternalAccountID: value.WeComSecondaryCorpID, SecretRef: secrets.SecretRef{Ref: "secret://local/wecom-secondary-verify", Version: 1}, SendSecretRef: secrets.SecretRef{Ref: "secret://local/wecom-secondary-send", Version: 1}}
+	route, err := buildSecondaryWeComRoute(value, root, snapshot, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.TenantID != wecomSecondaryTenantID || route.TenantID == webUILocalTenantID || route.AgentAppID != wecomSecondaryAppID ||
+		route.IdentitySecretRef.Ref != "secret://local/secondary-identity" || route.SessionSecretRef.Ref != "secret://local/secondary-session" {
+		t.Fatalf("route=%#v", route)
+	}
+	root.TenantID = webUILocalTenantID
+	if _, err := buildSecondaryWeComRoute(value, root, snapshot, binding); err == nil {
+		t.Fatal("primary tenant accepted for secondary Bot route")
 	}
 }
 

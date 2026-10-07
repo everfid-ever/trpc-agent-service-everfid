@@ -6,6 +6,7 @@ import (
 	"time"
 
 	channel "github.com/liuzengh/trpc-agent-service/trpcservice/channels/contract"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/inflight"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
@@ -26,6 +27,7 @@ type ReplyRelay struct {
 	RetryDelay         time.Duration
 	PollInterval       time.Duration
 	Telemetry          telemetry.Provider
+	Barrier            inflight.Barrier
 }
 
 func (r ReplyRelay) Run(ctx context.Context) error {
@@ -71,6 +73,11 @@ func (r ReplyRelay) publish(ctx context.Context, record messaging.OutboxRecord) 
 		Target: channel.DeliveryTarget{Channel: route.Channel, ExternalAccountID: route.ExternalAccountID,
 			ExternalMessageID: route.ExternalMessageID, ExternalChatID: route.ExternalChatID, ExternalUserID: route.ExternalUserID},
 		Final: true, TraceParent: telemetry.EffectiveTraceParent(ctx, record.TraceParent)}
+	if r.Barrier != nil {
+		if err := r.Barrier.Wait(ctx, inflight.PointP3BeforeReplyPublish); err != nil {
+			return err
+		}
+	}
 	return r.Replies.PublishReply(ctx, destination, event)
 }
 

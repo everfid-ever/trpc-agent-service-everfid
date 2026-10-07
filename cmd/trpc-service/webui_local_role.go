@@ -22,7 +22,6 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	lark "github.com/larksuite/oapi-sdk-go/v3"
 	redisclient "github.com/redis/go-redis/v9"
 
 	"github.com/liuzengh/trpc-agent-service/migrations"
@@ -39,7 +38,6 @@ import (
 	credentialpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/channels/credentials/postgres"
 	channeldelivery "github.com/liuzengh/trpc-agent-service/trpcservice/channels/delivery"
 	deliverypostgres "github.com/liuzengh/trpc-agent-service/trpcservice/channels/delivery/postgres"
-	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/feishu"
 	feishuprotocol "github.com/liuzengh/trpc-agent-service/trpcservice/channels/feishu/protocol"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/identity"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/channels/ingress"
@@ -121,6 +119,9 @@ const (
 	wecomLocalRouteKey         = "local-wecom"
 	wecomSecondaryBindingID    = "local-wecom-secondary"
 	wecomSecondaryRouteKey     = "local-wecom-secondary"
+	wecomSecondaryTenantID     = "t_01ARZ3NDEKTSV4RRFFQ69G5FB0"
+	wecomSecondaryAppID        = "app_01ARZ3NDEKTSV4RRFFQ69G5FB0"
+	wecomSecondaryModelID      = "deepseek-local-secondary"
 	payloadKeyRef              = "secret://local/payload-key"
 	webUILocalInstruction      = "You are a concise and helpful assistant. When the user asks to create, save, or record a note, call webui_create_note. Never claim that a note was created before the tool result is available. When an image content part is present, it was securely attached to this request: analyze its visible content directly and do not claim that the image or attachment was unavailable."
 )
@@ -156,6 +157,29 @@ type webUILocalBootstrap struct {
 	PayloadKey          *payloadkey.Resolver
 	SecretStore         *secretfs.Provider
 	ProviderRepo        *providerpostgres.Repository
+}
+
+// localTenantBootstrapSpec is the immutable identity boundary for one local
+// Bot tenant. The secondary Bot deliberately receives a different instance of
+// this specification so subsequent bootstrap work cannot accidentally reuse
+// a primary tenant/app/model identifier.
+type localTenantBootstrapSpec struct {
+	TenantID, TenantKey, DisplayName string
+	AppID, AppKey, AppDisplayName    string
+	ModelID, ModelKey                string
+	BindingID, RouteKey              string
+}
+
+func primaryLocalTenantSpec() localTenantBootstrapSpec {
+	return localTenantBootstrapSpec{TenantID: webUILocalTenantID, TenantKey: "webui-local", DisplayName: "WebUI Local",
+		AppID: webUILocalAppID, AppKey: "assistant", AppDisplayName: "WebUI Assistant", ModelID: webUILocalModelID,
+		ModelKey: "deepseek-local", BindingID: wecomLocalBindingID, RouteKey: wecomLocalRouteKey}
+}
+
+func secondaryLocalTenantSpec() localTenantBootstrapSpec {
+	return localTenantBootstrapSpec{TenantID: wecomSecondaryTenantID, TenantKey: "webui-local-secondary", DisplayName: "WebUI Local Secondary",
+		AppID: wecomSecondaryAppID, AppKey: "assistant", AppDisplayName: "WebUI Secondary Assistant", ModelID: wecomSecondaryModelID,
+		ModelKey: "deepseek-local-secondary", BindingID: wecomSecondaryBindingID, RouteKey: wecomSecondaryRouteKey}
 }
 
 func runWebUILocalRole(parent context.Context, getenv func(string) string, logger *roleLogger) error {
@@ -231,29 +255,14 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	browser := webui.BrowserHandler{Callback: endpoint, Routes: bindings, Secrets: bootstrap.SecretStore,
 		Messages: webuiMailbox, Results: payloads, ReplyRoutes: inbox, Progress: progressSubscriber}
 	adapters := []channel.Adapter{webuiAdapter}
-	var feishuEndpoint, wecomEndpoint http.Handler
+	var wecomEndpoint http.Handler
 	// The local profiles share one PostgreSQL volume, so the delivery catalog
-	// must resolve every channel that may already be persisted there. Adapter
-	// construction is therefore unconditional; the profile switches only gate
-	// ingress endpoints and bootstrap, and a disabled channel enqueues no
-	// reply outbox work because its callbacks are not mounted.
+	// resolves both the WebUI validation adapter and the WeCom HA adapter.
 	providerHTTP := &http.Client{Timeout: 30 * time.Second}
 	sendCredentials := credentials.Resolver{Locator: credentialpostgres.New(db), Secrets: bootstrap.SecretStore}
-	feishuCredentials := &feishu.CredentialProvider{Secrets: sendCredentials, Client: providerHTTP}
 	wecomTokens := &wecom.TokenProvider{Secrets: sendCredentials, Client: providerHTTP}
-	feishuAdapter := &feishu.Adapter{Protocol: feishuprotocol.Verifier{}, Sender: feishu.OfficialSender{Tokens: feishuCredentials, Client: providerHTTP, Clients: &feishu.ClientCache{
-		Credentials: feishuCredentials,
-		NewClient:   func(appID, appSecret string) *lark.Client { return lark.NewClient(appID, appSecret) },
-	}}}
 	wecomAdapter := &wecom.Adapter{Protocol: wecomprotocol.Verifier{}, Sender: wecom.OfficialSender{Tokens: wecomTokens}}
-	adapters = append(adapters, feishuAdapter, wecomAdapter)
-	if configValue.FeishuEnabled {
-		feishuEndpoint, err = newChannelEndpoint(feishuAdapter, resolver, identity.Mapper{Secrets: bootstrap.SecretStore},
-			preprocessStore, payloads, 1, 1<<20, telemetryProvider, configRepo)
-		if err != nil {
-			return errors.New("Feishu callback configuration rejected")
-		}
-	}
+	adapters = append(adapters, wecomAdapter)
 	if configValue.WeComEnabled {
 		wecomEndpoint, err = newChannelEndpoint(wecomAdapter, resolver, identity.Mapper{Secrets: bootstrap.SecretStore},
 			preprocessStore, payloads, 1, 1<<20, telemetryProvider, configRepo)
@@ -365,19 +374,17 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		}}
 
 	dispatcher := gateway.BrokerDispatcher{Tasks: tasks, Bindings: configRepo}
-	media := preprocess.MediaStager{Fetcher: preprocess.MediaRouter{
-		Feishu: feishu.OfficialMediaFetcher{Tokens: feishuCredentials, Client: providerHTTP},
-		WeCom:  wecom.OfficialMediaFetcher{Tokens: wecomTokens, Client: providerHTTP},
-	}, Malware: malware, DLP: localDisabledDLP{}, Artifacts: artifacts, MaxBytes: 10 << 20}
+	media := preprocess.MediaStager{Fetcher: preprocess.MediaRouter{WeCom: wecom.OfficialMediaFetcher{Tokens: wecomTokens, Client: providerHTTP}},
+		Malware: malware, DLP: localDisabledDLP{}, Artifacts: artifacts, MaxBytes: 10 << 20}
 	preprocessor := preprocess.Worker{Store: preprocessStore, Payloads: payloads, Dispatcher: dispatcher,
 		Owner: configValue.instanceName("preprocess"), LeaseTTL: 30 * time.Second, RetryDelay: time.Second, MaxAttempts: 8,
-		Media: &media, ArtifactRetention: 24 * time.Hour, Telemetry: telemetryProvider}
+		Media: &media, ArtifactRetention: 24 * time.Hour, Telemetry: telemetryProvider, Barrier: failoverBarrier}
 	dispatchRelay := relay.DispatchRelay{Outbox: inbox, Tasks: tasks, Broker: streamBroker, Owner: configValue.instanceName("dispatch-relay"),
 		ShardCount: 4, ClaimTTL: 30 * time.Second, ClaimRenewInterval: 10 * time.Second, PollInterval: 100 * time.Millisecond,
 		Telemetry: telemetryProvider}
 	replyRelay := relay.ReplyRelay{Outbox: inbox, Results: payloads, Routes: inbox, Replies: publisher,
 		Owner: configValue.instanceName("reply-relay"), ClaimTTL: 30 * time.Second, ClaimRenewInterval: 10 * time.Second, PollInterval: 100 * time.Millisecond,
-		Telemetry: telemetryProvider}
+		Telemetry: telemetryProvider, Barrier: failoverBarrier}
 	wakeupQueue, err := relayredis.NewWakeupQueue(redis, publisher, relayredis.WakeupQueueConfig{
 		Group: "webui-wakeup", ReadBlock: 250 * time.Millisecond, ReclaimIdle: 30 * time.Second})
 	if err != nil {
@@ -400,7 +407,7 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	}
 	deliveryService := channeldelivery.Service{Results: payloads, Ledger: inbox, Adapters: deliveryCatalog,
 		Owner: configValue.instanceName("delivery"), ClaimTTL: 30 * time.Second, ClaimRenewInterval: 10 * time.Second,
-		DefaultRetryDelay: time.Second, MaxRetryDelay: time.Minute, MaxAttempts: 8, MaxReconcileAttempts: 8}
+		DefaultRetryDelay: time.Second, MaxRetryDelay: time.Minute, MaxAttempts: 8, MaxReconcileAttempts: 8, Barrier: failoverBarrier}
 	deliverySupervisor := channeldelivery.Supervisor{Catalog: deliveryCatalog, RefreshInterval: time.Second,
 		NewConsumer: func(destination channel.ReplyDestination) (channeldelivery.ConsumerRunner, error) {
 			return channeldelivery.Consumer{Queue: replyQueue, Deliverer: deliveryService, Destination: destination,
@@ -411,9 +418,6 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	mux := http.NewServeMux()
 	mux.Handle("/webui", browser)
 	mux.Handle("/webui/", browser)
-	if feishuEndpoint != nil {
-		mux.Handle("/callbacks/feishu", feishuEndpoint)
-	}
 	if wecomEndpoint != nil {
 		mux.Handle("/callbacks/wecom", wecomEndpoint)
 	}
@@ -546,6 +550,9 @@ func runWebUILocalBootstrap(parent context.Context, getenv func(string) string, 
 }
 
 func loadWebUILocalConfig(getenv func(string) string) (webUILocalConfig, error) {
+	if strings.EqualFold(strings.TrimSpace(getenv("TRPC_FEISHU_LOCAL_ENABLED")), "true") {
+		return webUILocalConfig{}, errors.New("Feishu local runtime is no longer supported")
+	}
 	value := webUILocalConfig{PostgresDSN: strings.TrimSpace(getenv("TRPC_POSTGRES_DSN")),
 		RedisAddress: strings.TrimSpace(getenv("TRPC_REDIS_ADDRESS")), ListenAddress: valueOr(getenv("TRPC_LISTEN_ADDRESS"), ":8080"),
 		RedisEnvironment:             valueOr(getenv("TRPC_REDIS_ENVIRONMENT"), "local-runtime"),
@@ -585,8 +592,7 @@ func loadWebUILocalConfig(getenv func(string) string) (webUILocalConfig, error) 
 	if !validWebUILocalInstanceID(value.InstanceID) {
 		return webUILocalConfig{}, errors.New("WebUI local instance ID is invalid")
 	}
-	if value.FeishuEnabled && (value.FeishuAppID == "" || value.FeishuAppSecret == "" || value.FeishuVerificationToken == "" ||
-		value.FeishuEncryptKey == "") {
+	if value.FeishuEnabled && (value.FeishuAppID == "" || value.FeishuAppSecret == "" || value.FeishuVerificationToken == "" || value.FeishuEncryptKey == "") {
 		return webUILocalConfig{}, errors.New("Feishu local configuration is incomplete")
 	}
 	if value.WeComEnabled {
@@ -643,9 +649,8 @@ func newWebUILocalProcessStartID() (string, error) {
 
 // registerWebUILocalFailoverTestEndpoints exposes an opt-in control plane for
 // the Compose takeover checks. Callers must not register it in normal local or
-// production roles: its only purpose is to hold a worker at P2 so SIGKILL can
-// exercise durable recovery after model/tool execution and before final result
-// persistence and commit.
+// production roles: its only purpose is to hold durable work at P1–P4 so
+// SIGKILL can exercise each takeover boundary.
 func registerWebUILocalFailoverTestEndpoints(mux *http.ServeMux, token string, barrier *inflight.Controller) {
 	if mux == nil || barrier == nil {
 		return
@@ -665,38 +670,31 @@ func registerWebUILocalFailoverTestEndpoints(mux *http.ServeMux, token string, b
 		}
 		writeSnapshot(writer, action())
 	}
-	mux.HandleFunc("/test/failover/p2/arm", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost {
-			writer.Header().Set("Allow", http.MethodPost)
-			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		serve(writer, request, func() inflight.Snapshot {
-			barrier.Arm(inflight.PointP2BeforeTerminalCommit)
-			return barrier.Snapshot(inflight.PointP2BeforeTerminalCommit)
+	for name, point := range map[string]inflight.Point{"p1": inflight.PointP1BeforeExecution, "p2": inflight.PointP2BeforeTerminalCommit, "p3": inflight.PointP3BeforeReplyPublish, "p4": inflight.PointP4BeforeProviderDelivery} {
+		point := point
+		prefix := "/test/failover/" + name
+		mux.HandleFunc(prefix+"/arm", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			serve(w, r, func() inflight.Snapshot { barrier.Arm(point); return barrier.Snapshot(point) })
 		})
-	})
-	mux.HandleFunc("/test/failover/p2/status", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodGet {
-			writer.Header().Set("Allow", http.MethodGet)
-			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		serve(writer, request, func() inflight.Snapshot {
-			return barrier.Snapshot(inflight.PointP2BeforeTerminalCommit)
+		mux.HandleFunc(prefix+"/status", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			serve(w, r, func() inflight.Snapshot { return barrier.Snapshot(point) })
 		})
-	})
-	mux.HandleFunc("/test/failover/p2/release", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost {
-			writer.Header().Set("Allow", http.MethodPost)
-			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		serve(writer, request, func() inflight.Snapshot {
-			barrier.Release(inflight.PointP2BeforeTerminalCommit)
-			return barrier.Snapshot(inflight.PointP2BeforeTerminalCommit)
+		mux.HandleFunc(prefix+"/release", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			serve(w, r, func() inflight.Snapshot { barrier.Release(point); return barrier.Snapshot(point) })
 		})
-	})
+	}
 }
 
 // acquireWebUILocalRuntimeLock prevents the standalone local compositions
@@ -852,9 +850,13 @@ func bootstrapWebUILocal(ctx context.Context, db *sql.DB, configValue webUILocal
 	if err != nil {
 		return webUILocalBootstrap{}, err
 	}
-	root, snapshot, err = ensureWebUILocalWeComSecondaryBinding(ctx, configs, root, snapshot, configValue)
-	if err != nil {
-		return webUILocalBootstrap{}, err
+	var secondaryRoot tenant.Tenant
+	var secondarySnapshot configdomain.Snapshot
+	if configValue.WeComSecondaryEnabled {
+		secondaryRoot, secondarySnapshot, err = bootstrapSecondaryWeComTenant(ctx, tenants, apps, configs, providers, governanceStore, configValue)
+		if err != nil {
+			return webUILocalBootstrap{}, err
+		}
 	}
 	var binding configdomain.ChannelBinding
 	for _, candidate := range snapshot.Payload.ChannelBindings {
@@ -891,13 +893,13 @@ func bootstrapWebUILocal(ctx context.Context, db *sql.DB, configValue webUILocal
 			return webUILocalBootstrap{}, errors.New("existing WeCom local control plane is incompatible; recreate the Compose volume")
 		}
 		if configValue.WeComSecondaryEnabled {
-			for _, candidate := range snapshot.Payload.ChannelBindings {
+			for _, candidate := range secondarySnapshot.Payload.ChannelBindings {
 				if candidate.BindingID == wecomSecondaryBindingID && candidate.Channel == "wecom" {
 					wecomSecondaryBinding = candidate
 					break
 				}
 			}
-			if wecomSecondaryBinding.BindingID == "" || wecomSecondaryBinding.ExternalAccountID != configValue.WeComSecondaryCorpID {
+			if secondaryRoot.TenantID != wecomSecondaryTenantID || wecomSecondaryBinding.BindingID == "" || wecomSecondaryBinding.ExternalAccountID != configValue.WeComSecondaryCorpID {
 				return webUILocalBootstrap{}, errors.New("existing secondary WeCom local control plane is incompatible; recreate the Compose volume")
 			}
 		}
@@ -965,16 +967,36 @@ func bootstrapWebUILocal(ctx context.Context, db *sql.DB, configValue webUILocal
 				scope secrets.Scope
 				ref   secrets.SecretRef
 				value []byte
-			}{scope: secrets.Scope{TenantID: webUILocalTenantID, Subject: wecomSecondaryBindingID, Purpose: secrets.PurposeChannelVerify,
-				ResourceID: wecomSecondaryBindingID, ResourceVersion: snapshot.ConfigVersion}, ref: wecomSecondaryBinding.SecretRef,
+			}{scope: payloadkey.Scope(wecomSecondaryTenantID, 1), ref: secrets.SecretRef{Ref: payloadKeyRef, Version: 1}, value: deriveLocalSecret("secondary-payload", configValue.Token)},
+			struct {
+				scope secrets.Scope
+				ref   secrets.SecretRef
+				value []byte
+			}{scope: secrets.Scope{TenantID: wecomSecondaryTenantID, Subject: wecomSecondaryTenantID, Purpose: secrets.PurposeTenantIdentity, ResourceID: wecomSecondaryTenantID, ResourceVersion: 1}, ref: secrets.SecretRef{Ref: "secret://local/secondary-identity", Version: 1}, value: deriveLocalSecret("secondary-identity", configValue.Token)},
+			struct {
+				scope secrets.Scope
+				ref   secrets.SecretRef
+				value []byte
+			}{scope: secrets.Scope{TenantID: wecomSecondaryTenantID, Subject: wecomSecondaryTenantID, Purpose: secrets.PurposeTenantSession, ResourceID: wecomSecondaryTenantID, ResourceVersion: 1}, ref: secrets.SecretRef{Ref: "secret://local/secondary-session", Version: 1}, value: deriveLocalSecret("secondary-session", configValue.Token)},
+			struct {
+				scope secrets.Scope
+				ref   secrets.SecretRef
+				value []byte
+			}{scope: secrets.Scope{TenantID: wecomSecondaryTenantID, Subject: "worker-model", Purpose: secrets.PurposeModelCall, ResourceID: wecomSecondaryModelID, ResourceVersion: webUILocalModelVersion}, ref: secrets.SecretRef{Ref: "secret://local/deepseek-secondary", Version: 1}, value: apiKey},
+			struct {
+				scope secrets.Scope
+				ref   secrets.SecretRef
+				value []byte
+			}{scope: secrets.Scope{TenantID: wecomSecondaryTenantID, Subject: wecomSecondaryBindingID, Purpose: secrets.PurposeChannelVerify,
+				ResourceID: wecomSecondaryBindingID, ResourceVersion: secondarySnapshot.ConfigVersion}, ref: wecomSecondaryBinding.SecretRef,
 				value: []byte(fmt.Sprintf(`{"token":%q,"encoding_aes_key":%q,"receive_id":%q,"agent_id":%d}`,
 					configValue.WeComSecondaryCallbackToken, configValue.WeComSecondaryEncodingAESKey, configValue.WeComSecondaryCorpID, configValue.WeComSecondaryAgentID))},
 			struct {
 				scope secrets.Scope
 				ref   secrets.SecretRef
 				value []byte
-			}{scope: secrets.Scope{TenantID: webUILocalTenantID, Subject: wecomSecondaryBindingID, Purpose: secrets.PurposeChannelSend,
-				ResourceID: wecomSecondaryBindingID, ResourceVersion: snapshot.ConfigVersion}, ref: wecomSecondaryBinding.SendSecretRef,
+			}{scope: secrets.Scope{TenantID: wecomSecondaryTenantID, Subject: wecomSecondaryBindingID, Purpose: secrets.PurposeChannelSend,
+				ResourceID: wecomSecondaryBindingID, ResourceVersion: secondarySnapshot.ConfigVersion}, ref: wecomSecondaryBinding.SendSecretRef,
 				value: []byte(fmt.Sprintf(`{"corp_id":%q,"corp_secret":%q,"agent_id":%d}`,
 					configValue.WeComSecondaryCorpID, configValue.WeComSecondaryAppSecret, configValue.WeComSecondaryAgentID))},
 		)
@@ -1026,12 +1048,10 @@ func bootstrapWebUILocal(ctx context.Context, db *sql.DB, configValue webUILocal
 			return webUILocalBootstrap{}, err
 		}
 		if configValue.WeComSecondaryEnabled {
-			wecomSecondaryRoute = ingress.BindingRoute{OpaqueBindingID: "wecom-local-secondary-binding-v1", Channel: "wecom",
-				RouteKeyDigest: wecomprotocol.RouteKeyDigest(wecomSecondaryRouteKey), TenantID: webUILocalTenantID, AgentAppID: webUILocalAppID,
-				ChannelBindingID: wecomSecondaryBindingID, ExternalAccountID: configValue.WeComSecondaryCorpID, TenantVersion: root.Version,
-				BindingVersion: snapshot.ConfigVersion, SecretRef: wecomSecondaryBinding.SecretRef,
-				IdentitySecretRef: secrets.SecretRef{Ref: "secret://local/identity", Version: 1},
-				SessionSecretRef:  secrets.SecretRef{Ref: "secret://local/session", Version: 1}, Enabled: true}
+			wecomSecondaryRoute, err = buildSecondaryWeComRoute(configValue, secondaryRoot, secondarySnapshot, wecomSecondaryBinding)
+			if err != nil {
+				return webUILocalBootstrap{}, err
+			}
 			if err := ingresspostgres.New(db).PutBindingRoute(ctx, wecomSecondaryRoute); err != nil {
 				return webUILocalBootstrap{}, err
 			}
@@ -1039,6 +1059,20 @@ func bootstrapWebUILocal(ctx context.Context, db *sql.DB, configValue webUILocal
 	}
 	return webUILocalBootstrap{Tenant: root, Config: snapshot, Route: route, SecretRoot: configValue.SecretRoot,
 		FeishuRoute: feishuRoute, WeComRoute: wecomRoute, WeComSecondaryRoute: wecomSecondaryRoute, PayloadKey: payloadResolver, SecretStore: secretStore, ProviderRepo: providers}, nil
+}
+
+func buildSecondaryWeComRoute(value webUILocalConfig, root tenant.Tenant, snapshot configdomain.Snapshot, binding configdomain.ChannelBinding) (ingress.BindingRoute, error) {
+	if !value.WeComSecondaryEnabled || root.TenantID != wecomSecondaryTenantID || snapshot.TenantID != wecomSecondaryTenantID ||
+		binding.BindingID != wecomSecondaryBindingID || binding.Channel != "wecom" || binding.AgentAppID != wecomSecondaryAppID ||
+		binding.ExternalAccountID != value.WeComSecondaryCorpID || binding.SecretRef.Ref == "" || binding.SendSecretRef.Ref == "" {
+		return ingress.BindingRoute{}, errors.New("secondary WeCom route is incompatible")
+	}
+	return ingress.BindingRoute{OpaqueBindingID: "wecom-local-secondary-binding-v1", Channel: "wecom",
+		RouteKeyDigest: wecomprotocol.RouteKeyDigest(wecomSecondaryRouteKey), TenantID: wecomSecondaryTenantID, AgentAppID: wecomSecondaryAppID,
+		ChannelBindingID: wecomSecondaryBindingID, ExternalAccountID: value.WeComSecondaryCorpID, TenantVersion: root.Version,
+		BindingVersion: snapshot.ConfigVersion, SecretRef: binding.SecretRef,
+		IdentitySecretRef: secrets.SecretRef{Ref: "secret://local/secondary-identity", Version: 1},
+		SessionSecretRef:  secrets.SecretRef{Ref: "secret://local/secondary-session", Version: 1}, Enabled: true}, nil
 }
 
 // ensureWebUILocalModel keeps the one local, capability-complete model
@@ -1557,6 +1591,77 @@ func ensureWebUILocalWeComSecondaryBinding(ctx context.Context, configs configdo
 		return tenant.Tenant{}, configdomain.Snapshot{}, err
 	}
 	return published.Tenant, published.Snapshot, nil
+}
+
+// bootstrapSecondaryWeComTenant creates the second Bot as a separate tenant
+// authority. Its route must never reuse the primary tenant's app, model,
+// config snapshot, or secret scopes.
+func bootstrapSecondaryWeComTenant(ctx context.Context, tenants tenant.Repository, apps agentapp.Repository,
+	configs configdomain.Repository, providers *providerpostgres.Repository, policies webUILocalPolicyStore, value webUILocalConfig,
+) (tenant.Tenant, configdomain.Snapshot, error) {
+	if !value.WeComSecondaryEnabled || tenants == nil || apps == nil || configs == nil || providers == nil || policies == nil {
+		return tenant.Tenant{}, configdomain.Snapshot{}, errors.New("invalid secondary tenant bootstrap")
+	}
+	root, err := tenants.Get(ctx, wecomSecondaryTenantID)
+	if errors.Is(err, tenant.ErrNotFound) {
+		metadata := tenant.ChangeMetadata{ActorType: "system", ActorID: "wecom-local-secondary", ReasonCode: "local_bootstrap",
+			CorrelationID: "wecom-local-secondary", TraceID: "wecom-local-secondary"}
+		root, err = tenants.Create(ctx, tenant.CreateInput{Tenant: tenant.Tenant{TenantID: wecomSecondaryTenantID,
+			TenantKey: "webui-local-secondary", DisplayName: "WebUI Local Secondary"}, ChangeMetadata: metadata})
+		if err != nil {
+			return tenant.Tenant{}, configdomain.Snapshot{}, err
+		}
+		if _, err = providers.PublishModel(ctx, provider.ModelProfileSnapshot{TenantID: wecomSecondaryTenantID,
+			ProfileID: wecomSecondaryModelID, ProfileKey: "deepseek-local-secondary", DisplayName: "DeepSeek Local Secondary", Status: "active",
+			SchemaVersion: 1, Provider: "deepseek", Model: webUILocalModelName, Endpoint: "https://api.deepseek.com",
+			SecretRef: secrets.SecretRef{Ref: "secret://local/deepseek-secondary", Version: 1}, Version: webUILocalModelVersion}); err != nil {
+			return tenant.Tenant{}, configdomain.Snapshot{}, err
+		}
+		if _, err = providers.PublishBackend(ctx, provider.BackendProfileSnapshot{TenantID: wecomSecondaryTenantID,
+			ProfileID: webUILocalMemoryID, ProfileKey: "webui-local-memory", DisplayName: "WebUI Local Memory", Status: "active",
+			SchemaVersion: 1, Provider: "postgres", Capabilities: provider.CapabilitySet{"strong_ryw": true}, Version: 1}); err != nil {
+			return tenant.Tenant{}, configdomain.Snapshot{}, err
+		}
+		policy := governance.PolicyV1{SchemaVersion: 1, DefaultAction: governance.ActionAllow,
+			AllowedModels: []governance.VersionedRef{{ID: wecomSecondaryModelID, Version: webUILocalModelVersion}},
+			Tools:         []governance.ToolRule{{ToolID: localnote.ID, Version: localnote.Version, Dangerous: true, ConfirmationSupported: true}},
+			InputDLP:      governance.DLPDisabled, OutputDLP: governance.DLPDisabled}
+		digest, _, digestErr := governance.PolicyDigest(policy)
+		if digestErr != nil {
+			return tenant.Tenant{}, configdomain.Snapshot{}, digestErr
+		}
+		if err = policies.PublishPolicy(ctx, governance.PolicySnapshot{TenantID: wecomSecondaryTenantID, Version: 1, SchemaVersion: 1, Policy: policy, ContentDigest: digest, PublishedAt: time.Now().UTC()}); err != nil {
+			return tenant.Tenant{}, configdomain.Snapshot{}, err
+		}
+		appMetadata := agentapp.ChangeMetadata{ActorType: "system", ActorID: "wecom-local-secondary", Reason: "local_bootstrap", CorrelationID: "wecom-local-secondary", TraceID: "wecom-local-secondary"}
+		app, createErr := apps.Create(ctx, agentapp.CreateInput{App: agentapp.AgentApp{TenantID: wecomSecondaryTenantID, AgentAppID: wecomSecondaryAppID, AgentAppKey: "assistant", DisplayName: "WebUI Secondary Assistant"}, ChangeMetadata: appMetadata})
+		if createErr != nil {
+			return tenant.Tenant{}, configdomain.Snapshot{}, createErr
+		}
+		draft, draftErr := apps.CreateDraft(ctx, agentapp.CreateDraftInput{TenantID: wecomSecondaryTenantID, AgentAppID: wecomSecondaryAppID, ExpectedAppVersion: app.Version,
+			Revision: agentapp.Revision{AgentKind: agentapp.AgentKindLLM, Instruction: webUILocalInstruction, ModelProfileID: wecomSecondaryModelID, ModelProfileVersion: webUILocalModelVersion, ToolRefs: []agentapp.VersionedRef{{ID: localnote.ID, Version: localnote.Version, Required: true}}}, ChangeMetadata: appMetadata})
+		if draftErr != nil {
+			return tenant.Tenant{}, configdomain.Snapshot{}, draftErr
+		}
+		if _, err = apps.Publish(ctx, agentapp.PublishInput{TenantID: wecomSecondaryTenantID, AgentAppID: wecomSecondaryAppID, Revision: draft.Revision, ExpectedAppVersion: app.Version + 1, ExpectedDraftVersion: draft.DraftVersion, ChangeMetadata: appMetadata}); err != nil {
+			return tenant.Tenant{}, configdomain.Snapshot{}, err
+		}
+		published, publishErr := configs.Publish(ctx, configdomain.PublishInput{TenantID: wecomSecondaryTenantID, ExpectedTenantVersion: root.Version, Metadata: metadata,
+			Payload: configdomain.ConfigV1{SchemaVersion: 1, DefaultAgentAppID: wecomSecondaryAppID, PolicyVersion: 1,
+				ChannelBindings: []configdomain.ChannelBinding{{BindingID: wecomSecondaryBindingID, Channel: "wecom", ExternalAccountID: value.WeComSecondaryCorpID, AgentAppID: wecomSecondaryAppID, SecretRef: secrets.SecretRef{Ref: "secret://local/wecom-secondary-verify", Version: 1}, SendSecretRef: secrets.SecretRef{Ref: "secret://local/wecom-secondary-send", Version: 1}}},
+				BackendBindings: []configdomain.BackendBinding{{Domain: "memory", BackendProfileID: webUILocalMemoryID, BackendVersion: 1, Required: []string{"strong_ryw"}}, {Domain: "artifact", BackendProfileID: webUILocalMemoryID, BackendVersion: 1, Required: []string{"strong_ryw"}}}}})
+		if publishErr != nil {
+			return tenant.Tenant{}, configdomain.Snapshot{}, publishErr
+		}
+		root = published.Tenant
+	} else if err != nil {
+		return tenant.Tenant{}, configdomain.Snapshot{}, err
+	}
+	snapshot, err := configs.GetCurrent(ctx, wecomSecondaryTenantID)
+	if err != nil {
+		return tenant.Tenant{}, configdomain.Snapshot{}, err
+	}
+	return root, snapshot, nil
 }
 
 func ensureWebUILocalGraphChild(ctx context.Context, apps agentapp.Repository, metadata agentapp.ChangeMetadata, wanted webUILocalCapabilityRefs) (agentapp.Revision, error) {

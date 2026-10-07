@@ -12,6 +12,7 @@ import (
 
 	channel "github.com/liuzengh/trpc-agent-service/trpcservice/channels/contract"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/inflight"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
@@ -66,6 +67,7 @@ type Worker struct {
 	// preprocessing fails closed unless this policy is explicitly configured.
 	ArtifactRetention time.Duration
 	Telemetry         telemetry.Provider
+	Barrier           inflight.Barrier
 }
 
 func (w Worker) RunOnce(ctx context.Context, limit int) (int, error) {
@@ -84,6 +86,11 @@ func (w Worker) RunOnce(ctx context.Context, limit int) (int, error) {
 	processed := 0
 	for _, job := range jobs {
 		processed++
+		if w.Barrier != nil {
+			if err := w.Barrier.Wait(ctx, inflight.PointP1BeforeExecution); err != nil {
+				return processed, err
+			}
+		}
 		if err := w.preprocess(ctx, job); err != nil {
 			return processed, err
 		}

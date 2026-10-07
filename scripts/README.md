@@ -1,17 +1,14 @@
 # 脚本入口
 
-`scripts/` 按调用者分层。所有面向开发者或 CI 的脚本都会自行定位仓库根目录，因而可从
+`scripts/` 按调用者分层。所有面向开发者的脚本都会自行定位仓库根目录，因而可从
 任意工作目录以 `bash /absolute/path/to/script.sh` 调用。
 
 | 目录 | 调用者 | 内容 |
 | --- | --- | --- |
-| `ci/` | GitHub Actions、开发者 | admission、格式、依赖边界、文档链接 |
-| `e2e/` | GitHub Actions、开发者 | 按域后端 e2e、IM 契约与依赖恢复 |
-| `compose/` | `start.sh`、Compose 容器、开发者 | quickstart 与本地 PostgreSQL/Redis migration/runtime slice |
+| `e2e/` | 开发者 | 故障恢复、在途接管和单主机双节点演练 |
+| `compose/` | Compose 容器 | 仅保留容器内部的运行切片入口 |
 | `lib/` | 其他脚本 | 零-skip 等无独立业务语义的 helper |
-| `internal/` | Compose 容器定义 | backend adapter e2e 的容器内执行器；不得作为用户入口 |
 
 稳定的验收入口以 [README](../README.md) 和
-[可靠性功能文档](../docs/feature/reliability-failover/README.md) 为准。`ci/check-doc-links.sh` 会校验
-Markdown 的仓库内链接、标题锚点和 `scripts/*.sh` 引用。新增脚本必须先归类：不要把容器内部
-helper、CI helper 或一次性 e2e 再放回 `scripts/` 顶层。
+[可靠性功能文档](../docs/feature/reliability-failover/README.md) 为准。新增脚本必须先归类：不要把
+一次性调试脚本再放回 `scripts/` 顶层。

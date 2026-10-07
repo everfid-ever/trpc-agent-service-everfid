@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	channel "github.com/liuzengh/trpc-agent-service/trpcservice/channels/contract"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/inflight"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
 )
@@ -62,6 +63,7 @@ type Service struct {
 	MaxRetryDelay        time.Duration
 	MaxAttempts          int
 	MaxReconcileAttempts int
+	Barrier              inflight.Barrier
 }
 
 func (s Service) Deliver(ctx context.Context, event channel.ReplyEvent) error {
@@ -121,6 +123,11 @@ func (s Service) deliverSegment(ctx context.Context, event channel.ReplyEvent, a
 			return DeferredError{NotBefore: record.NotBefore}
 		default:
 			return runtime.ErrInvariantViolation
+		}
+	}
+	if s.Barrier != nil {
+		if err := s.Barrier.Wait(ctx, inflight.PointP4BeforeProviderDelivery); err != nil {
+			return err
 		}
 	}
 	contentDigest := plan.ContentDigest

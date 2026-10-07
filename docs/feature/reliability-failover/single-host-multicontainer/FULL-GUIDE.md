@@ -51,7 +51,7 @@
 
 **推论（对验收很重要）：** 不要去找"连接所有权转移"的代码或证据——它不存在。可核查的证据是：① 入口 `/statusz` 的健康集合变化；② 受害实例被摘除后新 callback 仍返回业务响应；③ 存活实例取得了更高的 fence 并完成提交。这三条共同等价于"连接接管成立"。
 
-> 相关实现（可选核对）：`cmd/trpc-service/wecom_ha_entry_role.go`（入口探测与转发）、`trpcservice/channels/contract/adapter.go`（渠道适配契约，回调式）、`trpcservice/channels/` 目录下全部渠道实现（`httpcallback` / `wecom` / `feishu` / `webui`，均为回调式，无 WebSocket 或长连接消费者）。
+> 相关实现（可选核对）：`cmd/trpc-service/wecom_ha_entry_role.go`（入口探测与转发）、`trpcservice/channels/contract/adapter.go`（渠道适配契约，回调式）、`trpcservice/channels/` 下的 `httpcallback`、`wecom` 与 `webui` 实现（均为回调式，无 WebSocket 或长连接消费者）。
 
 ## 4. live 与 ready 的差别
 

@@ -21,22 +21,4 @@ COPY --chown=nonroot:nonroot --from=build /out/trpc-healthcheck /trpc-healthchec
 USER nonroot:nonroot
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 CMD ["/trpc-healthcheck", "-path", "/readyz"]
 ENTRYPOINT ["/trpc-service"]
-CMD ["artifact"]
-
-# A code-execution Worker is intentionally a separate image target. The
-# regular service image stays distroless and cannot accidentally acquire a
-# shell. This target carries only the upstream managed-sandbox prerequisites;
-# the executed program is still placed in bubblewrap's clean environment with
-# an unshared network namespace by trpc-agent-go.
-FROM debian:bookworm-slim AS codeexec
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y bash bubblewrap ca-certificates python3 \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 65532 trpc \
-    && useradd --uid 65532 --gid 65532 --create-home --home-dir /var/lib/trpc --shell /usr/sbin/nologin trpc
-COPY --from=build /out/trpc-service /trpc-service
-COPY --from=build /out/trpc-healthcheck /trpc-healthcheck
-USER 65532:65532
-HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 CMD ["/trpc-healthcheck", "-path", "/readyz"]
-ENTRYPOINT ["/trpc-service"]
-CMD ["worker"]
+CMD ["webui-local"]

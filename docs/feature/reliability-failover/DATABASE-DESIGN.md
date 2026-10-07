@@ -63,9 +63,8 @@
 ### 2.3 本地验证与重置入口
 
 ```bash
-# 从零验证 schema 与运行切片
-bash scripts/ci/admission.sh
-# 或使用 Compose 的 runtime-test profile
+# 验证持久化会话、租约 fence、Outbox 与投递台账
+go test ./migrations ./trpcservice/gateway/postgres ./trpcservice/worker
 
 # 重置数据库卷（必须使用该显式命令，不要手工删卷）
 docker compose -f deploy/compose/docker-compose.local.yml down -v

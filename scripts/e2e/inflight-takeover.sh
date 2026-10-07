@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Verifies P2 recovery: a node is killed after model/tool execution but before
-# result persistence and terminal commit, and the peer finishes the input.
+# Verifies P1–P4 recovery: a node is killed at a durable-work boundary and
+# the peer finishes the original input without a second visible reply.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -20,9 +20,10 @@ route="${TRPC_WEBUI_LOCAL_ROUTE_KEY:-local-webui}"
 account="local-account"
 diagnostics="$(mktemp -d "${TMPDIR:-/tmp}/trpc-inflight-takeover.XXXXXX")"
 
-case "${1:-p2}" in
-  p2) ;;
-  *) echo "usage: $0 [p2]" >&2; exit 2 ;;
+point="${1:-p2}"
+case "${point}" in
+  p1|p2|p3|p4) ;;
+  *) echo "usage: $0 [p1|p2|p3|p4]" >&2; exit 2 ;;
 esac
 
 command -v docker >/dev/null 2>&1 || { echo "Docker Desktop is required" >&2; exit 2; }
@@ -83,7 +84,7 @@ send_message() {
 wait_barrier_hit() {
   local port="$1" body
   for _ in $(seq 1 180); do
-    body="$(curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${port}/test/failover/p2/status" -H "X-TRPC-Local-Token: ${token}")"
+    body="$(curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${port}/test/failover/${point}/status" -H "X-TRPC-Local-Token: ${token}")"
     [[ "${body}" == *'"hit":true'* ]] && return 0
     sleep 1
   done
@@ -106,9 +107,9 @@ wait_reply() {
   return 1
 }
 
-arm_p2() {
+arm_point() {
   local port="$1"
-  curl --fail --silent --show-error --max-time 5 -X POST "http://127.0.0.1:${port}/test/failover/p2/arm" \
+  curl --fail --silent --show-error --max-time 5 -X POST "http://127.0.0.1:${port}/test/failover/${point}/arm" \
     -H "X-TRPC-Local-Token: ${token}" >/dev/null
 }
 
@@ -116,10 +117,10 @@ compose up --detach --build
 wait_ready "${port_a}"
 wait_ready "${port_b}"
 
-message_id="p2-takeover-$(openssl rand -hex 8)"
-user="p2-user"
-chat="p2-chat"
-arm_p2 "${port_a}"
+message_id="${point}-takeover-$(openssl rand -hex 8)"
+user="${point}-user"
+chat="${point}-chat"
+arm_point "${port_a}"
 send_message "${port_a}" "${user}" "${chat}" "${message_id}" "Reply exactly ${message_id}"
 wait_barrier_hit "${port_a}"
 # SIGKILL bypasses the worker's graceful drain while it owns the P2 lease.
@@ -127,4 +128,4 @@ compose kill -s KILL webui-node-a
 wait_ready "${port_b}"
 wait_reply "${port_b}" "${user}" "${chat}" "${message_id}"
 
-echo "in-flight takeover smoke passed: P2 resumed after SIGKILL with one durable visible reply"
+echo "in-flight takeover smoke passed: ${point} resumed after SIGKILL with one durable visible reply"

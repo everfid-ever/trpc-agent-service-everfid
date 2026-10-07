@@ -241,7 +241,7 @@ bash scripts/e2e/single-host-multicontainer.sh
 
 ## 十、指标采集与判读示例
 
-Prometheus 侧（语义级，具体规则见 `deploy/prometheus-alerts.yml` / `deploy/compose/prometheus.yml`）可采集：
+任意现有观测系统可采集以下语义指标：
 
 - 入口健康后端数：`count(entry_backends_healthy == 1)`。
 - 节点 `/readyz` 成功率：`probe_success{job="node-a"}`。

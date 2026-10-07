@@ -11,9 +11,6 @@
 ## 本地验收
 
 ```bash
-# PostgreSQL/Redis runtime slice：会话、fence、Outbox 和回复去重
-bash scripts/e2e/backend-adapter.sh runtime
-
 # 两个节点在 PostgreSQL/Redis 短断后恢复
 bash scripts/e2e/dependency-recovery.sh
 

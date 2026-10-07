@@ -1,6 +1,6 @@
 # 单主机多容器实例可用性 — 发布与运维
 
-> 本文覆盖配置、部署、发布顺序、观测指标与告警、回滚约束、故障处置手册。所有服务名、端口、环境变量均与实现代码一致（可选核对：`deploy/compose/docker-compose.local.yml`、`cmd/trpc-service/wecom_ha_entry_role.go`、`cmd/trpc-service/webui_local_role.go`、`deploy/prometheus-alerts.yml`、`deploy/compose/prometheus.yml`）。
+> 本文覆盖配置、部署、发布顺序、观测指标、回滚约束与故障处置手册。所有服务名、端口和环境变量均与实现代码一致（可选核对：`deploy/compose/docker-compose.local.yml`、`cmd/trpc-service/wecom_ha_entry_role.go`、`cmd/trpc-service/webui_local_role.go`）。
 
 ## 一、资源与配置门禁
 
@@ -31,9 +31,9 @@ docker compose --profile wecom-ha-local up --detach --build
 | 入口 | healthy backend count、`callback` 成功率、`/readyz` 可用性、入口到后端延迟 | 入口 `/statusz`：`backends[].healthy` |
 | 调度 | active owner、lease lost 数、`stale fence` 拒绝数、pending oldest age、reclaim rate | Redis lease / PostgreSQL `session_head.last_fence`、worker 日志 |
 | 业务 | per-tenant final success、duplicate final、reply retry/ambiguous、queue lag | `delivery_ledger.state`、`outbox.state`、`inbox.state` |
-| 依赖 | PostgreSQL 连接池、Redis 命中/延迟、Qdrant/ClamAV 健康 | `/readyz` 依赖探测；`deploy/prometheus-alerts.yml` |
+| 依赖 | PostgreSQL 连接池、Redis 命中/延迟、Qdrant/ClamAV 健康 | `/readyz` 依赖探测与容器健康状态 |
 
-推荐告警（语义级，具体规则见 `deploy/prometheus-alerts.yml` / `deploy/compose/prometheus.yml`）：
+推荐以入口 `/statusz`、节点 `/readyz`、容器健康状态和持久化台账定期检查：
 
 - **入口无健康后端**：`count(healthy==true)==0` 持续 > 探测周期 → 严重（公开回调将 503）。
 - **单实例丢失**：某 `instance_id` 的 `/readyz` 持续失败且 `State.Running==true` → 进程假死，需人工介入。
@@ -98,9 +98,9 @@ docker compose --profile wecom-ha-local up --detach --build
 - 现象：postgres/redis 宕机，两实例 `/readyz` 同时 503，入口随之无健康后端。
 - 处理：这属于单一故障域内的依赖故障，本能力不保证其可用性；按依赖自身的高可用（外部 PostgreSQL/Redis 集群、跨主机部署）解决。本包只验证"应用实例级"故障接管，不替代依赖级 HA。
 
-## 七、告警规则示例（语义级，供映射到 deploy/prometheus-alerts.yml）
+## 七、告警规则示例（语义级）
 
-以下为语义级规则描述，具体表达式见 `deploy/prometheus-alerts.yml` / `deploy/compose/prometheus.yml`：
+以下为可映射到现有观测系统的语义级规则：
 
 ```yaml
 # 入口无健康后端（严重）：所有 backend healthy=false 持续 > 探测周期
