@@ -33,6 +33,16 @@ func (e *BudgetExceededError) Error() string        { return "execution budget e
 func (e *BudgetExceededError) Is(target error) bool { return target == ErrExecutionBudgetExceeded }
 
 type executionBudgetKey struct{}
+type llmCallObserverKey struct{}
+
+type LLMCallObserver func(context.Context) error
+
+func WithLLMCallObserver(ctx context.Context, observer LLMCallObserver) context.Context {
+	if observer == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, llmCallObserverKey{}, observer)
+}
 
 type budgetController struct {
 	budget ExecutionBudget
@@ -60,6 +70,9 @@ func ConsumeLLMCall(ctx context.Context) error {
 		return controller.reject("max_llm_calls")
 	}
 	controller.llm++
+	if observer, ok := ctx.Value(llmCallObserverKey{}).(LLMCallObserver); ok {
+		return observer(ctx)
+	}
 	return nil
 }
 

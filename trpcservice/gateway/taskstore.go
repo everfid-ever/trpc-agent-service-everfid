@@ -115,3 +115,7 @@ type TaskStore interface {
 	RequestCancel(context.Context, CancelRequest) (CancelResult, error)
 	InputParker
 }
+
+type ModelCallCounter interface {
+	RecordModelCall(context.Context, ExecutionKey) error
+}

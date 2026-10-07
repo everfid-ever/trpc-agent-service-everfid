@@ -21,6 +21,21 @@ func NewTaskStore(db *sql.DB) *TaskStore {
 	return &TaskStore{db: db, parkPolicy: gateway.DefaultParkPolicy()}
 }
 
+func (s *TaskStore) RecordModelCall(ctx context.Context, key gateway.ExecutionKey) error {
+	if s == nil || s.db == nil || key.TenantID == "" || key.RequestID == "" {
+		return runtime.ErrCapabilityUnsupported
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE execution_record SET model_call_count=model_call_count+1, updated_at=clock_timestamp() WHERE tenant_id=$1 AND request_id=$2`, key.TenantID, key.RequestID)
+	if err != nil {
+		return translate(err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil || count != 1 {
+		return runtime.ErrVersionMismatch
+	}
+	return nil
+}
+
 func NewTaskStoreWithParkPolicy(db *sql.DB, policy gateway.ParkPolicy) (*TaskStore, error) {
 	if db == nil {
 		return nil, runtime.ErrCapabilityUnsupported

@@ -3832,6 +3832,7 @@ CREATE TABLE public.execution_record (
     outcome text DEFAULT 'queued'::text NOT NULL,
     result_ref text,
     park_attempt integer DEFAULT 0 NOT NULL,
+	model_call_count integer DEFAULT 0 NOT NULL,
     not_before timestamp with time zone,
     version bigint DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -3845,6 +3846,7 @@ CREATE TABLE public.execution_record (
     CONSTRAINT execution_record_input_seq_check CHECK ((input_seq >= 1)),
     CONSTRAINT execution_record_outcome_check CHECK ((outcome = ANY (ARRAY['queued'::text, 'running'::text, 'pending'::text, 'blocked'::text, 'waiting_confirmation'::text, 'succeeded'::text, 'denied'::text, 'failed'::text, 'cancelled'::text, 'confirmation_denied'::text, 'confirmation_timeout'::text]))),
     CONSTRAINT execution_record_park_attempt_check CHECK ((park_attempt >= 0)),
+	CONSTRAINT execution_record_model_call_count_check CHECK ((model_call_count >= 0)),
     CONSTRAINT execution_record_park_state_check CHECK (((park_attempt >= 0) AND ((park_deadline IS NULL) OR (not_before IS NULL) OR (not_before <= park_deadline)) AND ((outcome <> 'blocked'::text) OR ((blocked_at IS NOT NULL) AND (blocked_reason = ANY (ARRAY['park_attempts_exhausted'::text, 'park_deadline_exceeded'::text])))))),
     CONSTRAINT execution_record_version_check CHECK ((version >= 0))
 );

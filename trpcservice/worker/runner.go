@@ -278,6 +278,11 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	// must receive the same trusted execution context as Tool.Call.
 	runCtx := runtime.WithExecutionBudget(runtime.WithExecutionContext(ctx, runtime.ExecutionContext{TenantID: envelope.TenantID,
 		RequestID: envelope.RequestID, SubjectID: envelope.UserID, PolicyVersion: envelope.PolicyVersion, PayloadKeyVersion: payload.KeyVersion}), envelope.ExecutionBudget)
+	if counter, ok := w.Tasks.(gateway.ModelCallCounter); ok {
+		runCtx = runtime.WithLLMCallObserver(runCtx, func(callCtx context.Context) error {
+			return counter.RecordModelCall(callCtx, gateway.ExecutionKey{TenantID: envelope.TenantID, RequestID: envelope.RequestID})
+		})
+	}
 	var cancelBudget context.CancelFunc
 	if envelope.ExecutionBudget.ExecutionTimeoutSeconds > 0 {
 		runCtx, cancelBudget = context.WithTimeout(runCtx, time.Duration(envelope.ExecutionBudget.ExecutionTimeoutSeconds)*time.Second)
