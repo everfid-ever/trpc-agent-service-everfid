@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
@@ -128,6 +129,7 @@ type webUILocalConfig struct {
 	RouteKey, Token, InstanceID, ClamAVAddress                                 string
 	ExclusiveRuntime                                                           bool
 	FailoverTestEnabled                                                        bool
+	StatusEnabled                                                              bool
 	FeishuEnabled                                                              bool
 	FeishuAppID, FeishuAppSecret                                               string
 	FeishuVerificationToken, FeishuEncryptKey, FeishuBotOpenID                 string
@@ -156,6 +158,13 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	configValue, err := loadWebUILocalConfig(getenv)
 	if err != nil {
 		return fmt.Errorf("configuration rejected: %w", err)
+	}
+	processStartID := ""
+	if configValue.StatusEnabled {
+		processStartID, err = newWebUILocalProcessStartID()
+		if err != nil {
+			return errors.New("process identity initialization failed")
+		}
 	}
 	telemetryProvider, err := newRoleTelemetry(parent, getenv, "webui-local", logger)
 	if err != nil {
@@ -412,6 +421,12 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	if failoverBarrier != nil {
 		registerWebUILocalFailoverTestEndpoints(mux, configValue.Token, failoverBarrier)
 	}
+	if processStartID != "" {
+		mux.HandleFunc("/statusz", func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(writer).Encode(map[string]string{"instance_id": configValue.InstanceID, "process_start_id": processStartID})
+		})
+	}
 	server := &http.Server{Addr: configValue.ListenAddress, Handler: mux, ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 
@@ -537,6 +552,7 @@ func loadWebUILocalConfig(getenv func(string) string) (webUILocalConfig, error) 
 		ClamAVAddress:           valueOr(getenv("TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS"), "clamav:3310"),
 		ExclusiveRuntime:        strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_EXCLUSIVE_RUNTIME")), "true"),
 		FailoverTestEnabled:     strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED")), "true"),
+		StatusEnabled:           strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_STATUS_ENABLED")), "true"),
 		FeishuEnabled:           strings.EqualFold(strings.TrimSpace(getenv("TRPC_FEISHU_LOCAL_ENABLED")), "true"),
 		FeishuAppID:             strings.TrimSpace(getenv("FEISHU_APP_ID")),
 		FeishuAppSecret:         strings.TrimSpace(getenv("FEISHU_APP_SECRET")),
@@ -586,6 +602,14 @@ func validWebUILocalInstanceID(value string) bool {
 
 func (value webUILocalConfig) instanceName(component string) string {
 	return "webui-local-" + component + "-" + value.InstanceID
+}
+
+func newWebUILocalProcessStartID() (string, error) {
+	value := make([]byte, 8)
+	if _, err := cryptorand.Read(value); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value), nil
 }
 
 // registerWebUILocalFailoverTestEndpoints exposes an opt-in control plane for

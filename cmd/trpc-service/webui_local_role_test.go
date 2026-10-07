@@ -51,7 +51,7 @@ func TestLoadWebUILocalConfigDefaultsAndRejectsUnsafeInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	if value.ListenAddress != ":8080" || value.RouteKey != webUILocalRouteKey || value.Token != webUILocalToken || value.InstanceID != "standalone" ||
-		value.APIKeyFile != "/run/secrets/deepseek_api_key" || value.ExclusiveRuntime || value.FailoverTestEnabled {
+		value.APIKeyFile != "/run/secrets/deepseek_api_key" || value.ExclusiveRuntime || value.FailoverTestEnabled || value.StatusEnabled {
 		t.Fatalf("unexpected defaults: %+v", value)
 	}
 	exclusive := cloneEnvironment(base)
@@ -65,6 +65,12 @@ func TestLoadWebUILocalConfigDefaultsAndRejectsUnsafeInput(t *testing.T) {
 	configured, err = loadWebUILocalConfig(mapEnvironment(failover))
 	if err != nil || !configured.FailoverTestEnabled {
 		t.Fatalf("failover config=%+v err=%v", configured, err)
+	}
+	status := cloneEnvironment(base)
+	status["TRPC_WEBUI_LOCAL_STATUS_ENABLED"] = "true"
+	configured, err = loadWebUILocalConfig(mapEnvironment(status))
+	if err != nil || !configured.StatusEnabled {
+		t.Fatalf("status config=%+v err=%v", configured, err)
 	}
 	for _, item := range []struct{ name, value string }{
 		{"TRPC_WEBUI_LOCAL_TOKEN", "short"},
@@ -115,6 +121,17 @@ func TestLoadWebUILocalConfigDefaultsAndRejectsUnsafeInput(t *testing.T) {
 	configured, err = loadWebUILocalConfig(mapEnvironment(wecom))
 	if err != nil || !configured.WeComEnabled || configured.WeComCorpID != "ww_local" || configured.WeComAgentID != 1000002 {
 		t.Fatalf("configured=%+v err=%v", configured, err)
+	}
+}
+
+func TestWebUILocalProcessStartIDIsFreshHex(t *testing.T) {
+	first, err := newWebUILocalProcessStartID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newWebUILocalProcessStartID()
+	if err != nil || len(first) != 16 || len(second) != 16 || first == second {
+		t.Fatalf("first=%q second=%q err=%v", first, second, err)
 	}
 }
 
