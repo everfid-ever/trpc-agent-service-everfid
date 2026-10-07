@@ -31,6 +31,7 @@ type ExecutionStatus struct {
 	Version         int64
 	CancelRequested bool
 	CancelVersion   int64
+	ModelCallCount  int
 }
 type CancelRequest struct {
 	TenantID, RequestID string
