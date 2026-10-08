@@ -27,7 +27,7 @@ func (value webUILocalConfig) instanceName(component string) string {
 }
 ```
 
-装配到以下七个组件（`/statusz.owners` 的键即为组件名）：
+装配到以下七个组件（owner 用于 lease、queue consumer 和日志关联，**不经 `/statusz` 暴露**）：
 
 | 组件 | 角色 | **实际装配参数** |
 |---|---|---|
@@ -50,8 +50,8 @@ func (value webUILocalConfig) instanceName(component string) string {
 | `/callbacks/wecom` | 渠道回调入口（存在 WeCom endpoint 时注册） |
 | `/livez` | 恒 200。**只表示进程没退出** |
 | `/readyz` | `db.PingContext` 与 `redis.Ping` 与 malware 探针任一失败 → 503。这才表示"能安全处理业务" |
-| `/statusz` | 返回 `{instance_id, process_start_id, owners{...}, inflight_test_barrier}`。**不返回** tenant、会话或 Secret |
-| `/test/failover/barrier/release` | 仅当测试 barrier 非 nil 时注册；要求 `POST` + header `X-TRPC-Local-Token == Token`，否则 404；成功 204。**只释放测试暂停**，不做业务重试、不改租约、不补发回复 |
+| `/statusz` | 返回 `{instance_id, process_start_id}`。**不返回** tenant、会话、任务或 Secret；barrier 状态通过 point-scoped test endpoint 查询。 |
+| `/test/failover/{p1|p2|p3|p4}/{arm,status,release}` | 仅启用 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true` 时注册；所有操作要求 `X-TRPC-Local-Token`，未鉴权为 403。标准 E2E arm node-a 后强杀它，不向 survivor release。 |
 
 ### 1.4 编排顺序
 
@@ -410,7 +410,7 @@ Reply Stream → Delivery.Deliver(event)
 
 1. `Ledger.ClaimDelivery(key, plan, Claim{Owner, TTL=30s})`。
 2. 未领到：`sent`/`failed` → 返回 nil（终态，不再动作）；`ambiguous` → `reconcile`；`pending`/`sending`/`retry_wait` → `DeferredError{NotBefore}`。
-3. **P3 barrier**（claim 后、调用 adapter 前）。
+3. Delivery 本身没有 P3 barrier；P3 位于 Reply Relay 的 `PublishReply` 前。
 4. `deliverWithClaimRenewal`：后台按 `claimTTL/3` 续租 claim；续租失败 → 取消调用 context。
 5. 错误分类：
    - `AmbiguousDeliveryError` → `state='ambiguous'`，`last_error_class='response_lost'`，`FinishDelivery`；
@@ -418,7 +418,7 @@ Reply Stream → Delivery.Deliver(event)
    - `RetryableDeliveryError` → `finishRetry(请求的 delay)`；其他 → `finishRetry(0)`；
    - `Delivered=false` → `finishRetry(ErrBackendUnavailable)`；
    - `ProviderMessageID == ""` → `state='ambiguous'`，`last_error_class='missing_provider_message_id'`。
-6. **P4 barrier**（拿到 provider receipt 后、持久化 `sent` 前）。
+6. P4 barrier 位于本函数 `ClaimDelivery` 成功后、调用 provider 前。
 7. `state='sent'` + `provider_message_id`，`FinishDelivery`。
 8. 仅在投递终态（`sent` 或 `failed`）持久化后，才 ACK account-queue entry。
 

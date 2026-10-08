@@ -6,9 +6,9 @@
 
 ## 一、统一流程与参数
 
-在隔离 Compose 项目中**只为本轮设置一个** `TRPC_INFLIGHT_TEST_BARRIER`；通常将 `TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID=auto`，让两个节点都能报告实际命中。脚本从 `/statusz` 找到命中的 owner 后才执行 SIGKILL，再通过受保护的本地 test endpoint 释放存活节点的 barrier。
+脚本使用 `webui-multinode` profile 启动隔离 Compose 项目。两个节点均显式启用 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true`；每轮只对 **node-a** 的一个 point 调用受保护的 `arm` endpoint。脚本确认该节点命中后直接 SIGKILL 它，node-b 从 durable state 接管。
 
-> 🔴 release **仅恢复测试暂停条件**，不会重投消息、删除 lease、修改任务状态或补发回复。若某轮测试需要手工改状态才"通过"，该轮结论应为**未验证自动接管**。
+> 🔴 `release` endpoint 只用于 endpoint 单测或不杀进程的局部调试；标准 E2E **不调用 release**。若某轮需要手工改状态、重投消息或释放存活节点的 barrier 才"通过"，该轮结论应为**未验证自动接管**。
 
 ```bash
 # 用法
@@ -20,19 +20,15 @@ TRPC_INFLIGHT_TENANT_ID=<tenant-a-id> \
 | 变量 | 含义 | 默认 |
 |---|---|---|
 | `TRPC_INFLIGHT_POINT` / `$1` | 选 P1–P4 窗口 | （必填） |
-| `TRPC_INFLIGHT_VICTIM_SERVICE` | 受害服务 `auto` / `wecom-ha-node-a` / `wecom-ha-node-b` | `auto` |
-| `TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID` | 命中槽位 `auto` / 具体实例 | `auto` |
-| `TRPC_INFLIGHT_TENANT_ID` | 限定租户（其余租户作并发对照） | 空 = 任意 |
-| `TRPC_INFLIGHT_PROJECT` | Compose 项目名 | `trpc-inflight-${RANDOM}${RANDOM}` |
-| `TRPC_INFLIGHT_TIMEOUT_SECONDS` | 就绪 / 命中超时 | `180` |
-| `TRPC_INFLIGHT_KEEP_ENVIRONMENT` | 保留现场 | `false` |
-| `TRPC_INFLIGHT_CONTROL_TOKEN` | release 鉴权 token | 回退 `TRPC_WEBUI_LOCAL_TOKEN` / `local-webui-token-change-me` |
-| `TRPC_LOCAL_WECOM_HA_NODE_A_PORT` / `..._NODE_B_PORT` | 节点观测端口 | `58088` / `58089` |
+| `$1` | 选 P1–P4 窗口 | `p2` |
+| `TRPC_WEBUI_LOCAL_TOKEN` | 控制面与 WebUI 签名 token | `local-webui-token-change-me` |
+| `TRPC_WEBUI_LOCAL_ROUTE_KEY` | WebUI 路由 key | `local-webui` |
+| `TRPC_LOCAL_MULTINODE_NODE_A_PORT` / `..._NODE_B_PORT` | 临时节点观测端口 | 脚本随机分配 |
 
 **前置校验（脚本自动执行，失败即退出码 2）：**
 
 - `docker`、`docker compose version`（v2）、`curl` 必须存在；
-- `deploy/compose/secrets/deepseek-api-key` 与 `deploy/compose/secrets/wecom.env` 必须存在且**非空**；
+- `deploy/compose/secrets/deepseek-api-key` 必须存在且**非空**；
 - 两个节点的 `/readyz` 必须在 `TRPC_INFLIGHT_TIMEOUT_SECONDS` 内返回 200。
 
 ---
@@ -41,27 +37,20 @@ TRPC_INFLIGHT_TENANT_ID=<tenant-a-id> \
 
 `scripts/e2e/inflight-takeover.sh` 主线：
 
-1. 定义 `compose()` 包装：`TRPC_INFLIGHT_TEST_BARRIER=<point> TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID=<id> TRPC_INFLIGHT_TEST_BARRIER_TENANT_ID=<tenant> docker compose --project-name <p> -f docker-compose.local.yml --profile wecom-ha-local "$@"` —— 用隔离项目名，只注入 barrier 变量，**不改既有 `.env.local`**。
-2. 校验 point 只能是 `p1|p2|p3|p4`（大小写归一化），victim 与 barrier instance 只能是 `auto|wecom-ha-node-a|wecom-ha-node-b`；非法即退出 2。
-3. `capture_diagnostics()` 在 cleanup 时 dump `compose ps` 与 `compose logs --no-color` 到 `mktemp -d "${TMPDIR:-/tmp}/trpc-inflight-takeover.XXXXXX"`，除非 `KEEP_ENVIRONMENT=true` 否则 `compose down --volumes --remove-orphans`。
-4. `wait_http(url, desc)`：每 1s `curl --fail --max-time 3`，超过超时即退出非 0。
-5. `wait_barrier_hit()`：轮询 `node-a` / `node-b` 的 `/statusz`，同时匹配 `"enabled":true`、`"point":"<point>_"`、`"hit":true`；命中即确定 victim / survivor（若 `VICTIM_SERVICE` 非 `auto` 则只在指定服务上找）。
-6. `compose up --detach --build` → 等两节点 `/readyz` → 打印「现在通过选定的 Bot 发送一条新的、带唯一标记的消息」提示（脚本**不伪造**用户输入）。
-7. `docker kill --signal=KILL <victim_container>` 强杀（非优雅退出）。
-8. 断言 survivor `/readyz` 可用；`docker inspect --format '{{.State.Running}}'` 断言 victim 为 `false`。
-9. `curl -X POST -H "X-TRPC-Local-Token: <token>" http://<survivor>/test/failover/barrier/release` —— 只释放存活节点 barrier（成功 204；token 不符返回 404）。
-10. 按 `TRPC_WECOM_REAL_ACCEPTANCE` 输出 `assumed` / `recorded`，其他取值退出 2。
+1. 以随机项目名和随机 host ports 执行 `docker compose --profile webui-multinode up --detach --build`。
+2. 等待 node-a、node-b 的 `/readyz`。
+3. 对 node-a `POST /test/failover/<point>/arm`（`X-TRPC-Local-Token` 鉴权），并经签名 WebUI callback 写入一条带唯一 `external_message_id` 的输入。
+4. 轮询 node-a `/test/failover/<point>/status` 至 `{"hit":true}`；这证明已到达该 durable boundary。
+5. `docker compose kill -s KILL webui-node-a`；等待 node-b ready，并轮询 node-b 的同一会话 reply。
+6. 成功时打印原 message id；失败时保留 Compose 日志到临时目录，随后销毁仅本轮创建的项目和 volumes。
 
 | 参数 | 作用 | 影响 |
 |---|---|---|
-| `TRPC_INFLIGHT_POINT` / `$1` | 选窗口 | 决定 P1–P4 哪个 barrier 启用 |
-| `TRPC_INFLIGHT_VICTIM_SERVICE` | 指定 victim | `auto` 时由 `/statusz` 命中动态确定 |
-| `TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID` | 限定槽位 | `auto` 让两节点都报告，脚本选真正命中的 |
-| `TRPC_INFLIGHT_TENANT_ID` | 限定租户 | 其余租户作并发对照（建议 Tenant B） |
-| `TRPC_INFLIGHT_TIMEOUT_SECONDS` | 超时 | 就绪/命中超期即退出非 0 |
-| `TRPC_INFLIGHT_KEEP_ENVIRONMENT` | 保留现场 | `false` 时只清理自创项目与卷 |
+| `$1` | 选窗口 | 决定 node-a 要 arm 的 P1–P4 barrier |
+| `TRPC_WEBUI_LOCAL_TOKEN` | 请求鉴权 | 保护 arm/status/release 控制面与 callback 签名 |
+| `TRPC_LOCAL_MULTINODE_NODE_A_PORT` / `...B...` | 端口覆盖 | 方便固定端口的本地调试；脚本默认随机 |
 
-> **脚本不负责制造业务消息。** 出现等待提示后，由测试人员向已绑定的 Bot 发送本轮唯一标记消息。脚本只在该消息已到达目标 durable boundary、`/statusz` 报告 hit 之后，才终止实际 owner。
+> **脚本负责制造一条经签名的 WebUI 输入。** 真实 WeCom 的人工会话连续性由 `single-host-multicontainer.sh` 和外部渠道演练验证；P1–P4 脚本只证明共享 durable state 上的接管。
 
 ---
 
@@ -127,28 +116,26 @@ FROM tool_attempt WHERE tenant_id = $1 AND request_id = $2;
 ### 3.3 P3（结果已提交未发送）
 
 ```bash
-TRPC_INFLIGHT_TENANT_ID=<tenant-a-id> bash scripts/e2e/inflight-takeover.sh p3
+bash scripts/e2e/inflight-takeover.sh p3
 ```
 
-- **命中前**：`session_commit` 出现终态行、`session_head.next_input_seq` 已 +1、`reply` outbox 为 `pending`、`result_payload` 已写；barrier 命中（P3 挂在 `ClaimDelivery` 成功之后、调用 adapter 之前）。
-- **强杀后**：`delivery_ledger` 停在初始/`sending` 态，`result_payload` 不变。
-- **存活节点动作**：relay 重放 reply outbox → `Deliver` → `ClaimDelivery` → 发送**已保存**的 `result_payload`；**绝不重跑模型**。
+- **命中前**：`session_commit` 出现终态行、`session_head.next_input_seq` 已 +1、`reply` outbox 已被 relay claim、`result_payload` 已写；barrier 命中在构造 `ReplyEvent` 后、`PublishReply` 前。
+- **强杀后**：reply outbox claim 到期，`result_payload` 不变；Delivery Ledger 尚未被该 barrier 触及。
+- **存活节点动作**：relay 重领 reply outbox → 发布同一 `ReplyEvent` → `Deliver` → `ClaimDelivery` → 发送**已保存**的 `result_payload`；**绝不重跑模型**。
 - ✅ **通过**：已提交结果被发送；`session_commit` 终态唯一（未被二次提交）；恢复阶段的模型调用次数 = 0。
 - ❌ **不能作为通过**：只看到 outbox 记录；或重新触发了模型执行。
 
 ### 3.4 P4（下游已接受本地未确认）
 
 ```bash
-TRPC_INFLIGHT_TENANT_ID=<tenant-a-id> bash scripts/e2e/inflight-takeover.sh p4
+bash scripts/e2e/inflight-takeover.sh p4
 ```
 
-- **命中前**：`delivery_ledger.state='sending'` 且 `claim_until` 有效（已 `ClaimDelivery`）；adapter 已返回 `ProviderMessageID`；barrier 命中（P4 挂在拿到 provider receipt 之后、持久化 `sent` 之前）。
-- **强杀后**：`state` 停在 `sending`，`claim_until` 过期；`sent` 未持久化。
-- **存活节点动作**：重新 `ClaimDelivery` —— 先把超期 `sending` 改写为 `ambiguous` / `last_error_class='owner_lost'`，再 claim；按 `client_request_id`（由 `(tenant_id, delivery_key, segment_no)` 稳定推导）调下游去重或对账。
-  - 下游支持去重/查询 → `ReconcileDelivery` 收敛到 `sent`，最终回复一次；
-  - 下游**不支持** → 保留 `ambiguous` 并告警；**不得盲重发，不得伪造 receipt**。
-- ✅ **通过**：用 provider 接受/对账证据解释去重；或诚实 `ambiguous` 且已告警。
-- ❌ **不能作为通过**：仅凭「客户端暂未显示」「上次 HTTP 超时」就判定未发送并重发。
+- **命中前**：`delivery_ledger.state='sending'` 且 `claim_until` 有效（已 `ClaimDelivery`）；barrier 命中在 provider 调用之前。
+- **强杀后**：`state` 停在 `sending`，claim 到期，**没有** provider receipt；这是可安全重试的窗口。
+- **存活节点动作**：重新 claim 后以同一 `client_request_id` 调 provider 并完成 `sent`；若在真实 provider 调用后的网络中断形成 `ambiguous`，再按下游去重/查询对账；下游不支持时保留 `ambiguous` 并告警。
+- ✅ **通过**：同一原输入只产生一次 visible reply，ledger 终态可解释。
+- ❌ **不能作为通过**：把 P4 测试 barrier 当作“provider 已接受未落库”的模拟；该未知结果窗口靠 adapter reconcile 的单独反例测试覆盖。
 
 ### 3.5 速查表（命中前 / 强杀后 / 存活动作）
 
@@ -156,8 +143,8 @@ TRPC_INFLIGHT_TENANT_ID=<tenant-a-id> bash scripts/e2e/inflight-takeover.sh p4
 |---|---|---|---|---|
 | `... p1` | `inbox` 有行 + `preprocess_job.state='ready'` | job 保持 `ready` / `dispatched_at` NULL | `ClaimReadyForDispatch` 接力 dispatch | execution 被创建并走到 terminal |
 | `... p2` | `execution_record.outcome='running'` + lease | lease TTL 过期 + stream pending | `Reclaim` + 新 fence 重跑模型 | 唯一 terminal commit，旧 fence 被拒 |
-| `... p3` | `session_commit` 终态 + reply outbox pending | ledger 未 `sending` | relay 重放 + 发送 `result_payload` | 已提交结果被发送，模型不重跑 |
-| `... p4` | `delivery_ledger.state='sending'` + `ProviderMessageID` | `sent` 未持久化 | 回收超时 claim + 对账/去重 | 收敛 `sent` 或保留 `ambiguous` |
+| `... p3` | `session_commit` 终态 + reply outbox claimed | reply event 未发布 | relay 重领并发布 + 发送 `result_payload` | 已提交结果被发送，模型不重跑 |
+| `... p4` | `delivery_ledger.state='sending'`、provider 尚未调用 | claim 到期 | 回收超时 claim + 安全发送 | 一次 visible reply |
 
 ---
 
@@ -366,3 +353,7 @@ DELTA_POLL: <n>s   证据存档: <diagnostics 目录>
 - 显式记录 `TRPC_WECOM_REAL_ACCEPTANCE`（默认 `assumed`），真实对话证据另存独立运行目录。
 - §8.2 的反例用例作为**"必须失败"的契约测试**一并运行；若某个反例没能被判失败，说明验收判据本身失效，应优先修复判据而不是放过。
 - 每个 job 产出 §十一 的结论模板文本作为 artifact，便于横向比较不同 P 点的恢复行为。
+
+## 当前实现增量验收：工具执行中强杀
+
+除 P1–P4 barrier 外，新增以下判定：可查询工具在接管后只能查询并复用已完成结果；幂等工具的多次调用必须使用同一 idempotency key；`manual` 工具不得再次调用外部实现，终态原因应为 `tool_effect_unknown`。证据至少包含 `tool_execution.attempt/fence/lease_owner/state`、`tool_attempt.state`、`tool_result_payload.result_ref` 和最终 `session_commit`。

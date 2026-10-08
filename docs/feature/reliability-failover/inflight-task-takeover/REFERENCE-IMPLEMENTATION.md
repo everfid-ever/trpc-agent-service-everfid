@@ -14,13 +14,66 @@
 | P1 挂点 | `trpcservice/preprocess/worker.go` |
 | P2 挂点 / 提交 | `trpcservice/worker/runner.go` |
 | 消费 / 续租 / ACK | `trpcservice/worker/consumer.go` |
-| P3/P4 挂点 / reconcile | `trpcservice/channels/delivery/service.go` |
+| P3 挂点 / reply publish | `trpcservice/relay/reply.go` |
+| P4 挂点 / reconcile | `trpcservice/channels/delivery/service.go` |
 | Ledger CAS SQL | `trpcservice/storage/messaging/postgres/store.go` |
 | 会话原子契约 | `trpcservice/storage/session/atomic.go` |
 | 租约 Redis Lua | `trpcservice/coordination/redis/lease.go` |
 | 演练脚本 | `scripts/e2e/inflight-takeover.sh` |
 
 以上路径**仅作可选核对**，不是实现说明的依赖。本文已把必要内容抄录完整。
+
+---
+
+## 0.5 先看数据：四个故障窗口各留下什么
+
+将下图当作“恢复地图”阅读：每一站先 durable，再允许下一站工作；新节点只从最后一个已落库的方块继续。字段名按职责分组，下一章才给逐字 DDL。
+
+```mermaid
+flowchart LR
+  P1["P1 · inbox / preprocess_job\n身份：tenant_id + request_id\n状态：state, payload_ref, dispatched_at"]
+  P2["P2 · execution_record + session_head\n执行：outcome, input_seq, park_attempt\n并发：lease(Redis) + last_fence(PostgreSQL)"]
+  P3["P3 · session_commit + outbox\n提交：outcome, result_ref, fence\n发布：reply idempotency_key, state, claim_owner/until"]
+  P4["P4 · delivery_ledger\n投递：segment_no, client_request_id\n状态：sending/sent/ambiguous + claim_owner/until"]
+  T["工具执行 · tool_execution\n身份：tenant + request + tool_call\n恢复：policy, fence, lease, result_ref, effect state"]
+  P1 --> P2 --> P3 --> P4
+  P2 --- T
+```
+
+| 故障瞬间 | 先读的记录 | 接管动作 | 绝不做的事 |
+|---|---|---|---|
+| P1 | `inbox`、`preprocess_job` | 重新领取并 dispatch 同一输入 | 让用户重发或另建 request。 |
+| P2 | Redis lease/fence、`execution_record`、`tool_execution` | reclaim，取得更高 fence；按工具恢复策略续办 | 旧 fence 提交，或未知副作用盲重放。 |
+| P3 | `session_commit`、reply `outbox` | 重新发布同一 `ReplyEvent` | 重跑模型。 |
+| P4 | `delivery_ledger` | claim 到期后接管并以同一 client request id 投递 | 绕过 Ledger 直接发送。 |
+
+---
+
+## 0.6 DDL 的表格版：接管记录一览
+
+先按这张表理解每个字段组，再在下一章查看逐字 SQL。`created_at`、`updated_at`、CHECK、默认值、外键和索引并未删掉，保留在 SQL 中作为精确契约。
+
+| 表 | 主键 / 唯一键 | 谁标识“同一个东西” | 谁控制领取 / 并发 | 谁记录结果 / 重试 | 故障窗口 |
+|---|---|---|---|---|---|
+| `inbox` | PK `(tenant_id, channel, external_account_id, external_message_id)`；UQ `(tenant_id, request_id)` | provider 消息四元组、`request_id`、`session_id`、`agent_app_id` | `state`, `input_seq`, `version` | `payload_ref`, `payload_digest`, `result_ref`, `terminal_reason` | P1 的输入事实。 |
+| `preprocess_job` | PK `(tenant_id, job_id)` | `tenant_id`, `request_id`, `session_id`, `channel_binding_id` | `state`, `attempt`, `lease_owner`, `lease_until`, `not_before`, `dispatched_at`, `version` | `payload_ref`, `prepared_payload_ref`, `reject_reason` | P1 的可重领工作。 |
+| `execution_record` | PK `(tenant_id, request_id)` | `request_id`, `input_seq`, 版本化 app/policy/config | `outcome`, `park_attempt`, `not_before`, `cancel_*`, `version` | `result_ref`, `blocked_reason` | P2 的任务尝试与停放。 |
+| `session_head` | PK `(tenant_id, agent_app_id, session_id)` | 会话三元组 | `last_fence`, `version`, `next_input_seq`, `last_allocated_input_seq` | `state_json`, `summary_id` | P2：对端取更高 fence 后才能提交。 |
+| `session_commit` | PK `(tenant, app, session, commit_id)`；终态唯一索引 `(tenant, app, session, input_seq)` | `request_id`, `input_seq`, `commit_id` | `fence`, `session_version`, `outcome` | `result_ref`, `reply_cursor`, `request_digest` | P2/P3 的唯一 terminal fact。 |
+| `outbox` | PK `(tenant_id, outbox_id)`；UQ `(tenant_id, kind, idempotency_key)` | `kind`, `aggregate_id`, `event_seq`, `idempotency_key` | `state`, `version`, `attempt`, `next_attempt_at`, `claim_owner`, `claim_until` | `payload_ref`, `published_at` | P3：Relay 重领后发布同一事件。 |
+| `delivery_ledger` | PK `(tenant_id, delivery_key, segment_no)` | `delivery_key`, `segment_no`, 稳定 `client_request_id` | `state`, `version`, `claim_owner`, `claim_until`, `attempt`, `not_before`, `reconcile_attempt` | `provider_message_id`, `last_error_class`, 内容/渲染版本 | P4：每个片段只允许一个有效 sender。 |
+| `confirmation_grant` / `tool_attempt` / `tool_result_payload` | grant / tool call 的 tenant-scoped 键 | `grant_id`, `request_id`, `tool_call_id` | grant `state=consumed`，attempt `state` | `result_ref`、加密工具结果 | 已确认工具的授权与结果闭环。 |
+| `tool_execution` | PK `(tenant_id, request_id, tool_call_id)`；UQ `(tenant_id, tool_id, tool_version, idempotency_key)` | 同一 tool call、固定工具版本和参数摘要 | `state`, `attempt`, `fence`, `lease_owner`, `lease_until` | `recovery_policy`, `external_handle`, `result_ref`, `last_error` | P2 工具执行中断后的查询/幂等重试/终止依据。 |
+
+### `tool_execution` 字段逐列解读
+
+| 字段 | 直观含义 | 接管时的判定 |
+|---|---|---|
+| `tenant_id`, `request_id`, `tool_call_id` | “哪位租户的哪条输入中的哪次工具调用” | 三者是不可改变的主键，防止串租户接管。 |
+| `tool_id`, `tool_version`, `args_digest` | “要继续的究竟是哪一个版本、哪一组参数” | 接管者只能恢复同一版本、同一参数摘要的调用。 |
+| `recovery_policy`, `idempotency_key`, `external_handle` | 外部副作用的恢复契约和查询把手 | 决定 query、同键重试、重放或 `effect_unknown`。 |
+| `state`, `attempt`, `fence`, `lease_owner`, `lease_until` | 当前是否在跑、谁拥有执行权、旧 owner 是否已过期 | 仅 lease 过期且新 fence 更高的节点可以接管。 |
+| `result_ref`, `last_error` | 已知结果或最后失败原因 | 有 `result_ref` 直接续办；无结果且策略不安全则不重放。 |
 
 ---
 
@@ -529,22 +582,18 @@ return 1
 ```go
 type Point string
 const (
-    PointP1 Point = "p1_persisted_before_dispatch"
-    PointP2 Point = "p2_executed_before_commit"
-    PointP3 Point = "p3_committed_before_send"
-    PointP4 Point = "p4_accepted_before_confirmation"
+    PointP1BeforeExecution        Point = "p1_persisted_before_execution"
+    PointP2BeforeTerminalCommit   Point = "p2_executed_before_commit"
+    PointP3BeforeReplyPublish     Point = "p3_result_committed_before_reply_publish"
+    PointP4BeforeProviderDelivery Point = "p4_delivery_claimed_before_provider_send"
 )
-func ValidPoint(value Point) bool
-func ParsePoint(value string) (Point, error)
-type Observation struct{ Point Point; TenantID, RequestID, Owner string; At time.Time }
-type Barrier interface{ Wait(context.Context, Observation) error }
-type BarrierFunc func(context.Context, Observation) error
-type Status struct{ Enabled bool `json:"enabled"`; Point Point `json:"point,omitempty"`; Hit, Released bool }
-type Controller struct{ /* point, tenantID, mu, hit, released, release, once */ }
-func NewController(point Point, tenantID string) (*Controller, error)
-func (c *Controller) Wait(ctx context.Context, obs Observation) error
-func (c *Controller) Release()
-func (c *Controller) Status() Status
+type Barrier interface{ Wait(context.Context, Point) error }
+type Snapshot struct{ Point Point; Armed, Hit, Released bool }
+type Controller struct{ /* map[Point]*gate guarded by mutex */ }
+func (c *Controller) Arm(point Point) <-chan struct{}
+func (c *Controller) Wait(ctx context.Context, point Point) error
+func (c *Controller) Release(point Point) bool
+func (c *Controller) Snapshot(point Point) Snapshot
 ```
 
 ### 4.2 会话原子契约（`trpcservice/storage/session/atomic.go`）
@@ -586,7 +635,7 @@ type Service struct {
     RendererVersion, FormatVersion string
     DefaultRetryDelay, MaxRetryDelay time.Duration
     MaxAttempts, MaxReconcileAttempts int
-    InflightBarrier inflight.Barrier
+    Barrier inflight.Barrier
 }
 ```
 
@@ -598,21 +647,20 @@ type Service struct {
 |---|---|---|---|
 | P1 | `preprocess/worker.go` `dispatch()` | `Dispatcher.Dispatch` **之前** | durable job 已存在、尚未成为 execution |
 | P2 | `worker/runner.go` `ExecuteWithLease` | 模型/工具与 `renderOutbound` 之后、`encodeResultRef`/`PutResult`/`beforeCommit`/`CommitTurn` 之前 | 已生成终态内容但未提交 |
-| P3 | `channels/delivery/service.go` `deliverSegment()` | `ClaimDelivery` 成功后、`deliverWithClaimRenewal` 之前 | 已 claim 但未调 adapter |
-| P4 | 同上 | adapter 返回且 `ProviderMessageID != ""` 后、置 `sent` 与 `FinishDelivery` 之前 | 已拿到接受证据但未持久化 sent |
+| P3 | `relay/reply.go` `ReplyRelay.handle()` | 构造 `ReplyEvent` 后、`PublishReply` 之前 | terminal result/outbox/route 已持久化，reply event 未发布 |
+| P4 | `channels/delivery/service.go` `deliverSegment()` | `ClaimDelivery` 成功后、`deliverWithClaimRenewal` 之前 | delivery 已领取，provider 尚未调用 |
 
 每个挂点统一调用：
 
 ```go
-if s.InflightBarrier != nil {
-    if err := s.InflightBarrier.Wait(ctx, inflight.Observation{
-        Point: inflight.PointPX, TenantID: ..., RequestID: ..., Owner: ..., At: time.Now().UTC()}); err != nil {
+if barrier != nil {
+    if err := barrier.Wait(ctx, inflight.PointP4BeforeProviderDelivery); err != nil {
         return err
     }
 }
 ```
 
-`Status` 只暴露 `enabled/point/hit/released`，不暴露 tenant/request。
+point-scoped `Snapshot` 只暴露 `point/armed/hit/released`，不暴露 tenant/request。
 
 ---
 
@@ -731,9 +779,7 @@ SELECT ... FROM outbox o WHERE o.state='claimed' AND o.claim_until < $1;
 | 次 Bot：`WECOM_SECONDARY_CORP_ID`、`WECOM_SECONDARY_AGENT_ID`、`WECOM_SECONDARY_APP_SECRET`、`WECOM_SECONDARY_CALLBACK_TOKEN`、`WECOM_SECONDARY_ENCODING_AES_KEY` | 第二 Bot 凭据 | 任一缺失 → `incomplete`；(Corp ID, Agent ID) 与主 Bot 相同 → `incompatible` |
 | `TRPC_WECOM_HA_ENTRY_BACKENDS` | 入口后端 | ≥2，http，去重 |
 | `TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL` | 探测周期 | 默认 1s，[100ms, 1m] |
-| `TRPC_INFLIGHT_TEST_BARRIER` | P1–P4 暂停点 | 空=关闭（生产默认） |
-| `TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID` | 命中哪个槽位 | `auto` 或具体 instance id |
-| `TRPC_INFLIGHT_TEST_BARRIER_TENANT_ID` | 限定租户 | 空=任意租户 |
+| `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED` | 注册 P1–P4 测试控制面 | `true` 仅用于 `webui-multinode` 演练 |
 | `TRPC_WEBUI_LOCAL_TOKEN` / `X-TRPC-Local-Token` | 控制面鉴权 | 仅本地演练 |
 | `TRPC_WECOM_REAL_ACCEPTANCE` | 真实 WeCom 验收状态 | `assumed`（默认）/ `recorded` |
 
@@ -752,11 +798,10 @@ delivery 重试装配值：`MaxAttempts` 8、`MaxReconcileAttempts` 8、`Default
 TRPC_INFLIGHT_TENANT_ID=<tenant-a-id> \
   bash scripts/e2e/inflight-takeover.sh p2
 
-# 脚本内部等价环境变量（脚本自动透传）：
-#   TRPC_INFLIGHT_TEST_BARRIER=<point>
-#   TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID=<auto|node-a|node-b>
-#   TRPC_INFLIGHT_TEST_BARRIER_TENANT_ID=<optional>
-#   docker compose --project-name <random> -f deploy/compose/docker-compose.local.yml --profile wecom-ha-local up --detach --build
+# 脚本以 webui-multinode profile 隔离启动；该 profile 已启用
+# TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true。脚本经受保护 endpoint arm node-a 的 point：
+# POST /test/failover/<p1|p2|p3|p4>/arm
+# docker compose --project-name <random> -f deploy/compose/docker-compose.local.yml --profile webui-multinode up --detach --build
 ```
 
 2. 脚本 `wait_http` 等两节点 `/readyz`（`node-a` 端口 `${TRPC_LOCAL_WECOM_HA_NODE_A_PORT:-58088}`，`node-b` 端口 `${TRPC_LOCAL_WECOM_HA_NODE_B_PORT:-58089}`）。
@@ -764,10 +809,9 @@ TRPC_INFLIGHT_TENANT_ID=<tenant-a-id> \
 4. `wait_barrier_hit` 轮询两节点 `/statusz`，匹配 `"enabled":true` + `"point":"<point>_"` + `"hit":true` → 确定 victim/survivor。
 5. `docker kill --signal=KILL <victim_container>` 强杀。
 6. 断言 survivor `/readyz` 仍可用；`docker inspect` 断言 victim `State.Running == false`。
-7. 对 survivor `POST /test/failover/barrier/release`（带 `X-TRPC-Local-Token`，默认回退 `TRPC_WEBUI_LOCAL_TOKEN` 或 `local-webui-token-change-me`）。注释明确：**释放 barrier 不是业务重试或租约变更**，只是恢复该演练所代表的下游依赖响应。
-8. 按 `TRPC_WECOM_REAL_ACCEPTANCE` 输出 `assumed` / `recorded`。
+7. 等待 survivor 对同一 WebUI 用户/会话返回包含原 `external_message_id` 的结果；不调用 release，也不修改任何任务或投递状态。
 
-变量全集：`TRPC_INFLIGHT_VICTIM_SERVICE`(auto|node-a|node-b)、`TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID`、`TRPC_INFLIGHT_TENANT_ID`、`TRPC_INFLIGHT_PROJECT`、`TRPC_INFLIGHT_TIMEOUT_SECONDS`(180)、`TRPC_INFLIGHT_KEEP_ENVIRONMENT`、`TRPC_INFLIGHT_CONTROL_TOKEN`。默认 `KEEP=false` 时脚本 `compose down --volumes --remove-orphans` 仅销毁自创容器与卷。
+脚本参数只有 point（`p1|p2|p3|p4`）；`TRPC_WEBUI_LOCAL_TOKEN` 和 `TRPC_WEBUI_LOCAL_ROUTE_KEY` 可覆盖本地鉴权/路由，`TRPC_LOCAL_MULTINODE_NODE_A_PORT`、`...NODE_B_PORT` 可覆盖随机观测端口。cleanup 仅销毁自创 Compose 项目和 volumes。
 
 ---
 
@@ -779,7 +823,7 @@ TRPC_INFLIGHT_TENANT_ID=<tenant-a-id> \
 | 命中 | `/statusz` 报 `enabled/hit` | `wait_barrier_hit` 输出 JSON |
 | 强杀 | victim `State.Running==false` | `docker inspect` |
 | 存活 | survivor `/readyz` 200 | curl 成功 |
-| 释放 | `POST /test/failover/barrier/release` → 204 | curl 成功 |
+| 接管 | node-b 对同一原 message id 产生回复 | WebUI replies 查询成功 |
 | 业务 | 同 `request_id` 完成 terminal + 最终回复一次 | inbox/execution_record/session_commit/delivery_ledger 行（见 testing-and-acceptance.md 证据字段） |
 
 **三计数核对（必做）：**
@@ -904,3 +948,9 @@ FROM tool_result_payload WHERE tenant_id = $1 AND request_id = $2;
 - **演练脚本停不到这个位置**：`p2` barrier 停在"模型与工具都跑完、结果尚未提交"，是确定性的 P2 边界。要复现"工具函数体内被杀"，须让被测工具自身阻塞（长 sleep 或等待外部信号），再对节点 `docker kill --signal=KILL`。
 - 判定三件事即可：① `session_events` 中存在该 tool_call 事件（用 §10.6 ①）；② 不存在 `tool_attempt`（`allow`）或停在 `effect_unknown`（`ask`）；③ 接管节点取得更高 fence 后重跑，最终只有一行终态 `session_commit`、每 segment 至多一行 `sent`。
 - **不要**把"工具只执行了一次"作为验收项：`allow` 路径不承诺该性质；应改为验收"外部系统按业务幂等键只有一个业务效果"。
+
+## 11. 当前实现增量：`tool_execution` 恢复协议
+
+迁移 `000002_tool_execution_recovery.up.sql` 增加 `tool_execution(tenant_id,request_id,tool_call_id)`；其不可变输入为 tool/version、args digest、recovery policy 和 idempotency key。`Claim` 的 SQL 只允许首次插入或接管过期 `running` lease，并递增 attempt/fence。工具接口为 `RecoveryDescriptor`（策略+稳定 key），可查询工具另实现 `RecoveryQuerier`。已消费 Grant 的恢复不得再次 `ConsumeGrant`；仅当 tool attempt/request/tool call 一致且仍为 `effect_unknown` 时执行策略化恢复。
+
+当前内置 `webui_create_note` 是 `idempotent_key` 工具。新外部工具未声明恢复契约时默认 `manual`，故障后不会自动重放。

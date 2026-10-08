@@ -17,7 +17,6 @@ type webUILocalRuntimeStatus struct {
 	InstanceID      string            `json:"instance_id"`
 	ProcessStartID  string            `json:"process_start_id"`
 	Owners          map[string]string `json:"owners"`
-	InflightBarrier inflight.Status   `json:"inflight_test_barrier"`
 }
 
 func newWebUILocalProcessStartID() (string, error) {
@@ -65,7 +64,7 @@ mux.HandleFunc("/livez", func(writer http.ResponseWriter, _ *http.Request) {
 })
 mux.HandleFunc("/statusz", func(writer http.ResponseWriter, _ *http.Request) {
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(writer).Encode(configValue.runtimeStatus(inflightBarrier))
+	_ = json.NewEncoder(writer).Encode(map[string]string{"instance_id": configValue.InstanceID, "process_start_id": processStartID})
 })
 mux.HandleFunc("/readyz", func(writer http.ResponseWriter, request *http.Request) {
 	if db.PingContext(request.Context()) != nil ||
@@ -290,17 +289,14 @@ func (s Service) deliverSegment(ctx context.Context, event channel.ReplyEvent, a
 		default: return runtime.ErrInvariantViolation
 		}
 	}
-	if s.InflightBarrier != nil {
-		_ = s.InflightBarrier.Wait(ctx, inflight.Observation{Point: inflight.PointP3, TenantID: event.TenantID, RequestID: event.RequestID, Owner: s.Owner, At: time.Now().UTC()})
+	if s.Barrier != nil {
+		if err := s.Barrier.Wait(ctx, inflight.PointP4BeforeProviderDelivery); err != nil { return err }
 	}
 	// ... deliverWithClaimRenewal（后台按 claimTTL/3 续租 claim）...
 	if resultDelivery.ProviderMessageID == "" {
 		record.State, record.LastErrorClass = messaging.DeliveryAmbiguous, "missing_provider_message_id"
 		_, finishErr := s.Ledger.FinishDelivery(ctx, record, record.Version)
 		return errors.Join(AmbiguousError{Err: runtime.ErrInvariantViolation}, finishErr)
-	}
-	if s.InflightBarrier != nil {
-		_ = s.InflightBarrier.Wait(ctx, inflight.Observation{Point: inflight.PointP4, TenantID: event.TenantID, RequestID: event.RequestID, Owner: s.Owner, At: time.Now().UTC()})
 	}
 	record.State = messaging.DeliverySent
 	record.ProviderMessageID = resultDelivery.ProviderMessageID
@@ -310,7 +306,7 @@ func (s Service) deliverSegment(ctx context.Context, event channel.ReplyEvent, a
 }
 ```
 
-**改变了什么状态 / 为何抗故障：** Claim 成功后 `state='sending'` 并写入 `claim_owner/claim_until`；P3 暂停点验证“claim 后未发送”时由存活节点接管；P4 暂停点验证“下游已受理但未确认”时由 `client_request_id`（由 `StableDeliveryRequestID(key)` 稳定推导）去重收敛。两个发送者不能同时发同一片段（I6），下游不可去重时诚实 `ambiguous`（I7）。台账每 segment 一行，`sent` 后不可重发。
+**改变了什么状态 / 为何抗故障：** Claim 成功后 `state='sending'` 并写入 `claim_owner/claim_until`；P4 暂停点在此后、provider 调用前，存活节点可在 claim 超时后安全接管。P3 位于更上游的 Reply Relay 发布前，验证的是 reply outbox 重放而不是 ledger claim。真实 provider 已受理但本地未知时，才由 `client_request_id`（由 `StableDeliveryRequestID(key)` 稳定推导）去重/对账收敛。两个发送者不能同时发同一片段（I6），下游不可去重时诚实 `ambiguous`（I7）。台账每 segment 一行，`sent` 后不可重发。
 
 ---
 
@@ -492,7 +488,7 @@ WHERE tenant_id=$1 AND agent_app_id=$2 AND session_id=$3
 ORDER BY session_seq
 ```
 
-**改变了什么状态 / 为何抗故障：** 只读，无状态改变。这里必须澄清一处容易被写错的事实：**"接管后的上下文来自哪里"的答案是官方会话后端的 `session_events`（复数，`app_name = tenantID + "/" + agentAppID`，由 `trpc-agent-go/session/postgres` 同步写入），而不是平台 `session_event`（单数）**。生产 worker 使用 `NewDurableBufferedTurnScoped`，其 `Commit` 显式把 `Events`/`StateDelta`/`SummaryCandidate` 置 nil（避免重建第二个会话真相源），因此 `commit_turn` 的 `p_events` 为 null、平台 `session_event` 不产生新行，`LoadSession` 也没有生产调用方——它只服务测试与迁移路径。结论：N1 内存全失后 N2 之所以能答对代号，是因为**模型上下文可从官方会话后端重建**（每次尝试追加的事件都同步落库），事件顺序即上下文顺序。详见 [../DATABASE-DESIGN.md](../DATABASE-DESIGN.md) §1.1 与 [../inflight-task-takeover/REFERENCE-IMPLEMENTATION.md](../inflight-task-takeover/REFERENCE-IMPLEMENTATION.md) §10.1。
+**改变了什么状态 / 为何抗故障：** 只读，无状态改变。这里必须澄清一处容易被写错的事实：**"接管后的上下文来自哪里"的答案是官方会话后端的 `session_events`（复数，`app_name = tenantID + "/" + agentAppID`，由 `trpc-agent-go/session/postgres` 同步写入），而不是平台 `session_event`（单数）**。生产 worker 使用 `NewDurableBufferedTurnScoped`，其 `Commit` 显式把 `Events`/`StateDelta`/`SummaryCandidate` 置 nil（避免重建第二个会话真相源），因此 `commit_turn` 的 `p_events` 为 null、平台 `session_event` 不产生新行，`LoadSession` 也没有生产调用方——它只服务测试与迁移路径。结论：N1 内存全失后 N2 之所以能答对代号，是因为**模型上下文可从官方会话后端重建**（每次尝试追加的事件都同步落库），事件顺序即上下文顺序。详见本包 [REFERENCE-IMPLEMENTATION.md](REFERENCE-IMPLEMENTATION.md) 与 [在途接管参考实现](../inflight-task-takeover/REFERENCE-IMPLEMENTATION.md) 的工具恢复章节。
 
 ---
 

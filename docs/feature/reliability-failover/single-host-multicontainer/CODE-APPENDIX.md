@@ -169,29 +169,13 @@ func (value webUILocalConfig) instanceName(component string) string {
 	return "webui-local-" + component + "-" + value.InstanceID + "-" + value.ProcessStartID
 }
 
-type webUILocalRuntimeStatus struct {
-	InstanceID      string            `json:"instance_id"`
-	ProcessStartID  string            `json:"process_start_id"`
-	Owners          map[string]string `json:"owners"`
-	InflightBarrier inflight.Status   `json:"inflight_test_barrier"`
-}
-
-func (value webUILocalConfig) runtimeStatus(barrier ...*inflight.Controller) webUILocalRuntimeStatus {
-	components := []string{"worker", "preprocess", "dispatch-relay", "reply-relay", "wakeup-relay", "wakeup", "delivery"}
-	owners := make(map[string]string, len(components))
-	for _, component := range components {
-		owners[component] = value.instanceName(component)
-	}
-	status := inflight.Status{}
-	if len(barrier) == 1 && barrier[0] != nil { status = barrier[0].Status() }
-	return webUILocalRuntimeStatus{InstanceID: value.InstanceID, ProcessStartID: value.ProcessStartID, Owners: owners, InflightBarrier: status}
-}
-
-func newWebUILocalProcessStartID() (string, error) {
-	var value [8]byte
-	if _, err := rand.Read(value[:]); err != nil { return "", err }
-	return hex.EncodeToString(value[:]), nil // 8 字节 → 16 字符 hex
-}
+// cmd/trpc-service/webui_local_role.go
+mux.HandleFunc("/statusz", func(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"instance_id": configValue.InstanceID, "process_start_id": processStartID,
+	})
+})
 ```
 
 **语义**：owner/consumer 名 = `webui-local-<component>-<InstanceID>-<ProcessStartID>`。`ProcessStartID` 每次启动随机 8 字节 hex（16 字符），不可配置。重新加入时该值改变，使所有 owner 名随之改变——旧 lease 在 TTL 后过期，旧 consumer 的 pending 被新进程或 peer reclaim。这是"重新加入 ≠ 旧 owner 复活"的代码基础。
@@ -202,17 +186,12 @@ func newWebUILocalProcessStartID() (string, error) {
 mux.HandleFunc("/livez", func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusOK) })
 mux.HandleFunc("/statusz", func(writer http.ResponseWriter, _ *http.Request) {
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(writer).Encode(configValue.runtimeStatus(inflightBarrier))
+	_ = json.NewEncoder(writer).Encode(map[string]string{"instance_id": configValue.InstanceID, "process_start_id": processStartID})
 })
 if inflightBarrier != nil {
-	mux.HandleFunc("/test/failover/barrier/release", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost || request.Header.Get("X-TRPC-Local-Token") != configValue.Token {
-			http.NotFound(writer, request)
-			return
-		}
-		inflightBarrier.Release()
-		writer.WriteHeader(http.StatusNoContent)
-	})
+	registerWebUILocalFailoverTestEndpoints(mux, configValue.Token, inflightBarrier)
+	// Registers point-scoped POST arm/release and GET status handlers at
+	// /test/failover/{p1|p2|p3|p4}/..., all token protected.
 }
 mux.HandleFunc("/readyz", func(writer http.ResponseWriter, request *http.Request) {
 	if db.PingContext(request.Context()) != nil || redis.Ping(request.Context()).Err() != nil || malware.Probe(request.Context()) != nil {
@@ -223,7 +202,7 @@ mux.HandleFunc("/readyz", func(writer http.ResponseWriter, request *http.Request
 })
 ```
 
-**语义**：`/statusz` 输出实例身份、7 个组件的 owner 与 barrier 状态；`/readyz` 覆盖 db+redis+malware 三个依赖，任一失败即 503；`/test/failover/barrier/release` 仅在 barrier 非 nil 时注册，且须 `POST` + `X-TRPC-Local-Token` 匹配，否则 404——释放 barrier 只是恢复演练所代表的下游依赖响应，不是业务重试或租约变更。
+**语义**：`/statusz` 输出实例身份和组件 owner；`/readyz` 覆盖 db+redis+malware 三个依赖，任一失败即 503；仅在 failover test 启用时注册 point-scoped `/test/failover/{p1|p2|p3|p4}/{arm,status,release}`，所有操作均须 token。标准 E2E 强杀命中节点，不通过 release 改变业务接管。
 
 ## 9. 双实例编排：相同业务能力，不同实例身份（Compose 片段）
 
@@ -244,10 +223,6 @@ wecom-ha-node-a:
     TRPC_OTEL_ALLOW_INSECURE: "true"
     TRPC_SERVICE_VERSION: ${TRPC_LOCAL_SERVICE_VERSION:-development}
     TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-node-a
-    # barrier 透传（空=生产安全默认）
-    TRPC_INFLIGHT_TEST_BARRIER: ${TRPC_INFLIGHT_TEST_BARRIER:-}
-    TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID: ${TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID:-}
-    TRPC_INFLIGHT_TEST_BARRIER_TENANT_ID: ${TRPC_INFLIGHT_TEST_BARRIER_TENANT_ID:-}
   secrets: [deepseek_api_key]
   volumes: [webui-local-skills:/var/lib/trpc-webui-local/skills]
   ports: ["${TRPC_LOCAL_WECOM_HA_NODE_A_PORT:-58088}:8080"]
@@ -398,13 +373,9 @@ deliveryService := channeldelivery.Service{Results: payloads, Ledger: inbox, Ada
 
 ```json
 // 基线
-{"instance_id":"wecom-ha-node-a","process_start_id":"9f3c1a2b4d5e6f07",
- "owners":{"worker":"webui-local-worker-wecom-ha-node-a-9f3c1a2b4d5e6f07", ...},
- "inflight_test_barrier":{"enabled":false}}
+{"instance_id":"wecom-ha-node-a","process_start_id":"9f3c1a2b4d5e6f07"}
 // 重新加入后（process_start_id 已变）
-{"instance_id":"wecom-ha-node-a","process_start_id":"1b2c3d4e5f6a7b8c",
- "owners":{"worker":"webui-local-worker-wecom-ha-node-a-1b2c3d4e5f6a7b8c", ...},
- "inflight_test_barrier":{"enabled":false}}
+{"instance_id":"wecom-ha-node-a","process_start_id":"1b2c3d4e5f6a7b8c"}
 ```
 
 `process_start_id` 前后对比的判定（脚本逻辑等价）：

@@ -1,122 +1,57 @@
-# 在途任务接管与幂等投递 — 文档包
+# 在途任务接管与幂等投递
 
-> **对应项目描述：企微 AI Bot 多租户可靠性平台** — 主线二「**在途任务恢复**」。
-> 描述原文对照：*覆盖消息已持久化未执行、模型或工具执行中、结果已提交未发送等关键故障窗口；通过任务租约、执行权回收、Fencing Token、Inbox/Outbox 和 Delivery Ledger 实现原始消息自动续处理或安全重试，区分模型调用次数、任务尝试次数与最终回复次数，保证用户无需重发且每个输入只产生一次可见最终回复。*
-> ⚠️ 末句的"一次可见最终回复"在下游不可按 `client_request_id` 去重时只能承诺**至少一次 + 诚实告警**，见顶层 `README.md` §0.5。
+本目录按 L1–L4 分层；跨层的审查问题见 [文档方法](../DOCUMENTATION-METHOD.md)。`tool_execution`、可查询/幂等工具恢复及已消费 Grant 接管属于当前实现增量，以 L3 文档中的增量章节和迁移 `000002_tool_execution_recovery` 为准。
 
-> 子包定位：`reliability-failover / inflight-task-takeover`
-> 一句话：当一条用户消息已经**被系统可靠接收**、但还没产生**最终可见回复**时，执行或发送节点故障，存活节点必须自动继续处理同一条原始消息；用户不重发，系统不串租户、不丢会话、不重复产生最终回复或外部业务效果。
+## 文档地图
 
-本文档包是**自足的复现文档**。一个从未见过本仓库源码的工程师，仅凭本目录下的 Markdown，即可从零实现等价系统并通过同等验收。所有表名、字段名、SQL 函数名、环境变量名、Go 标识符、错误码均逐字对应真实实现（见 [REFERENCE-IMPLEMENTATION.md](./REFERENCE-IMPLEMENTATION.md) 的「事实来源」一节），不引用「见仓库某文件」作为唯一说明。
+| 文件 | 级别 | 回答什么问题 | 谁读 / 何时读 | 可整篇跳过 |
+|---|---|---|---|---|
+| `README.md` | 导航 | 覆盖范围、当前实现和阅读入口 | 所有人，先读 | — |
+| `OVERVIEW.md` | L1 | 场景、术语、业务故事、承诺/边界 | 管理/产品/交接 | — |
+| `FULL-GUIDE.md` / `design.md` | L2 | P1–P4 因果链、状态机、竞态及“不能只做 X” | 架构评审/实现前 | 非代码读者可跳过设计细节 |
+| `implementation-walkthrough.md` / `CODE-APPENDIX.md` / `REFERENCE-IMPLEMENTATION.md` | L3 | 运行时顺序、代码证据、DDL/Redis/接口/算法/配置/启动顺序 | 实现/外部复刻 | 非代码/纯验收 |
+| `testing-and-acceptance.md` / `release-and-operations.md` | L4 | 判定表、最小证据、反例、演练、上线与处置 | QA/SRE/上线 | 非验收角色 |
 
-> **怎么读（按角色）：**
-> - **非代码读者** → 只读 [OVERVIEW.md](./OVERVIEW.md) 🟢（§0 有"技术名 → 大白话"对照表）+ [FULL-GUIDE.md](./FULL-GUIDE.md) 的 §2 五个持久化事实、§3–§6 四个窗口、§10 边界。**可整篇跳过** `REFERENCE-IMPLEMENTATION.md`、`CODE-APPENDIX.md`、`implementation-walkthrough.md`、`design.md`。
-> - **工程实现者** → [REFERENCE-IMPLEMENTATION.md](./REFERENCE-IMPLEMENTATION.md)（完整 DDL / Lua / 接口 / 算法）→ [design.md](./design.md) → [implementation-walkthrough.md](./implementation-walkthrough.md) → [CODE-APPENDIX.md](./CODE-APPENDIX.md)。库架构、迁移演进、隔离级别与行锁、加密存储、只增表清理责任见 [../DATABASE-DESIGN.md](../DATABASE-DESIGN.md)。
-> - **运维 / 值班 / 验收** → [release-and-operations.md](./release-and-operations.md) 与 [testing-and-acceptance.md](./testing-and-acceptance.md)。
-> 跨包角色总路径见仓库同级 [../README.md](../README.md) §0。
+## 目标
 
----
+同一条已持久化输入在节点故障后无需用户重发。系统区分模型调用、任务尝试和最终回复：模型可以重跑，任务 lease 可以易主，但一个输入只允许一个有效 terminal commit，最终可见回复由投递台账收敛。
 
-## 1. 文档地图
+## 四个故障窗口
 
-| 文档 | 用途 | 何时读 |
+| 窗口 | 已持久化事实 | 接管动作 |
 |---|---|---|
-| [OVERVIEW.md](./OVERVIEW.md) | 场景、术语表（五个持久化事实）、P1–P4 业务故事、范围与不包含 | 先读，建立心智模型 |
-| [FULL-GUIDE.md](./FULL-GUIDE.md) | 完整独立说明：五个持久化事实、P1–P4 的前提/风险/方案/必须接受的事实、barrier、幂等分层、演练顺序、验收与边界 | 设计评审、写实现前通读 |
-| [design.md](./design.md) | 架构图、消息生命周期状态机、四个故障窗口的数据边界、任务租约/执行权回收、Outbox/Ledger、时序图 | 理解结构与时序 |
-| [implementation-walkthrough.md](./implementation-walkthrough.md) | 逐模块实现走读：barrier 接口 → 四个挂点 → preprocess dispatch → worker 执行与 commit → relay → delivery | 写代码时对照 |
-| [CODE-APPENDIX.md](./CODE-APPENDIX.md) | 逐段摘录关键实现代码并解释状态变化与故障语义 | 怀疑某条不变量是否成立时查 |
-| [REFERENCE-IMPLEMENTATION.md](./REFERENCE-IMPLEMENTATION.md) | **新增**。自足复现材料：完整 DDL、Redis 契约、Go 接口、四挂点算法、Ledger CAS SQL、配置全表、端到端复现步骤、验证清单 | 从零实现或复现验收的权威材料 |
-| [testing-and-acceptance.md](./testing-and-acceptance.md) | 完整测试方案：参数、P1–P4 逐步命令与预期、脚本行为逐条解释、三计数核对、证据字段、判定表、反例清单 | 做验收、写 CI |
-| [release-and-operations.md](./release-and-operations.md) | 配置、部署、发布顺序、观测指标、回滚约束、故障处置手册 | 上线与值班 |
+| P1：消息已持久化、未执行 | Inbox、Payload、预处理任务 | 存活节点扫描/领取任务并继续 dispatch |
+| P2：模型或工具执行中 | broker delivery、会话 lease/fence、确认与工具状态 | 未 ACK 的消息被 reclaim；新 owner 取得更高 fence 后继续或安全恢复工具 |
+| P3：结果已提交、未发布回复 | terminal session commit、Outbox、结果 payload | 不重跑模型；Relay 重新发布已保存的 reply event |
+| P4：外部发送已开始、未确认 | Delivery Ledger、渠道请求身份 | 以 `client_request_id` 去重或查询后完成；无法确认时标记不确定而不谎报成功 |
 
----
+测试 barrier 分别挂在 P1（预处理前）、P2（terminal commit 前）、P3（reply publish 前）和 P4（provider delivery 前）。`scripts/e2e/inflight-takeover.sh p1|p2|p3|p4` 命中 barrier 后强杀 owner，再观察 peer 收敛。
 
-## 2. 已实现范围声明（务必先读）
+## 接管与提交规则
 
-本包覆盖的故障窗口与保证：
+- 会话 lease 保证同一会话只有一个活动执行者；续租失败立即失去执行权。
+- Fencing Token 单调增加，并在会话提交处校验，旧 owner 不能覆盖新 owner。
+- 输入只有 durable 后才 ACK；执行失败的 delivery 保持 pending，供消费者组 reclaim。
+- terminal commit 与 Outbox 在同一持久化事务中产生；Relay 与 Delivery 可独立重试。
+- Delivery Ledger 对每个回复片段做条件领取和状态推进，`sent` 后不再次发送。
 
-- **P1 已持久化未执行**：原始输入 + 预处理任务已 durable，执行任务尚未发出。故障后由存活节点的未完成任务扫描/Outbox 重放自动继续 dispatch。
-- **P2 模型或工具执行中**：worker 已领取、已发起模型/工具调用，terminal result 尚未提交。故障后原队列消息不 ACK；存活节点 reclaim 同一条消息、取更高 fence、重试可重跑的工作。
-- **P2 子窗口 · 工具调用执行中（`allow` 工具）**：工具执行进度**无任何 durable 记录**，接管后以同一输入**重开一轮**（模型重新推理、可能再次调用该工具），不做断点续跑。详见 `FULL-GUIDE.md` §4.5 与 `REFERENCE-IMPLEMENTATION.md` §10。
-- **P2 子窗口 · 工具调用执行中（`ask` 工具）**：有工具级账本 `tool_attempt`（`effect_unknown` → `succeeded`/`failed`）+ 加密结果 `tool_result_payload`；接管后**不重跑**，采用已存结果或诚实以"效果不确定"终结。
-- **P3 结果已提交未发送**：terminal outcome、会话推进、reply outbox 已原子保存，下游尚未调用。恢复者**绝不重跑模型**，只扫描未发布 outbox、重新发布并发送已保存结果。
-- **P4 下游已接受本地未确认**：发送节点已取得下游接受证据（如 provider message ID），但在把 ledger 写为 `sent` 之前死亡。新节点按 `client_request_id` 去重/对账后可收敛；若下游无法去重或查询，则保留 `ambiguous` 并告警。
+## 工具调用接管
 
-**明确不承诺（诚实边界，详见 OVERVIEW §范围与不包含）：**
+需要确认的工具另有 `tool_execution` 记录，键为 `(tenant_id, request_id, tool_call_id)`，保存工具/版本、参数摘要、恢复策略、幂等键、状态、尝试次数、fence、lease owner/expiry、结果引用和错误。接管者只能在原 lease 到期后领取该记录，并持有更高 fence。
 
-1. 不承诺跨主机 / 整机断电 / Docker daemon / 共享磁盘 / 共享 PostgreSQL·Redis 故障下的可用性（同为单一故障域）。
-2. 不承诺模型调用次数恒为 1；P2 接管可重跑模型（模型内部生成状态通常不可跨节点恢复）。
-3. 不承诺下游无法按 `client_request_id` 去重或查询时 P4 的绝对 exactly-once；此时只能「至少一次 + `ambiguous` 告警」。
-4. 不把 Docker 自动重启（`restart: "no"` 已禁用）当作存活节点接管。
-5. 不把健康恢复 / 连接恢复 / 队列恢复单独当作完整业务 RTO。
-
----
-
-## 3. 15 分钟复现直达（最少步骤）
-
-> 以下命令全部可照抄。环境变量、SQL、接口定义见 [REFERENCE-IMPLEMENTATION.md](./REFERENCE-IMPLEMENTATION.md)。
-
-**前置（一次性）：**
-
-```bash
-# 1) 准备好本地密钥文件（真实仓库要求存在，否则脚本直接退出）
-test -s deploy/compose/secrets/deepseek-api-key
-test -s deploy/compose/secrets/wecom.env
-
-# 2) 确认 docker 与 docker compose v2、curl 可用
-docker --version
-docker compose version
-command -v curl
-```
-
-**复现 P2（最典型的「执行中故障」）：**
-
-```bash
-# 在仓库根目录执行；脚本会拉起隔离 compose 项目，等两节点 ready
-TRPC_INFLIGHT_TENANT_ID=<tenant-a-id> \
-  bash scripts/e2e/inflight-takeover.sh p2
-```
-
-脚本运行后：
-
-1. 提示「现在通过选定的 Bot 发送一条新的、带唯一标记的消息」。
-2. 脚本轮询两节点 `/statusz`，命中 `enabled:true` + `point:"p2_..."` + `hit:true` 即确定受害 / 存活节点。
-3. 对受害容器 `docker kill --signal=KILL`（强杀，不优雅退出）。
-4. 对存活节点 `POST /test/failover/barrier/release`（带 `X-TRPC-Local-Token`），恢复测试暂停。
-5. 真实 WeCom 对话仍按 `TRPC_WECOM_REAL_ACCEPTANCE=assumed`（默认）作为「前置已通过」。
-
-**验收快查（等同 [testing-and-acceptance.md](./testing-and-acceptance.md) 的 P2 断言）：**
-
-- 同一条 `request_id` 在故障前已有 durable 证据（inbox / preprocess_job / execution_record）。
-- 受害节点停止期间，存活节点完成同 `request_id` 的 terminal commit，且旧 fence owner 被 `stale fence` 拒绝。
-- 最终回复**只出现一次**（每 segment 一行，`sent` 后只允许 ACK，不允许重发）。
-- 对照租户 Tenant B 全程正常，不串 tenant/session。
-
-> 其余 P1 / P3 / P4 仅把上例的 `p2` 换成 `p1` / `p3` / `p4`，语义与断言见 [testing-and-acceptance.md](./testing-and-acceptance.md)。
-
----
-
-## 4. 三个计数：必须量化区分
-
-贯穿全包的验收核心。任何一个「重复 / 丢失」判断都先落到这三个计数上：
-
-| 计数 | 允许 >1？ | 来源字段 | 含义 |
-|---|---|---|---|
-| **模型调用次数** | **允许**（P2 接管可重跑） | 不落库，由执行重试驱动 | 一次 terminal commit 之前模型可被多个 owner 调用多次 |
-| **任务尝试次数** | 受控 | `execution_record.park_attempt` / `delivery_ledger.attempt` | 输入序号 / 回复片段的重试次数，有上限（`park_execution` 的 `p_max_attempts` ≤ 64，delivery `MaxAttempts` 默认 8） |
-| **最终回复次数** | **必须 = 1** | `delivery_ledger` 每 segment 一行，`state='sent'` 后不可重发 | 每个可见的最终回复片段只产生一次 |
-
-**铁律：** 上述三者互不等价。一次 terminal commit 可能来自多次模型调用；一次最终回复可能背后有多次 `delivery_ledger.attempt`；但最终回复一旦 `sent`，只许 ACK，不许重发。
-
----
-
-## 5. 与本仓库其它两个子包的关系
-
-| 子包 | 关注 |
+| 恢复策略 | 接管后的动作 |
 |---|---|
-| `conversation-continuity` | 故障恢复后**两个 Bot 在原会话继续正确对话**（语义连续） |
-| `single-host-multicontainer` | 同主机 N1/N2 共存、单实例被 SIGKILL、重新加入 |
-| **`inflight-task-takeover`（本包）** | 故障发生在「消息已收 / 正在执行 / 已提交未发 / 已接受未确认」四窗口时的接管与幂等投递 |
+| `queryable` | 先用稳定恢复键查询外部操作；若已完成，只持久化结果，不再调用外部系统 |
+| `idempotent_key` | 用同一稳定幂等键重试；外部系统应将重复请求折叠为同一业务效果 |
+| `replay_safe` | 可直接重放 |
+| `manual` | 禁止自动重放，记录 `effect_unknown` 并将任务收敛为 `tool_effect_unknown` |
 
-本包不替代另两个包；三者可组合演练。
+确认令牌只消费一次。若旧节点已消费令牌但在结果落库前死亡，接管节点会先查找已保存结果；没有结果时，它仅在取得同一工具执行租约且策略允许时恢复，绝不会再次消费令牌。`tool_attempt` 与加密的 `tool_result_payload` 记录最终业务效果和结果引用。
+
+当前内置 `webui_create_note` 工具声明 `idempotent_key`，其稳定键由 tenant、request、tool call 和参数摘要推导。未来新增带外部副作用的工具必须实现相应恢复契约，否则默认 `manual`。
+
+## 验证与边界
+
+- `go test ./trpcservice/tool ./trpcservice/worker ./trpcservice/agent` 覆盖查询恢复不重放、消费冲突下的接管、人工恢复拒绝重放和续办路径。
+- `go test ./...` 覆盖全量回归。
+- 如果下游渠道不支持请求级去重且不能查询接受状态，P4 无法在理论上证明恰好一次；系统只能保留不确定状态并告警。

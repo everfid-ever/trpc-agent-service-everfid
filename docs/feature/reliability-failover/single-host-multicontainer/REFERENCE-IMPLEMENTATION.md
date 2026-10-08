@@ -6,6 +6,48 @@
 
 ---
 
+## 0.5 先看共享与隔离：两个容器如何接管同一份数据
+
+这里没有“每容器一套表”。两个实例共享同一份 PostgreSQL/Redis 权威状态；隔离的是进程身份、端口和短暂内存。下面的图先回答数据放在哪里、故障后谁能继续写。
+
+```mermaid
+flowchart LR
+  E["稳定入口 :58087\n只转发 ready 节点"] --> A["node-a :58088\ninstance_id + process_start_id"]
+  E --> B["node-b :58089\ninstance_id + process_start_id"]
+  A --> PG["PostgreSQL · 业务事实\ninbox / session_* / execution_record\noutbox / delivery_ledger / tool_execution"]
+  B --> PG
+  A --> R["Redis · 协调与队列\nWork/Reply Stream · lease · fence"]
+  B --> R
+  PG --> N["接管判据\n唯一键 + CAS + fence"]
+  R --> N
+```
+
+| 数据类别 | 是否共享 | 关键字段/键 | 节点死亡后的含义 |
+|---|---|---|---|
+| 输入、会话、结果、待发回复 | 是，PostgreSQL | `tenant_id`、`request_id`、`session_id`、`fence`、`state` | 对端从最后一个 durable state 恢复。 |
+| 工作/回复队列、会话执行权 | 是，Redis | stream pending、lease、递增 fence | 旧 owner 停止续租，TTL 后对端 reclaim。 |
+| provider 投递权 | 是，PostgreSQL | `delivery_ledger.claim_owner`、`claim_until`、`client_request_id` | 过期 claim 才能被新节点接管。 |
+| HTTP 端口、goroutine、连接、屏障 | 否，节点本地 | `instance_id`、`process_start_id` | 随故障节点消失，不能作为恢复依据。 |
+
+---
+
+## 0.6 共享 DDL 的表格版：HA 到底共用什么
+
+多容器 HA 不另建一套业务表；它复用前两项能力的表，并要求两个节点以相同 schema 读写。下表把 HA 关注的字段摘成运维可读视图；逐字 DDL 在会话连续性和在途接管包中保留。
+
+| 共享记录 | 唯一身份 / 主键 | HA 必看字段 | node-a 被杀后 node-b 如何使用 |
+|---|---|---|---|
+| `inbox` | `(tenant_id, channel, external_account_id, external_message_id)` | `request_id`, `session_id`, `state`, `input_seq`, `payload_ref` | 用同一输入事实继续，不把重传当新消息。 |
+| `preprocess_job` | `(tenant_id, job_id)` | `state`, `lease_owner`, `lease_until`, `attempt`, `dispatched_at` | 领取未完成 job，再做同一 dispatch。 |
+| `session_head` | `(tenant_id, agent_app_id, session_id)` | `last_fence`, `version`, `next_input_seq` | 先校准 Redis fence，再取得更高执行权。 |
+| `session_commit` | `(tenant, app, session, commit_id)` + terminal unique index | `input_seq`, `fence`, `outcome`, `result_ref` | 识别已经提交的结果，拒绝旧进程迟到提交。 |
+| `outbox` | `(tenant_id, outbox_id)` + `(tenant_id, kind, idempotency_key)` | `state`, `claim_owner`, `claim_until`, `attempt`, `payload_ref` | relay claim 过期后重发同一个事件。 |
+| `delivery_ledger` | `(tenant_id, delivery_key, segment_no)` | `state`, `claim_owner`, `claim_until`, `client_request_id`, `provider_message_id` | 只接管过期 claim；以稳定请求 ID 避免重复可见回复。 |
+| `tool_execution` | `(tenant_id, request_id, tool_call_id)` | `recovery_policy`, `fence`, `lease_*`, `result_ref`, `state` | 根据工具契约查询、同键重试、重放或安全停止。 |
+| Redis lease / fence / Streams | `tenant_id + agent_app_id + session_id` 派生 key；stream entry id | owner、lease TTL、单调 fence、pending entry | owner TTL 到期，consumer reclaim 原 entry；PG `last_fence` 防止 Redis fence 回退。 |
+
+---
+
 ## 1. 完整入口参考实现（Go）
 
 下面是 `wecom-ha-entry` 的**完整可落地**参考实现，覆盖全部 HTTP 路径与状态码语义。其结构与仓库 `wecom_ha_entry_role.go` 一致。
@@ -327,24 +369,14 @@ func runWeComHAEntryRole(parent context.Context, getenv func(string) string, log
 | `/readyz` | GET | `db.PingContext` + `redis.Ping` + `malware.Probe` 全成功 | 200 / 503 `not ready` |
 | `/statusz` | GET | 实例身份 + 7 组件 owner + barrier 状态 | 200 JSON |
 | `/callbacks/wecom` | POST | WeCom 回调入口（存在 endpoint 时） | 业务码 |
-| `/test/failover/barrier/release` | POST | 仅 barrier 非 nil；须 `X-TRPC-Local-Token` 匹配 | 204 / 404 |
+| `/test/failover/{p1|p2|p3|p4}/{arm,status,release}` | POST / GET / POST | 仅 failover-test 启用；须 `X-TRPC-Local-Token` 匹配 | 200 JSON / 403 |
 
 `/statusz` 固定 JSON 形状：
 
 ```json
 {
   "instance_id": "wecom-ha-node-a",
-  "process_start_id": "9f3c1a2b4d5e6f07",
-  "owners": {
-    "worker": "webui-local-worker-wecom-ha-node-a-9f3c1a2b4d5e6f07",
-    "preprocess": "webui-local-preprocess-wecom-ha-node-a-9f3c1a2b4d5e6f07",
-    "dispatch-relay": "webui-local-dispatch-relay-wecom-ha-node-a-9f3c1a2b4d5e6f07",
-    "reply-relay": "webui-local-reply-relay-wecom-ha-node-a-9f3c1a2b4d5e6f07",
-    "wakeup-relay": "webui-local-wakeup-relay-wecom-ha-node-a-9f3c1a2b4d5e6f07",
-    "wakeup": "webui-local-wakeup-wecom-ha-node-a-9f3c1a2b4d5e6f07",
-    "delivery": "webui-local-delivery-wecom-ha-node-a-9f3c1a2b4d5e6f07"
-  },
-  "inflight_test_barrier": {"enabled": false}
+  "process_start_id": "9f3c1a2b4d5e6f07"
 }
 ```
 
@@ -352,8 +384,8 @@ func runWeComHAEntryRole(parent context.Context, getenv func(string) string, log
 
 - `instance_id` 必须等于该节点 `TRPC_WEBUI_LOCAL_INSTANCE_ID`。
 - `process_start_id` 每次进程启动必须**重新随机**（8 字节 → 16 hex），这是"重新加入 ≠ 旧 owner 复活"的判定依据。
-- `owners` 的 7 个 key 固定为 `worker`/`preprocess`/`dispatch-relay`/`reply-relay`/`wakeup-relay`/`wakeup`/`delivery`，值前缀 `webui-local-<component>-<instance_id>-<process_start_id>`。
-- `inflight_test_barrier.enabled` 默认 `false`（生产安全默认）。
+- Worker、Relay 与 Delivery 在内部使用 `webui-local-<component>-<instance_id>-<process_start_id>` owner；这些 owner 不经 status endpoint 暴露。
+- P1–P4 test endpoint 只有 `webui-multinode` 显式启用 failover-test 时注册，且状态需按 point 查询。
 
 ---
 
@@ -469,9 +501,6 @@ services:
       TRPC_OTEL_ALLOW_INSECURE: "true"
       TRPC_SERVICE_VERSION: ${TRPC_LOCAL_SERVICE_VERSION:-development}
       TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-node-a
-      TRPC_INFLIGHT_TEST_BARRIER: ${TRPC_INFLIGHT_TEST_BARRIER:-}
-      TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID: ${TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID:-}
-      TRPC_INFLIGHT_TEST_BARRIER_TENANT_ID: ${TRPC_INFLIGHT_TEST_BARRIER_TENANT_ID:-}
     secrets: [deepseek_api_key]
     volumes: [webui-local-skills:/var/lib/trpc-webui-local/skills]
     ports: ["${TRPC_LOCAL_WECOM_HA_NODE_A_PORT:-58088}:8080"]
@@ -549,9 +578,7 @@ secrets:
 | `TRPC_WECOM_HA_ENTRY_BACKENDS` | 入口后端 | `http://wecom-ha-node-a:8080,http://wecom-ha-node-b:8080`，≥2，http，去重 |
 | `TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL` | 探测周期 | 默认 `1s`，范围 `[100ms, 1m]` |
 | `TRPC_LISTEN_ADDRESS`（入口） | 入口监听 | `:8080` |
-| `TRPC_INFLIGHT_TEST_BARRIER` | P1–P4 暂停点 | 空=关闭（生产默认） |
-| `TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID` | 命中哪个槽位 | `auto` 或具体 instance id |
-| `TRPC_INFLIGHT_TEST_BARRIER_TENANT_ID` | 限定租户 | 空=任意租户 |
+| `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED` | 注册 P1–P4 测试控制面 | 仅 `webui-multinode` profile 设为 `true` |
 | `TRPC_WEBUI_LOCAL_TOKEN` / `X-TRPC-Local-Token` | 控制面鉴权 | 仅本地演练 |
 | `TRPC_WECOM_REAL_ACCEPTANCE` | 真实 WeCom 验收状态 | `assumed`（默认）/ `recorded` |
 | `TRPC_LOCAL_WECOM_HA_ENTRY_PORT` | 入口宿主端口 | `58087` |
@@ -634,7 +661,7 @@ curl --silent "http://127.0.0.1:58087/statusz"
 - [ ] `docker compose --profile wecom-ha-local ps` 显示 `wecom-ha-bootstrap` 已完成、`node-a`/`node-b`/`entry` 运行。
 - [ ] `node-a:58088/readyz`、`node-b:58089/readyz`、`entry:58087/readyz` 均 200。
 - [ ] `entry:58087/statusz` 中两后端 `healthy:true`。
-- [ ] `node-a:58088/statusz` 的 `instance_id == "wecom-ha-node-a"` 且 `owners.worker` 以 `webui-local-worker-wecom-ha-node-a-` 开头。
+- [ ] `node-a:58088/statusz` 的 `instance_id == "wecom-ha-node-a"`；使用 worker consumer/lease 记录确认其 owner 前缀为 `webui-local-worker-wecom-ha-node-a-`。
 - [ ] 强杀 `node-a` 后，`entry/statusz` 中 `wecom-ha-node-a` 变 `healthy:false`、`wecom-ha-node-b` 仍 `true`；`docker inspect node-a` 的 `State.Running==false` 持续。
 - [ ] 显式 `start node-a` 后，`node-a/statusz` 的 `process_start_id` 与基线**不同**；`entry/statusz` 中 `node-a` 重新 `healthy:true`。
 - [ ] 反向强杀 `node-b` 后，`entry/statusz` 只剩重新加入的 `node-a` 健康；`node-b` `State.Running==false` 持续。

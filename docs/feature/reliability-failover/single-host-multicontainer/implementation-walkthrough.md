@@ -79,22 +79,12 @@ delivery       := configValue.instanceName("delivery")
 
 owner 写入 lease、ledger claim、日志和 metrics；consumer ID 写入 Redis consumer group。两者均携带 `process_start_id`，因此重新加入的新进程不会与旧 owner 混淆。
 
-`runtimeStatus(barrier)` 输出 JSON：
+节点 `/statusz` 输出 JSON：
 
 ```json
 {
   "instance_id": "wecom-ha-node-a",
-  "process_start_id": "9f3c1a2b4d5e6f07",
-  "owners": {
-    "worker": "webui-local-worker-wecom-ha-node-a-9f3c1a2b4d5e6f07",
-    "preprocess": "webui-local-preprocess-wecom-ha-node-a-9f3c1a2b4d5e6f07",
-    "dispatch-relay": "webui-local-dispatch-relay-wecom-ha-node-a-9f3c1a2b4d5e6f07",
-    "reply-relay": "webui-local-reply-relay-wecom-ha-node-a-9f3c1a2b4d5e6f07",
-    "wakeup-relay": "webui-local-wakeup-relay-wecom-ha-node-a-9f3c1a2b4d5e6f07",
-    "wakeup": "webui-local-wakeup-wecom-ha-node-a-9f3c1a2b4d5e6f07",
-    "delivery": "webui-local-delivery-wecom-ha-node-a-9f3c1a2b4d5e6f07"
-  },
-  "inflight_test_barrier": {"enabled": false}
+  "process_start_id": "9f3c1a2b4d5e6f07"
 }
 ```
 
@@ -103,7 +93,7 @@ HTTP 面（行 ~431–452）：
 - `/callbacks/wecom`（存在 WeCom endpoint 时）
 - `/livez` → 200
 - `/statusz` → `runtimeStatus` JSON
-- `/test/failover/barrier/release`（仅当 barrier 非 nil）→ 要求 `POST` 且 header `X-TRPC-Local-Token == configValue.Token`，否则 404；成功 204
+- `/test/failover/{p1|p2|p3|p4}/{arm,status,release}`（仅启用 failover test 时）→ 每个操作要求正确 `X-TRPC-Local-Token`，否则 403
 - `/readyz` → `db.PingContext` 与 `redis.Ping` 与 `malware.Probe` 任一失败即 503
 
 ## 六、模块 F：编排启动顺序与依赖条件
@@ -182,16 +172,16 @@ docker compose --profile wecom-ha-local start wecom-ha-node-a
 
 ## 十二、模块 K：在途屏障（P1–P4）与 worker 消费回收
 
-当演练需要证明"故障瞬间的在途任务"语义时，节点通过 `TRPC_INFLIGHT_TEST_BARRIER` 在四个挂点阻塞（见相邻 `inflight-task-takeover/design.md`）：
+当演练需要证明"故障瞬间的在途任务"语义时，`webui-multinode` 节点通过 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true` 注册四个可按 HTTP arm 的挂点（见相邻 `inflight-task-takeover/design.md`）：
 
 | Point | 位置 | 阻塞时刻 |
 |---|---|---|
 | P1 | `preprocess/worker.go` `dispatch()` 前 | durable job 已存在、尚未成为 execution |
 | P2 | `worker/runner.go` | 模型/工具已跑完、尚未 commit |
-| P3 | `delivery/service.go` `deliverSegment()` | 已 claim delivery、尚未发送 |
-| P4 | 同上 | adapter 已返回 receipt、尚未置 `sent` |
+| P3 | `relay/reply.go` `ReplyRelay.handle()` | reply event 已构造、尚未 publish |
+| P4 | `delivery/service.go` `deliverSegment()` | 已 claim delivery、尚未调 provider |
 
-`barrier.Wait` 不匹配时直接返回 nil（不影响生产）；匹配则 `hit=true` 并阻塞至 `Release` 或 `ctx.Done()`。`inflight.Status` 有意不返回 tenant/request（健康接口不得成为消息路由元数据泄露面）。`/test/failover/barrier/release` 仅 `POST` + `X-TRPC-Local-Token` 匹配时 204——释放 barrier 只是恢复演练所代表的下游依赖响应，不是业务重试或租约变更。
+未 arm 的 point 上 `barrier.Wait` 直接返回；已 arm 的 point 置 `hit=true` 并阻塞至 `Release` 或 `ctx.Done()`。Snapshot 不含 tenant/request。控制端点为 `/test/failover/{p1|p2|p3|p4}/{arm,status,release}`；标准 E2E 命中 node-a 后直接 SIGKILL，进程取消该 wait，存活节点从 durable state 接管，绝不靠 release 修复业务状态。
 
 Worker 消费回收（`worker/consumer.go`）：`Run()` 的 reclaim goroutine 每秒 `Broker.Reclaim(consumerID, limit=100)`，对每条走 `process`；`handle()` 中 `acquire` 循环 `Acquire`，`ErrVersionConflict` 按 `RetryWait(250ms)` 重试；续租失败 `markLeaseLost()` 关闭 `leaseLost` 并取消执行 context；`executeErr != nil` 时**不 ACK**，保留 pending 供存活节点 reclaim；Consume 回调执行失败故意返回 nil 以免 worker 退出，让空闲 delivery 可被 reclaim。
 

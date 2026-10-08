@@ -88,7 +88,7 @@ docker compose --profile wecom-ha-local up --detach --build
 
 - 现象：`inbox_nonterminal` / `outbox_active` / `delivery_active` 单调上升，reclaim 不下降。
 - 处理：
-  - 确认存活实例 worker/delivery 是否在运行（`/statusz` 的 `owners` 是否变化、进程是否真在消费）。
+  - 确认存活实例 worker/delivery 是否在运行（`/statusz` 的启动身份、consumer/lease/claim 是否持续推进）。
   - 检查 Redis consumer group pending 是否被某"僵尸 consumer"（旧 `process_start_id`）占据——旧进程已死但 group 未 reclaim，需等待 `ReclaimIdle`/`ReclaimInterval` 回收，或排查 reclaim 循环是否异常退出。
   - 容量不足时临时扩容单实例资源或缩短 `ReclaimInterval`（需评估对 Redis 压力）。
   - 属于"存活实例接管"但接不住负载时，应将其视为容量问题，而非本能力缺陷。
@@ -151,7 +151,7 @@ docker compose --profile wecom-ha-local up --detach --build
 # 查看入口健康集合
 curl -s http://127.0.0.1:58087/statusz | jq .
 # 查看某节点身份与 owner
-curl -s http://127.0.0.1:58088/statusz | jq '{instance_id,process_start_id,owners}'
+curl -s http://127.0.0.1:58088/statusz | jq '{instance_id,process_start_id}'
 # 确认受害容器持续停止
 docker inspect <container> --format '{{.State.Running}}'
 # 重新加入
@@ -187,7 +187,7 @@ psql "$DSN" -c "SELECT count(*) FROM inbox WHERE state<>'terminal';"
 |---|---|---|---|
 | 每日 | 入口健康集合 | `curl -s http://127.0.0.1:58087/statusz` | 至少一个 backend `healthy:true` |
 | 每日 | 入口自身 ready | `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:58087/readyz` | `200` |
-| 每日 | 两节点身份与 owner | `curl -s http://127.0.0.1:58088/statusz`、`...:58089/statusz` | `instance_id` 分别为 `wecom-ha-node-a` / `wecom-ha-node-b`；`owners` 七项齐全 |
+| 每日 | 两节点身份与 owner | `curl -s http://127.0.0.1:58088/statusz`、`...:58089/statusz`，再查询 consumer/lease | `instance_id` 分别为 `wecom-ha-node-a` / `wecom-ha-node-b`；每次重启的 `process_start_id` 改变 |
 | 每日 | 容器重启计数 | `docker inspect --format '{{.RestartCount}}'` | 无增长（`restart:"no"` 下应恒为 0） |
 | 每日 | 积压 | Redis stream pending 数、oldest pending 年龄；`inbox` 非终态行数 | 稳定、不单调增长 |
 | 每周 | 投递台账状态分布 | `SELECT tenant_id, state, count(*) FROM delivery_ledger GROUP BY 1,2` | 无长期 `sending`、无增长中的 `ambiguous` |

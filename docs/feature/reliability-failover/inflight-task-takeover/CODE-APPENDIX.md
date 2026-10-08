@@ -10,33 +10,23 @@
 // 仓库对应位置，可选核对：trpcservice/reliability/inflight/barrier.go:15
 type Point string
 const (
-    PointP1 Point = "p1_persisted_before_dispatch"
-    PointP2 Point = "p2_executed_before_commit"
-    PointP3 Point = "p3_committed_before_send"
-    PointP4 Point = "p4_accepted_before_confirmation"
+    PointP1BeforeExecution        Point = "p1_persisted_before_execution"
+    PointP2BeforeTerminalCommit   Point = "p2_executed_before_commit"
+    PointP3BeforeReplyPublish     Point = "p3_result_committed_before_reply_publish"
+    PointP4BeforeProviderDelivery Point = "p4_delivery_claimed_before_provider_send"
 )
-type Observation struct {
-    Point     Point
-    TenantID  string
-    RequestID string
-    Owner     string
-    At        time.Time
-}
-type Barrier interface { Wait(context.Context, Observation) error }
-type Status struct {
-    Enabled  bool  `json:"enabled"`
-    Point    Point `json:"point,omitempty"`
-    Hit      bool  `json:"hit"`
-    Released bool  `json:"released"`
-}
+type Barrier interface { Wait(context.Context, Point) error }
+type Snapshot struct { Point Point; Armed, Hit, Released bool }
 ```
 
-**语义：** 业务组件只依赖 `Barrier`，不依赖 HTTP、Docker 或测试框架。正常运行时不注入它，生产任务不会暂停。`Status` 有意不返回 tenant、request 或正文，状态接口只说明「某个边界是否命中」——这是故意的安全设计：健康端点不能成为消息路由元数据泄露面。
+**语义：** 业务组件只依赖 `Barrier`，不依赖 HTTP、Docker 或测试框架。正常运行时不注入它，生产任务不会暂停。`Snapshot` 只说明某个 point 是否 arm/hit/released，不含 tenant、request 或正文。
 
 ```go
-// 仓库对应位置，可选核对：trpcservice/reliability/inflight/barrier.go:36
-func ValidPoint(value Point) bool          // 仅四个之一
-func ParsePoint(value string) (Point, error) // ""|p1|p2|p3|p4 或完整名；"" 表示未配置
+// trpcservice/reliability/inflight/barrier.go
+func (c *Controller) Arm(point Point) <-chan struct{}
+func (c *Controller) Wait(context.Context, Point) error
+func (c *Controller) Release(point Point) bool
+func (c *Controller) Snapshot(point Point) Snapshot
 ```
 
 ---
@@ -44,52 +34,30 @@ func ParsePoint(value string) (Point, error) // ""|p1|p2|p3|p4 或完整名；""
 ## 2. Controller 不会替系统重试或修改状态
 
 ```go
-// 仓库对应位置，可选核对：trpcservice/reliability/inflight/barrier.go:104
-func (c *Controller) Wait(ctx context.Context, observation Observation) error {
-    if c == nil || observation.Point != c.point ||
-        (c.tenantID != "" && observation.TenantID != c.tenantID) {
-        return nil
-    }
-    if ctx == nil { return errors.New("in-flight barrier context is nil") }
-    c.mu.Lock()
-    c.hit = true
-    released := c.released
-    c.mu.Unlock()
-    if released { return nil }
-    select {
-    case <-ctx.Done():
-        return ctx.Err()
-    case <-c.release:
-        return nil
-    }
-}
-func (c *Controller) Release() {
-    if c == nil { return }
-    c.once.Do(func() {
-        c.mu.Lock(); c.released = true; c.mu.Unlock()
-        close(c.release)
-    })
+// trpcservice/reliability/inflight/barrier.go
+func (c *Controller) Wait(ctx context.Context, point Point) error {
+    c.mu.Lock(); g := c.gates[point]; c.mu.Unlock()
+    if g == nil { return nil }             // only explicitly armed points pause
+    g.hitOnce.Do(func() { close(g.hit) })
+    select { case <-ctx.Done(): return ctx.Err(); case <-g.release: return nil }
 }
 ```
 
-**故障语义：** 匹配 point/tenant 的任务停住，不匹配的任务直接通过。`hit=true` 让外部（脚本轮询 `/statusz`）能定位真正命中的 owner。强杀命中进程时 controller 连同内存消失，但 `inbox`、任务 pending、`lease`、`ledger` record 都没有被它改变——这正是存活节点必须恢复的条件。`Release` 只释放存活节点上的测试暂停，**不重新入队、不删租约、不补发回复、不变更 ledger**。
-
-`Status()`（行 138）返回 `Enabled/Point/Hit/Released`，nil controller 返回零值 `Status{}`。
+**故障语义：** 只有被 arm 的 point 停住。脚本轮询 point-scoped `status`，命中后强杀 node-a；controller 连同内存消失，但 `inbox`、任务 pending、lease、ledger 都未被它改变。`Release(point)` 只用于局部调试，**不重新入队、不删租约、不补发回复、不变更 ledger**。
 
 ---
 
 ## 3. P1：持久化 job 在 dispatch 前暂停
 
 ```go
-// 仓库对应位置，可选核对：trpcservice/preprocess/worker.go:251
-func (w Worker) dispatch(ctx context.Context, job Job) error {
-    if w.InflightBarrier != nil {
-        if err := w.InflightBarrier.Wait(ctx, inflight.Observation{
-            Point: inflight.PointP1, TenantID: job.TenantID,
-            RequestID: job.RequestID, Owner: w.Owner, At: w.now()}); err != nil {
-            return err
-        }
+// trpcservice/preprocess/worker.go: RunOnce
+for _, job := range jobs {
+    if w.Barrier != nil {
+        if err := w.Barrier.Wait(ctx, inflight.PointP1BeforeExecution); err != nil { return processed, err }
     }
+    // process(job) performs preprocess -> dispatch -> MarkDispatched
+}
+func (w Worker) dispatch(ctx context.Context, job Job) error {
     payloadRef := job.PayloadRef
     if job.PreparedPayloadRef != "" { payloadRef = job.PreparedPayloadRef }
     _, err := w.Dispatcher.Dispatch(ctx, gateway.DispatchRequest{
@@ -115,10 +83,8 @@ func (w Worker) dispatch(ctx context.Context, job Job) error {
 // 仓库对应位置，可选核对：trpcservice/worker/runner.go:618
 outbound, err := renderOutbound(ctx, w.OutputRenderer, envelope, content)
 if err != nil { return fmt.Errorf("render outbound result: %w", err) }
-if w.InflightBarrier != nil {
-    if err := w.InflightBarrier.Wait(ctx, inflight.Observation{
-        Point: inflight.PointP2, TenantID: envelope.TenantID,
-        RequestID: envelope.RequestID, Owner: w.Owner, At: time.Now().UTC()}); err != nil {
+if w.Barrier != nil {
+    if err := w.Barrier.Wait(ctx, inflight.PointP2BeforeTerminalCommit); err != nil {
         return err
     }
 }
@@ -160,7 +126,9 @@ return w.Broker.Ack(ctx, delivery)            // 仅在 executeErr==nil 时 ACK
 
 ---
 
-## 5. P3/P4：Delivery Ledger 的发送与不确定状态
+## 5. P3：Reply Relay 发布前；P4：Delivery Ledger 的发送与不确定状态
+
+P3 不在 Delivery Ledger。`trpcservice/relay/reply.go` 在从 durable result 和冻结 `ReplyRoute` 构造完 `ReplyEvent` 后执行 `r.Barrier.Wait(ctx, inflight.PointP3BeforeReplyPublish)`，再调用 `r.Replies.PublishReply(...)`。因此 P3 被杀只会留下可重领的 reply outbox claim；接管者重发同一 reply event，既不运行模型，也不调用 provider。
 
 ```go
 // 仓库对应位置，可选核对：trpcservice/channels/delivery/service.go:109
@@ -177,10 +145,8 @@ if !acquired {
         return DeferredError{NotBefore: record.NotBefore}
     }
 }
-if s.InflightBarrier != nil {
-    if err := s.InflightBarrier.Wait(ctx, inflight.Observation{
-        Point: inflight.PointP3, TenantID: event.TenantID,
-        RequestID: event.RequestID, Owner: s.Owner, At: time.Now().UTC()}); err != nil {
+if s.Barrier != nil {
+    if err := s.Barrier.Wait(ctx, inflight.PointP4BeforeProviderDelivery); err != nil {
         return err
     }
 }
@@ -213,13 +179,6 @@ if resultDelivery.ProviderMessageID == "" {
     _, finishErr := s.Ledger.FinishDelivery(ctx, record, record.Version)
     return errors.Join(AmbiguousError{Err: runtime.ErrInvariantViolation}, finishErr)
 }
-if s.InflightBarrier != nil {
-    if err := s.InflightBarrier.Wait(ctx, inflight.Observation{
-        Point: inflight.PointP4, TenantID: event.TenantID,
-        RequestID: event.RequestID, Owner: s.Owner, At: time.Now().UTC()}); err != nil {
-        return err
-    }
-}
 record.State = messaging.DeliverySent
 record.ProviderMessageID = resultDelivery.ProviderMessageID
 record.LastErrorClass = ""
@@ -227,9 +186,7 @@ _, err = s.Ledger.FinishDelivery(ctx, record, record.Version)
 return err
 ```
 
-**状态变化（P3）：** `ClaimDelivery` 成功后 `delivery_ledger.state='sending'`，`attempt` 递增；节点若在此刻被杀，`state` 停在 `sending` 且 `claim_until` 过期。存活节点重新 `ClaimDelivery` 时，先把 `state='sending' AND claim_until<=now()` 的旧记录置 `ambiguous`/`owner_lost`，再重新 claim。**P3 不重跑模型**：`result_payload` 已是终态内容，只发送已保存结果。
-
-**状态变化（P4）：** 拿到 `ProviderMessageID` 后置 `sent` 前被杀，`sent` 未持久化。存活节点按 `client_request_id` 去重/对账收敛；若下游不支持，保留 `ambiguous`。`ProviderMessageID==""` 一律 `ambiguous` + `missing_provider_message_id`（绝不伪造 receipt）。
+**状态变化（P4）：** `ClaimDelivery` 成功后 `delivery_ledger.state='sending'`，`attempt` 递增，但 provider 尚未调用；节点若在此刻被杀，claim 到期后存活节点重新处理同一稳定 `client_request_id`。provider 调用后的网络中断仍可能形成 `ambiguous`：此时按 `client_request_id` 去重/对账收敛；下游不支持时保留 `ambiguous`，绝不伪造 receipt。
 
 ---
 
@@ -312,18 +269,16 @@ type TerminalError struct{ Err error }             // 已持久化 failed，可 
 ## 8. 启用契约（测试控制面开关）
 
 ```text
-TRPC_INFLIGHT_TEST_BARRIER=<p1|p2|p3|p4>          # 空=关闭（生产默认）
-TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID=<auto|wecom-ha-node-a|wecom-ha-node-b>
-TRPC_INFLIGHT_TEST_BARRIER_TENANT_ID=<可选 tenant id>
+TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true       # 仅 webui-multinode 演练 profile
 ```
 
-未设置 point 时 controller 不创建；指定 tenant 时只暂停目标租户；`auto` 允许测试先找实际 owner 再杀它（脚本轮询 `/statusz` 的 `inflight_test_barrier` 字段：`enabled/point/hit/released`，不含 tenant/request）。`Release` 通过受保护端点 `POST /test/failover/barrier/release`（带 `X-TRPC-Local-Token`）触发。
+未启用 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED` 时 controller 不创建。启用后，以带 `X-TRPC-Local-Token` 的 `/test/failover/{p1|p2|p3|p4}/{arm,status,release}` 控制**单个 point**；状态只含 `point/armed/hit/released`，不含 tenant/request。标准 E2E arm node-a、命中后杀死 node-a，不向 survivor release。
 
 **代码结论（四个断言）：**
 - P1 证明可靠接收（F1 已 durable，未成为 execution）；
 - P2 证明可接管执行（新 fence owner 完成原 request，旧 fence 被拒）；
-- P3 证明不重跑已提交结果（只发送 `result_payload`）；
-- P4 诚实处理「下游已接受但本地未确认」（去重/对账收敛，否则 `ambiguous`）。
+- P3 证明已提交结果的 reply event 在发布前崩溃时由 relay 重放，模型不重跑；
+- P4 证明 delivery claim 后、provider 调用前崩溃时由 ledger 接管；provider 调用结果不确定时仍以去重/对账收敛，否则 `ambiguous`。
 
 ---
 
@@ -465,3 +420,13 @@ type TerminalError   struct{ Err error }                // 已持久化 failed�
 ```
 
 `TerminalError` 表示已持久化 `failed`，account-queue entry 可 ACK；`DeferredError` 让 entry 保持 pending，等另一 delivery 尝试或 `not_before` 到期。两者都不能被误判为「成功」，也不能被误判为「需立即重发」。
+
+## 当前实现增量：代码证据索引
+
+| 证据 | 位置 | 说明 |
+|---|---|---|
+| 恢复契约 | `trpcservice/tool/recovery.go` | 四种 recovery policy 与 queryable 接口 |
+| 工具 lease | `trpcservice/tool/execution/postgres/store.go` | Claim/Renew/Finish 的 owner+fence CAS |
+| Guard | `trpcservice/tool/guard.go` | 先 Claim、一次 Grant 消费、恢复已消费的不确定 attempt |
+| 续办 | `trpcservice/worker/runner.go` | consumed confirmation 先复用结果，再进入受保护恢复 |
+| 数据迁移 | `migrations/000002_tool_execution_recovery.up.sql` | `tool_execution` 表、索引和约束 |

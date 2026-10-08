@@ -123,7 +123,7 @@ Bot B（次）  : https://<tunnel-host>/callbacks/wecom?route_key=local-wecom-se
 
 | 类别 | 指标 / 观测点 | 说明 |
 |---|---|---|
-| 实例身份 | `/statusz.instance_id`、`/statusz.process_start_id`、`/statusz.owners.*` | 把 lease、consumer、claim、日志映射到**真实进程**；不得靠容器名猜 owner |
+| 实例身份 | `/statusz.instance_id`、`/statusz.process_start_id`，加上 lease/consumer/claim 记录中的 owner | 把持久化 owner 映射到**真实进程**；不得靠容器名猜 owner |
 | 健康 | `/livez`、`/readyz`、入口 `/readyz`、入口 `/statusz.backends[].healthy` | live 只说进程没退出；ready 才算能服务业务 |
 | 会话执行 | lease 获得次数、续约失败次数、`ErrLeaseLost` 计数 | 续约失败是"即将失去执行权"的先兆 |
 | 提交 | `commit_turn` 成功数、`ErrStaleFence` 拒绝数、`ErrVersionConflict` 数 | stale fence 拒绝是 fence 机制**正在工作**的证据 |
@@ -332,7 +332,7 @@ HAVING count(*) > 1;
 | 每次发布前 | §1.1 配置门禁三项命令 | 全部通过；两组 Bot 元组不同 |
 | 每日 | `delivery_ledger` 状态分布（§4.1 SQL） | 无长期 `sending`、无增长中的 `ambiguous`、无新增 `failed` |
 | 每日 | 入口 `/statusz` | 至少一个 backend `healthy:true` |
-| 每日 | 各节点 `/statusz.owners` | owner 名含各自 `process_start_id`；无重复 |
+| 每日 | 各节点 `/statusz` 与 lease/consumer/claim 记录 | `process_start_id` 与对应持久化 owner 一致；无重复 |
 | 每周 | stream pending 与 oldest pending 趋势 | 稳定，无单调增长 |
 | 每周 | `session_commit` 终态唯一性检查（§4.1 SQL） | 返回 0 行 |
 | 每次演练后 | `session_head.last_fence` 单调性 | 接管后只增不减 |

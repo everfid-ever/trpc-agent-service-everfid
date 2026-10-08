@@ -228,7 +228,7 @@ Ledger 主路径 `pending → sending → sent`，并允许 `retry_wait` 与 `am
 
 ## 7. 测试暂停点如何保证命中准确
 
-测试 barrier 默认关闭，仅在显式配置 P1–P4、目标实例和可选 tenant 时启用。它只在已经达到对应 durable boundary 时阻塞该任务，并通过 `/statusz` 的 `inflight_test_barrier` 报告已命中。测试人员随后强杀**真正命中的 owner**；受害进程消失后，存活节点才被释放继续正常接管。
+测试 barrier 默认关闭；仅 `webui-multinode` 显式启用 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true`。测试经 `/test/failover/<point>/arm` 指定 node-a 的一个 point，再通过 `/test/failover/<point>/status` 确认 hit 后强杀 node-a。受害进程消失后，node-b 自行从 durable state 接管。
 
 barrier 不是重试器：它**不会**创建任务、删除租约、变更 Ledger 或补发回复。若测试需要手工改状态才成功，结论应是「未验证自动接管」。
 
@@ -238,8 +238,8 @@ barrier 不是重试器：它**不会**创建任务、删除租约、变更 Ledg
 |---|---|---|
 | P1 | `preprocess/worker.go` `dispatch()` | `Dispatcher.Dispatch` 之前（durable job 已存在、尚未成为 execution） |
 | P2 | `worker/runner.go` | 模型/工具与 `renderOutbound` 之后、`encodeResultRef`/`PutResult`/`beforeCommit`/`CommitTurn` 之前 |
-| P3 | `channels/delivery/service.go` `deliverSegment()` | `ClaimDelivery` 成功后、`deliverWithClaimRenewal` 之前 |
-| P4 | 同上 | adapter 返回且 `ProviderMessageID != ""` 后、置 `sent` 与 `FinishDelivery` 之前 |
+| P3 | `relay/reply.go` `ReplyRelay.handle()` | 已构造冻结路由的 `ReplyEvent` 后、`PublishReply` 之前 |
+| P4 | `channels/delivery/service.go` `deliverSegment()` | `ClaimDelivery` 成功后、`deliverWithClaimRenewal` 调 provider 之前 |
 
 ---
 
@@ -263,7 +263,7 @@ barrier 不是重试器：它**不会**创建任务、删除租约、变更 Ledg
 2. 选择一个 P 点，只让 Tenant A 原消息停在该点；Tenant B 全程作为对照。
 3. 记录原消息、任务、owner、tenant/session、暂停命中和持久化证据（inbox / preprocess_job / execution_record / session_commit / delivery_ledger 行）。
 4. 强杀实际责任节点，记录 `t0`，确认它持续停止（`State.Running == false`）。
-5. 仅释放存活节点的测试暂停（POST `/test/failover/barrier/release`）；**不改队列、不删租约、不手改任务或发送记录。**
+5. 受害节点已被强杀，barrier 随其进程消失；不对存活节点释放或 arm 任何 barrier，**不改队列、不删租约、不手改任务或发送记录。**
 6. 在预设 `T_TASK/T_DELIVER` 内检查同一原消息的完成和最终可见回复。
 7. 观察 `W_DUPLICATE`，记录重试次数、迟到回复、重复 terminal、永久 pending 和副作用幂等结果。
 8. 重建基线，再对 Tenant B 和其它 P 点独立重复。
@@ -335,8 +335,8 @@ barrier 不是重试器：它**不会**创建任务、删除租约、变更 Ledg
 | P2 | `execution_record`(running) + Redis lease + stream pending | 模型中间态、render 结果、`result_payload` |
 | P2-a（模型已请求工具、工具执行中） | 上列全部 + 官方会话后端 `session_events` 中那条含 `tool_calls` 的 assistant 消息（**仅此一条工具相关记录**） | 工具执行进度、工具中间结果、工具返回值、本轮的模型/工具调用计数 |
 | P2-b（`ask` 工具消费授权后、结果落库前） | 上列全部 + `confirmation_grant`(consumed) + `tool_attempt`(effect_unknown) | 工具结果密文（`tool_result_payload` 未写入时） |
-| P3 | `session_commit`(终态) + `session_head` 推进 + reply outbox(pending) + `result_payload` | adapter 尚未调用 |
-| P4 | `delivery_ledger`(sending 或 sent/ambiguous) + provider_message_id(部分) | 本地 `sent` 持久化 |
+| P3 | `session_commit`(终态) + `session_head` 推进 + reply outbox(claimed) + `result_payload` | `ReplyEvent` 尚未发布；adapter 尚未调用 |
+| P4 | `delivery_ledger`(sending) + 稳定 `client_request_id` | provider 尚未调用；因此接管可安全从投递调用前继续 |
 
 所有窗口都不依赖进程内存状态——这是本设计能接管的前提：只要「半成品」落在 PostgreSQL 或 Redis（带 TTL 自动释放），存活节点就能从最后一个 durable 状态接力。
 
@@ -456,3 +456,7 @@ lease, _ := w.acquire(ctx, key)
 ## 22. 一句话收尾
 
 在途任务接管的本质是：**把一条消息的五个持久化事实（F1–F5）分段落库，使任一节点在任意事实之间死亡时，存活节点都能从「最后一个已落库事实」接力，且靠 Inbox 唯一键、fence、Delivery Ledger 条件更新、业务幂等键四层边界保证不丢、不重、不串、不翻案。** 模型调用可重跑（≥1），任务尝试受控，最终回复必须恰好一次（在下游可去重的诚实边界内）。这就是本包全部设计的出发点与验收终点。
+
+## 23. 当前实现增量：长程确认工具接管
+
+`ask` 工具在 `tool_attempt=effect_unknown` 且结果不存在时不再一律终止。新版本先取得 `(tenant_id, request_id, tool_call_id)` 对应的 `tool_execution` lease，再按工具声明的恢复策略处理：`queryable` 先查询，`idempotent_key` 用相同键重试，`replay_safe` 重放，`manual` 终止为 `tool_effect_unknown`。因此禁止的是**无契约的盲重放**，而不是禁止一切工具续办。

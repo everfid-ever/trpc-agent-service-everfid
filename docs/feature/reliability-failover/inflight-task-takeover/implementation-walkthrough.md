@@ -13,17 +13,16 @@
 // 仓库对应位置，可选核对：trpcservice/reliability/inflight/barrier.go
 type Point string
 const (
-    PointP1 Point = "p1_persisted_before_dispatch"
-    PointP2 Point = "p2_executed_before_commit"
-    PointP3 Point = "p3_committed_before_send"
-    PointP4 Point = "p4_accepted_before_confirmation"
+    PointP1BeforeExecution        Point = "p1_persisted_before_execution"
+    PointP2BeforeTerminalCommit   Point = "p2_executed_before_commit"
+    PointP3BeforeReplyPublish     Point = "p3_result_committed_before_reply_publish"
+    PointP4BeforeProviderDelivery Point = "p4_delivery_claimed_before_provider_send"
 )
-type Observation struct{ Point Point; TenantID, RequestID, Owner string; At time.Time }
-type Barrier interface{ Wait(context.Context, Observation) error }
-type Status struct{ Enabled bool `json:"enabled"`; Point Point `json:"point,omitempty"`; Hit, Released bool }
+type Barrier interface{ Wait(context.Context, Point) error }
+type Snapshot struct { Point Point; Armed, Hit, Released bool }
 ```
 
-`Controller.Wait`：point/tenant 不匹配直接返回 nil；匹配则 `hit=true` 并阻塞至 `Release()` 或 `ctx.Done()`。`Status` 有意不返回 tenant/request（健康接口不得成为路由元数据泄露面）。nil controller 安全（直接返回 nil / 零值）。启用条件：同时配置 `TRPC_INFLIGHT_TEST_BARRIER` 及（可选）`INSTANCE_ID`/`TENANT_ID`，否则不创建 Controller。
+`Controller.Wait` 在未 arm 的 point 上直接返回；命中已 arm 的 point 后置 `hit` 并阻塞至 `Release(point)` 或 `ctx.Done()`。它没有 tenant/request 过滤功能，也不把状态暴露到健康接口。测试组合仅通过 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true` 创建 controller，并用带 `X-TRPC-Local-Token` 的本地控制面分别 arm/status/release 某一个 point：`/test/failover/{p1|p2|p3|p4}/{arm,status,release}`。
 
 **为什么这么设计？** 测试只负责精确制造故障；自动接管仍由持久化状态、队列 reclaim、lease/fence、Delivery Ledger 完成。barrier 不创建任务、不删租约、不变更 Ledger、不补发回复。
 
@@ -31,30 +30,17 @@ type Status struct{ Enabled bool `json:"enabled"`; Point Point `json:"point,omit
 
 ## 二、P1 挂点：preprocess dispatch 之前
 
-入口：`preprocess/worker.go` 的 `Worker.dispatch()`。
+入口：`preprocess/worker.go` 的 `Worker.RunOnce()`；它在已领取 preprocess job、任何预处理和 dispatch 之前暂停。
 
 ```go
-// 仓库对应位置，可选核对：trpcservice/preprocess/worker.go:251
-func (w Worker) dispatch(ctx context.Context, job Job) error {
-    if w.InflightBarrier != nil {
-        if err := w.InflightBarrier.Wait(ctx, inflight.Observation{
-            Point: inflight.PointP1, TenantID: job.TenantID,
-            RequestID: job.RequestID, Owner: w.Owner, At: w.now()}); err != nil {
-            return err
+// trpcservice/preprocess/worker.go
+for _, job := range jobs { // jobs were durably claimed
+    if w.Barrier != nil {
+        if err := w.Barrier.Wait(ctx, inflight.PointP1BeforeExecution); err != nil {
+            return processed, err
         }
     }
-    payloadRef := job.PayloadRef
-    if job.PreparedPayloadRef != "" { payloadRef = job.PreparedPayloadRef }
-    _, err := w.Dispatcher.Dispatch(ctx, gateway.DispatchRequest{
-        Tenant: tenant.Context{TenantID: job.TenantID, TenantVersion: job.TenantVersion,
-            AgentAppID: job.AgentAppID, SubjectID: job.UserID, Channel: job.Channel,
-            TrustedSource: "channel_binding:" + job.ChannelBindingID},
-        RequestID: job.RequestID, SessionID: job.SessionID, UserID: job.UserID,
-        PayloadRef: payloadRef, ConfigVersion: job.ConfigVersion,
-    })
-    if err != nil { return err }
-    _, err = w.Store.MarkDispatched(ctx, job, w.now())
-    return err
+    // process(job): preprocess, Dispatcher.Dispatch, then MarkDispatched
 }
 ```
 
@@ -75,10 +61,8 @@ func (w Worker) dispatch(ctx context.Context, job Job) error {
 // 仓库对应位置，可选核对：trpcservice/worker/runner.go:618
 outbound, err := renderOutbound(ctx, w.OutputRenderer, envelope, content)
 if err != nil { return fmt.Errorf("render outbound result: %w", err) }
-if w.InflightBarrier != nil {
-    if err := w.InflightBarrier.Wait(ctx, inflight.Observation{
-        Point: inflight.PointP2, TenantID: envelope.TenantID,
-        RequestID: envelope.RequestID, Owner: w.Owner, At: time.Now().UTC()}); err != nil {
+if w.Barrier != nil {
+    if err := w.Barrier.Wait(ctx, inflight.PointP2BeforeTerminalCommit); err != nil {
         return err
     }
 }
@@ -113,66 +97,40 @@ executeErr = w.Executor.ExecuteWithLease(executionCtx, envelope, lease.Fence, be
 
 ---
 
-## 四、P3 挂点：Delivery Ledger claim 后、Adapter 调用前
+## 四、P3 挂点：Reply Relay 构造 reply event 后、发布前
 
-入口：`channels/delivery/service.go` 的 `deliverSegment()`。
+入口：`relay/reply.go` 的 `ReplyRelay.handle()`。此时 terminal result、reply outbox 和冻结的 reply route 都已经 durable；尚未向 reply queue 发布事件。
 
 ```go
-// 仓库对应位置，可选核对：trpcservice/channels/delivery/service.go:109
-record, acquired, err := s.Ledger.ClaimDelivery(ctx, key, plan, messaging.DeliveryClaim{Owner: s.Owner, TTL: claimTTL})
-if !acquired {
-    switch record.State {
-    case messaging.DeliverySent, messaging.DeliveryFailed: return nil
-    case messaging.DeliveryAmbiguous: return s.reconcile(ctx, event, record)
-    case messaging.DeliveryPending, messaging.DeliverySending, messaging.DeliveryRetryWait:
-        return DeferredError{NotBefore: record.NotBefore}
-    }
+// trpcservice/relay/reply.go
+event := channel.ReplyEvent{TenantID: record.TenantID, RequestID: record.AggregateID,
+    ChannelBindingID: route.ChannelBindingID, DeliveryKey: record.IdempotencyKey,
+    ContentRef: result.ResultRef, Target: frozenTarget, Final: true}
+if r.Barrier != nil {
+    if err := r.Barrier.Wait(ctx, inflight.PointP3BeforeReplyPublish); err != nil { return err }
 }
-if s.InflightBarrier != nil {
-    if err := s.InflightBarrier.Wait(ctx, inflight.Observation{
-        Point: inflight.PointP3, TenantID: event.TenantID,
-        RequestID: event.RequestID, Owner: s.Owner, At: time.Now().UTC()}); err != nil {
-        return err
-    }
-}
-record, resultDelivery, deliverErr := s.deliverWithClaimRenewal(ctx, adapter, channel.DeliveryRequest{
-    Event: event, ClientRequestID: record.ClientRequestID, Target: event.Target,
-    Content: append([]byte(nil), content...), ContentDigest: contentDigest, ContentType: contentType,
-}, record, claimTTL)
+return r.Replies.PublishReply(ctx, destination, event)
 ```
 
-**恢复路径：** relay 至少一次发布 reply outbox → delivery 消费 → `Deliver()` 校验 schema（`ResultRef == event.ContentRef` 否则 `ErrVersionMismatch`）、解析版本化 adapter（`adapter.ID() == event.Target.Channel` 否则 `ErrTenantScope`）、按 `MaxTextBytes()` 分片 → 每个 segment `deliverSegment`。模型执行与回复发送严格分离：**P3 故障只恢复 relay/delivery，不触发 `Execute`**。
+**恢复路径：** Relay 的 outbox claim 到期后由另一个节点重新领取、重新构造相同 reply event 并发布；之后 delivery 消费该事件。模型执行与回复发送严格分离：**P3 故障只恢复 relay publish，不触发 `Execute`，也尚未 claim Delivery Ledger**。
 
-**P3 关键事实：** 结果已保存于 `result_payload`，恢复只发送已保存内容。`deliverWithClaimRenewal` 在后台按 `claimTTL/3` 续租 claim，失败即取消调用 context——防止 owner 死亡后 claim 悬挂导致双发。
+**P3 关键事实：** 结果已保存于 `result_payload`，恢复使用冻结路由发布同一 reply event；其后的 delivery ledger 才负责发送端去重。
 
 ---
 
-## 五、P4 挂点：Provider 接受证据后、持久化 sent 前
+## 五、P4 挂点：Delivery Ledger 已领取、Provider 调用前
 
-同一 `deliverSegment` 内，紧接 P3 之后：
+入口为 `channels/delivery/service.go` 的 `deliverSegment()`，在 `ClaimDelivery` 成功后、`deliverWithClaimRenewal` 调用 adapter 之前：
 
 ```go
-// 仓库对应位置，可选核对：trpcservice/channels/delivery/service.go:163
-if !resultDelivery.Delivered {
-    return s.finishRetry(ctx, record, runtime.ErrBackendUnavailable, 0)
+// trpcservice/channels/delivery/service.go
+record, acquired, err := s.Ledger.ClaimDelivery(ctx, key, plan, claim)
+if !acquired { return deferredOrReconcile(record) }
+if s.Barrier != nil {
+    if err := s.Barrier.Wait(ctx, inflight.PointP4BeforeProviderDelivery); err != nil { return err }
 }
-if resultDelivery.ProviderMessageID == "" {
-    record.State, record.LastErrorClass = messaging.DeliveryAmbiguous, "missing_provider_message_id"
-    _, finishErr := s.Ledger.FinishDelivery(ctx, record, record.Version)
-    return errors.Join(AmbiguousError{Err: runtime.ErrInvariantViolation}, finishErr)
-}
-if s.InflightBarrier != nil {
-    if err := s.InflightBarrier.Wait(ctx, inflight.Observation{
-        Point: inflight.PointP4, TenantID: event.TenantID,
-        RequestID: event.RequestID, Owner: s.Owner, At: time.Now().UTC()}); err != nil {
-        return err
-    }
-}
-record.State = messaging.DeliverySent
-record.ProviderMessageID = resultDelivery.ProviderMessageID
-record.LastErrorClass = ""
-_, err = s.Ledger.FinishDelivery(ctx, record, record.Version)
-return err
+record, resultDelivery, err := s.deliverWithClaimRenewal(ctx, adapter, request, record, claimTTL)
+// only after the provider outcome is known: FinishDelivery(sent/retry_wait/ambiguous)
 ```
 
 **错误分类（同一函数内）：**
@@ -300,10 +258,10 @@ if errors.Is(err, runtime.ErrAlreadyTerminal) { return nil }
 | P1 恢复 | `preprocess_job.state='ready'` | `execution_record` 创建 + `inbox`→`dispatch_ready` | prepare_dispatch |
 | P2 命中 | `execution_record.outcome='running'` | 不变（暂停） | worker runner |
 | P2 提交 | `execution_record.outcome='running'` | `session_head.next_input_seq+1` + `session_commit` 终态 + `outbox` reply pending | commit_turn |
-| P3 命中 | `delivery_ledger.state='sending'` | 不变（暂停） | delivery |
-| P3 发送 | `delivery_ledger.state='sending'` | `state='sent'` + `provider_message_id`（或 `ambiguous`） | FinishDelivery |
-| P4 命中 | `delivery_ledger.state='sending'` | 不变（暂停，sent 未持久化） | delivery |
-| P4 收敛 | `delivery_ledger.state='sending'/'ambiguous'` | `state='sent'` 或保留 `ambiguous` + 告警 | FinishDelivery/ReconcileDelivery |
+| P3 命中 | `outbox(kind='reply').state='claimed'` | 不变（reply event 尚未发布） | Reply Relay |
+| P3 恢复 | `outbox.state='claimed'` 的 claim 到期 | 重新发布同一个 `ReplyEvent` | Reply Relay |
+| P4 命中 | `delivery_ledger.state='sending'` | 不变（provider 尚未调用） | delivery |
+| P4 收敛 | `delivery_ledger.state='sending'/'ambiguous'` | `state='sent'`，或保留 `ambiguous` + 告警 | FinishDelivery/ReconcileDelivery |
 
 ---
 
@@ -329,7 +287,7 @@ return w.Store.FinishReady(ctx, job)        // 文本：直接 ready
 
 ---
 
-## 十三、delivery 分片与 adapter 解析（P3/P4 前的准备）
+## 十三、delivery 分片与 adapter 解析（P4 前的准备）
 
 `Deliver()`（仓库对应位置，可选核对：`trpcservice/channels/delivery/service.go:72`）在 `deliverSegment` 前完成：
 
@@ -344,3 +302,11 @@ for segmentNo, content := range segments { s.deliverSegment(ctx, event, adapter,
 ```
 
 每个 segment 独立 `deliverSegment` → 独立 `delivery_ledger` 行（key = `(tenant_id, delivery_key, segment_no)`），互不影响；一个 segment 的 `ambiguous` 不会拖垮其它 segment。
+
+## 当前实现增量：确认工具被接管时的运行时顺序
+
+1. Runner 发现 confirmation 已 `consumed`，先读取 `tool_result_payload`；有结果则直接续办模型。
+2. 无结果且 `tool_attempt=effect_unknown` 时，重新解析同一固定版本工具。
+3. Guarded callable 先 Claim `tool_execution`，再检测 Grant 已消费；不会第二次消费 Grant。
+4. 按 `queryable`/`idempotent_key`/`replay_safe`/`manual` 决定查询、重试、重放或安全终止。
+5. 成功后按顺序写工具结果、完成 tool attempt、完成 tool execution，再把结果作为同一 tool call 的 continuation 输入。

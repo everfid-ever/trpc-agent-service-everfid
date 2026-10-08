@@ -207,7 +207,7 @@ sequenceDiagram
 | 稳定入口 | 只转发健康后端，不替代业务幂等 | `cmd/trpc-service/wecom_ha_entry_role.go` |
 | 编排 | bootstrap + 双节点(restart:no) + 入口 | `deploy/compose/docker-compose.local.yml`（profile `wecom-ha-local`） |
 
-**当前实现进展（仓库已落地）：** `webui-local` 已支持 `TRPC_WECOM_SECONDARY_LOCAL_ENABLED=true` 与一组 `WECOM_SECONDARY_*` 凭据。在显式启用且两个 Bot 的 `(Corp ID, Agent ID)` 不同前提下，启动建立 Tenant B、独立 Agent/Policy、`local-wecom-secondary` binding、独立 ingress route 与 tenant-scoped 凭据投放。同一企业下的两个不同 Agent 合法；Tenant B 的 Agent 是最小 LLM 组合，不注册 Tenant A 的 local-note 工具或 memory service。
+**当前实现（仓库已落地）：** `webui-local` 支持 `TRPC_WECOM_SECONDARY_LOCAL_ENABLED=true` 与一组 `WECOM_SECONDARY_*` 凭据。在显式启用且两个 Bot 的 `(Corp ID, Agent ID)` 不同前提下，bootstrap 建立 Tenant B、独立 app/policy、`local-wecom-secondary` binding、独立 ingress route 与 tenant-scoped identity/session/payload/model/channel-secret scope。两 Bot 可共享同一基础设施，却不共享业务身份。次 Bot 同样装配当前的 `webui_create_note`（`idempotent_key`）恢复契约；是否启用工具由各自 policy/config 决定，而不是借用主 Bot 状态。
 
 ---
 

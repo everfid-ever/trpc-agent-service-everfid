@@ -163,8 +163,8 @@ t6    N2 发送最终回复并把 delivery_ledger 推进为 sent
 
 `delivery_ledger` 状态机：`pending → sending → sent`，并含 `retry_wait` / `ambiguous` / `failed`。
 
-- **P3 barrier**（claim 成功后、调用 adapter 前）：暂停点用于演练“发送前进程被kill”，验证 claim 后未发送时由存活节点接管。
-- **P4 barrier**（拿到 provider receipt 后、持久化 sent 前）：暂停点用于演练“下游已受理但未确认”，验证 `client_request_id` 去重收敛。
+- **P3 barrier**（`ReplyRelay` 已构造 reply event、`PublishReply` 前）：暂停点验证已提交结果的 relay publish 可由存活节点重放，不重跑模型。
+- **P4 barrier**（`ClaimDelivery` 成功、调用 provider 前）：暂停点验证 delivery claim 接管后可安全调用 provider。provider 已接受但本地未知的独立窗口由 `client_request_id` 去重/对账收敛。
 
 错误分类（见 `delivery/service.go`）：
 - `AmbiguousDeliveryError` → state=`ambiguous`，`last_error_class='response_lost'`，进入 `reconcile`。
@@ -306,7 +306,7 @@ N2 acquire 时拿到 fence=21，提交成功 → session_head.last_fence=21
 ④ 投递一致： delivery_ledger 的 tenant_id 与期望租户一致；每 segment 恰有一条终态
 ```
 
-> **注意表名：** 平台表 `session_event`（单数）在生产 durable turn 中不产生新行（`p_events` 为 null），**不是**对话历史的来源；历史在官方会话后端的 `session_events`（复数，键为 `app_name`/`user_id`/`session_id`）。详见 [../DATABASE-DESIGN.md](../DATABASE-DESIGN.md) §1.1。
+> **注意表名：** 平台表 `session_event`（单数）在生产 durable turn 中不产生新行（`p_events` 为 null），**不是**对话历史的来源；历史在官方会话后端的 `session_events`（复数，键为 `app_name`/`user_id`/`session_id`）。详见本包 [REFERENCE-IMPLEMENTATION.md](REFERENCE-IMPLEMENTATION.md) 的数据模型章节。
 
 四层全部一致，且客户端可见回复内容只含本租户代号 → 才算"回忆正确且不串扰"。
 

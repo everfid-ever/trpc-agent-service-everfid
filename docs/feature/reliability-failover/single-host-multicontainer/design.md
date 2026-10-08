@@ -101,7 +101,7 @@ TRPC_WEBUI_LOCAL_INSTANCE_ID  +   newWebUILocalProcessStartID() (8B rand → 16 
    (Redis)        (PostgreSQL delivery_ledger)         (stream consumer group)
 ```
 
-`runtimeStatus()` 输出的 `owners` 映射包含 7 个组件：`worker`、`preprocess`、`dispatch-relay`、`reply-relay`、`wakeup-relay`、`wakeup`、`delivery`，值均为上述命名。重新加入时 `process_start_id` 改变，全部 owner 名随之改变——旧 lease 在 TTL 后过期，旧 consumer 的 pending 被新进程（或 peer）reclaim。
+Worker、preprocess、relay、delivery 的内部 owner 名都含 `instance_id` 与 `process_start_id`。`/statusz` 仅公开实例身份和启动身份；重新加入时 `process_start_id` 改变，内部 owner 名随之改变——旧 lease 在 TTL 后过期，旧 consumer 的 pending 被新进程（或 peer）reclaim。
 
 ## 七、模块 6：端口的网络语义
 
@@ -118,7 +118,7 @@ TRPC_WEBUI_LOCAL_INSTANCE_ID  +   newWebUILocalProcessStartID() (8B rand → 16 
 关键服务（profile `wecom-ha-local`）：
 
 - `wecom-ha-bootstrap`：`command: webui-local-bootstrap`，一次性初始化共享 tenant/config，`TRPC_WEBUI_LOCAL_INSTANCE_ID=wecom-ha-bootstrap`，依赖 postgres/redis/qdrant healthy。
-- `wecom-ha-node-a` / `wecom-ha-node-b`：`command: wecom-local`，`restart: "no"`，共享 `TRPC_POSTGRES_DSN` / `TRPC_REDIS_ADDRESS: redis:6379` / `TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS: clamav:3310`；主/次 Bot 均启用；`INSTANCE_ID` 分别为 `wecom-ha-node-a` / `wecom-ha-node-b`；端口 `${TRPC_LOCAL_WECOM_HA_NODE_A_PORT:-58088}:8080` / `${TRPC_LOCAL_WECOM_HA_NODE_B_PORT:-58089}:8080`；`depends_on: wecom-ha-bootstrap(service_completed_successfully)`、clamav、otel-collector。node-a 环境块 `&wecom-ha-runtime-environment` 内含 barrier 变量透传（`TRPC_INFLIGHT_TEST_BARRIER` 等，均 `:-` 空默认）。
+- `wecom-ha-node-a` / `wecom-ha-node-b`：`command: wecom-local`，`restart: "no"`，共享 `TRPC_POSTGRES_DSN` / `TRPC_REDIS_ADDRESS: redis:6379` / `TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS: clamav:3310`；主/次 Bot 均启用；`INSTANCE_ID` 分别为 `wecom-ha-node-a` / `wecom-ha-node-b`；端口 `${TRPC_LOCAL_WECOM_HA_NODE_A_PORT:-58088}:8080` / `${TRPC_LOCAL_WECOM_HA_NODE_B_PORT:-58089}:8080`；`depends_on: wecom-ha-bootstrap(service_completed_successfully)`、clamav、otel-collector。此 profile 不透传 in-flight barrier；P1–P4 只由独立 `webui-multinode` 测试 profile 启用。
 - `wecom-ha-entry`：`command: wecom-ha-entry`，`restart: "no"`；`TRPC_WECOM_HA_ENTRY_BACKENDS: http://wecom-ha-node-a:8080,http://wecom-ha-node-b:8080`；`TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL: 1s`；端口 `${TRPC_LOCAL_WECOM_HA_ENTRY_PORT:-58087}:8080`。注释明确：**这是唯一允许暴露给 HTTPS tunnel / 企业微信控制台的端口**。
 - PostgreSQL / Redis / Qdrant / ClamAV / otel-collector 为共享依赖（同故障域）。
 
@@ -328,9 +328,9 @@ sequenceDiagram
 
 | 端点 | 要求 |
 |---|---|
-| `/statusz` | 输出 `instance_id`、`process_start_id`、`owners`、`inflight_test_barrier`；**不返回** tenant、会话、消息内容或 Secret |
+| `/statusz` | 输出 `instance_id`、`process_start_id`；**不返回** tenant、会话、消息内容或 Secret。组件 owner 是运行时内部身份，barrier 状态仅经受保护的 point endpoint 查询。 |
 | `/livez`、`/readyz` | 无鉴权，但不得泄露内部拓扑细节（`/readyz` 只返回状态码，不返回后端列表） |
-| `/test/failover/barrier/release` | 仅当测试 barrier 非 nil 时注册；要求 `POST` + `Header X-TRPC-Local-Token == 配置 token`，否则返回 404（不暴露"端点存在但鉴权失败"这一信息）；**绝不经公网入口暴露** |
+| `/test/failover/{p1|p2|p3|p4}/{arm,status,release}` | 仅当 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true` 时注册；每项要求正确 `X-TRPC-Local-Token`，否则 403；**绝不经公网入口暴露** |
 | `/callbacks/wecom` | 只接受 GET/POST（其他 405）；请求体上限 2 MiB；验签由后端的可信入口候选流程完成（见 `conversation-continuity` 包） |
 
 ### 17.3 转发时的头部处理

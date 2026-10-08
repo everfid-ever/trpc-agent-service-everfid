@@ -42,20 +42,20 @@ TRPC_WECOM_LOCAL_ENABLED=true
 TRPC_WECOM_SECONDARY_LOCAL_ENABLED=true        # (Corp ID, Agent ID) 必须不同
 TRPC_WECOM_HA_ENTRY_BACKENDS=http://wecom-ha-node-a:8080,http://wecom-ha-node-b:8080
 TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL=1s
-# 生产默认绝对不设置以下 barrier 变量：
-# TRPC_INFLIGHT_TEST_BARRIER / _INSTANCE_ID / _TENANT_ID
+# 生产默认绝对不设置：
+# TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true
 ```
 
 ### 1.3 测试控制面（仅隔离 Compose 使用）
 
-`TRPC_INFLIGHT_TEST_BARRIER*` 是 **process-local** 控制面：不写入业务数据库、不续租、不重投消息、不修改 Ledger。实例被终止后，接管只由已有的 pending reclaim、lease TTL 或 delivery claim TTL 完成。
+`TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true` 才会注册 process-local 的 P1–P4 控制面：不写入业务数据库、不续租、不重投消息、不修改 Ledger。实例被终止后，接管只由已有的 pending reclaim、lease TTL 或 delivery claim TTL 完成。
 
 约束：
 
-- 🔴 生产部署**必须不设置**这些变量；一旦误设，立即从配置移除并**重启**相关实例（变量不落库，移除即失效，但已命中的进程需重启以清除内存中的 controller）。
-- 🔴 不得把 `/test/failover/barrier/release` 经公网入口暴露；它要求 `POST` + `X-TRPC-Local-Token` 匹配，否则返回 404。
-- 释放 barrier **不是**业务重试或租约变更，只是恢复该演练所代表的下游依赖响应。判定"业务是否自动接管"要看受害节点死亡后存活节点是否**独立**完成任务。
-- 演练默认 `KEEP_ENVIRONMENT=false`，退出即销毁自创容器与卷，不影响既有环境；需排查时设 `true`。
+- 🔴 生产部署**必须不设置**该开关；一旦误设，移除配置并**重启**相关实例以清除内存 controller。
+- 🔴 不得把 `/test/failover/{p1|p2|p3|p4}/{arm,status,release}` 经公网入口暴露；每个操作均要求正确 `X-TRPC-Local-Token`，无 token 返回 403。
+- 标准接管演练命中后直接杀死 owner；不对 survivor 调 release。release 不是业务重试或租约变更。
+- 演练脚本退出即销毁其自创容器与卷；失败日志保留到临时目录。
 
 ---
 
@@ -81,7 +81,7 @@ TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL=1s
 3. **先发布能识别新状态的 consumer**（preprocess / worker / delivery），再发布 producer。理由：旧的 consumer 遇到未知 envelope 字段或未知 delivery 状态必须能安全忽略/遍历，而不是 panic 或把 `ambiguous` 误判为 `failed`。
 4. **P1–P3 集成验证通过 + P4 的 Provider 能力结论已记录**（下游是否支持 `client_request_id` 去重/查询），才允许把自动重试策略用于真实写工具。
 5. 两节点并行运行并通过稳定基线后，才允许扩大流量或启用第二个 Bot。
-6. barrier 变量仅用于隔离测试 Compose，**不得混入生产发布**。
+6. `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED` 仅用于隔离的 `webui-multinode` 测试 Compose，**不得混入生产发布**。
 
 ---
 
@@ -179,7 +179,7 @@ TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL=1s
 - [ ] `/readyz` 覆盖 db + redis + malware 全部返回 200；
 - [ ] `final_duplicate_total` 无告警（同一 segment 无两条 `sent`）；
 - [ ] `delivery_state_dist` 中无长期 `sending`；
-- [ ] barrier 变量已移除，内存 controller 随重启清除（`/statusz.inflight_test_barrier.enabled=false`）。
+- [ ] `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED` 未设置；生产角色不会注册 failover test endpoint。
 
 ---
 
@@ -283,3 +283,7 @@ TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL=1s
 三者独立成立、组合不冲突，且都依赖同一共享依赖（PostgreSQL / Redis），同属单一故障域，不承诺跨主机可用性。
 
 > ⚠️ 不要因为"后一条新消息成功"就判定原在途任务已被接管——这是两个不同的证据面。
+
+## 当前实现增量：工具恢复处置
+
+监控 `tool_execution` 的过期 `running`、`effect_unknown`、attempt/fence 增长和 `manual recovery required` 错误。对 `queryable`/`idempotent_key` 工具，优先让 lease 到期后的接管完成；对 `manual` 工具，不要人工重复调用外部系统，应依据 provider 侧证据决定后续业务补偿。发布顺序必须先应用迁移 `000002_tool_execution_recovery`，再部署会写入该表的应用版本。

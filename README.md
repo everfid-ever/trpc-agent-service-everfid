@@ -6,16 +6,19 @@
 2. 在途任务自动接管和幂等回复投递；用户不需重发，最终可见回复不重复。
 3. 同一主机的多个容器实例共享 PostgreSQL、Redis 与协调状态运行；任一实例非优雅退出后由其他实例接管。
 
-功能设计、参考实现、测试和运维说明位于 [docs/feature/reliability-failover](docs/feature/reliability-failover/README.md)。
+实现总览位于 [可靠性文档](docs/feature/reliability-failover/README.md)。其中每项能力均有一份详细实现说明，涵盖持久化模型、运行时接管、故障窗口、代码地图、演练和边界。
 
 ## 本地验收
 
 ```bash
-# 两个节点在 PostgreSQL/Redis 短断后恢复
-bash scripts/e2e/dependency-recovery.sh
+# 全量代码回归
+go test ./...
 
-# node-a/node-b 双向 SIGKILL 后完成 durable reply
-bash scripts/e2e/node-takeover.sh
+# P1–P4 中任选一个 durable 边界强杀 owner，由 peer 接管原输入
+bash scripts/e2e/inflight-takeover.sh p2
+
+# WeCom 双节点：强杀、重加入和反向故障
+bash scripts/e2e/single-host-multicontainer.sh
 ```
 
-后两个演练需要 Docker Desktop 和本机 `deploy/compose/secrets/deepseek-api-key`。脚本在隔离 Compose project 中运行，失败时保留诊断日志位置。
+演练需要 Docker Desktop；在途接管需要本机 `deploy/compose/secrets/deepseek-api-key`，WeCom 双节点演练还需要 `deploy/compose/secrets/wecom.env`。脚本在隔离 Compose project 中运行，失败时保留诊断日志位置。

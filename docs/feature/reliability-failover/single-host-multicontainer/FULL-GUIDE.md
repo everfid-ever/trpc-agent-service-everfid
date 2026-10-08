@@ -132,7 +132,7 @@ N1 生成新的进程身份、通过 readiness 后重新成为候选实例。随
 | 容器状态与重启计数 | `docker inspect --format '{{.State.Running}}'` | 受害实例是否持续停止，是否被 Docker 自动重建 |
 | 入口健康集合 | `GET /statusz` 的 `backends[].healthy` | callback 是否仍有可用后端 |
 | `process_start_id` | `GET /statusz` 的 `process_start_id` | 重新加入是否产生新 owner |
-| owner 映射 | `GET /statusz` 的 `owners` | worker/relay/delivery 实际由谁承担 |
+| owner 映射 | `GET /statusz` 的实例/启动身份 + lease、consumer、ledger claim 记录 | worker/relay/delivery 实际由谁承担 |
 | consumer/lease/fence/claim | Redis / PostgreSQL 记录 | 谁接管了任务或投递职责 |
 | tenant/session/request/delivery 关联 | 共享库查询 | 两个 Bot 是否仍在正确原会话 |
 | 客户端最终回复 | 真实 Bot 会话或 delivery ledger `sent` 行 | 用户是否在预设时间内看到唯一结果 |
@@ -226,10 +226,10 @@ N1 旧进程（若残留）commit fence=5 → commit_turn 拒绝: stale fence
 
 - P1：durable job 已存在、尚未成为 execution（dispatch 之前）。
 - P2：模型/工具已跑完、尚未 commit。
-- P3：已 claim delivery、尚未真正发送。
-- P4：adapter 已返回 provider receipt、尚未置 `sent`。
+- P3：reply event 已构造、尚未由 Reply Relay 发布。
+- P4：Delivery Ledger 已 claim、尚未调用 provider；调用结果未知则另由 `client_request_id` 去重/对账收敛。
 
-演练时在 Compose 中透传 `TRPC_INFLIGHT_TEST_BARRIER=p2` 等，`node-a`/`node-b` 会在对应点阻塞；命中后 SIGKILL victim，释放 barrier，观察 survivor 是否收敛。本包主脚本不默认开启 barrier（生产安全默认空），但它使用的同一套 owner/lease/ledger 机制正是 P1–P4 的底座。
+在途演练使用独立的 `webui-multinode` profile：其显式启用 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true`，由测试经 `/test/failover/<point>/arm` arm node-a，命中后 SIGKILL node-a；不释放 survivor 的 barrier。本包主脚本不启用 barrier，但它使用的同一套 owner/lease/ledger 机制正是 P1–P4 的底座。
 
 ## 17. 常见误解
 
@@ -286,7 +286,7 @@ N1 旧进程（若残留）commit fence=5 → commit_turn 拒绝: stale fence
 | 单实例容量不足 | 接管后需独自承接两 Bot 全量 | 两实例同时运行时积压不涨，单实例时涨 → 容量问题 |
 | 续租失败导致重复执行 | `lease_lost` 使同一会话被反复重跑，挤占吞吐 | `ErrLeaseLost` 计数与积压同涨 |
 | 投递重试风暴 | `delivery_ledger` 大量 `retry_wait`，下游持续拒绝 | `attempt` 分布右移、`last_error_class='retryable'` 占比高 |
-| reclaim 未运行 | 消费循环退出或异常 | `/statusz.owners` 有 owner，但 pending 不下降 |
+| reclaim 未运行 | 消费循环退出或异常 | `statusz` 可用但 pending 不下降；结合 consumer/lease 记录定位 |
 | 连接池/fd 耗尽 | 续租是高频小事务；fd 耗尽早表现为消费停滞 | DB 连接数、进程 fd 数 |
 
 **判据纪律：** 积压增长时**先区分**是容量问题还是故障接管失败。若接管方一直 ready 且积压能回落，是容量问题；若 pending 永久不下降，才是接管链路问题。

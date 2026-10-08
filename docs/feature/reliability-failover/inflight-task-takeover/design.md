@@ -110,8 +110,8 @@ pending ──▶ sending ──▶ sent
 |---|---|---|---|
 | P1 | `inbox`(F1) + `preprocess_job`(ready) | 尚未创建 `execution_record` | 扫描 ready job 继续 dispatch |
 | P2 | `execution_record`(running) + lease(redis) + Redis stream pending | 模型中间态、render 结果、result_payload | reclaim + 新 fence 重跑，只一个 terminal commit |
-| P3 | `session_commit`(终态) + `session_head` 推进 + reply outbox(pending) + `result_payload` | adapter 尚未调用 | outbox 重放 + 发送已保存结果 |
-| P4 | `delivery_ledger`(sending 或 sent/ambiguous) + `provider_message_id`(内存/部分) | 本地 `sent` 持久化 | claim 不双发 + 下游去重/对账 |
+| P3 | `session_commit`(终态) + `session_head` 推进 + reply outbox(claimed) + `result_payload` | reply event 尚未发布，adapter 尚未调用 | relay 重领 outbox 并发布同一 event |
+| P4 | `delivery_ledger`(sending) + 稳定 `client_request_id` | provider 尚未调用 | claim 接管后安全调用；调用后未知结果才走下游去重/对账 |
 
 > 关键洞察：P1/P2 的「半成品」在 PostgreSQL，进程死亡后存活节点能发现；P3/P4 的「半成品」在 ledger/outbox，同样可发现。所有窗口都不依赖进程内存状态——这正是本设计能接管的前提。
 
@@ -168,7 +168,7 @@ return redis.call('DEL', KEYS[1])
 
 ### 5.1 Transactional Outbox（F3↔F4 解耦）
 
-`commit_turn` 在单事务写入 `session_commit` + `session_head` + `outbox`（`kind='reply'`，`idempotency_key = format('%s:%s', kind, idempotency_key)`）。**注意**：`p_events` 在生产 durable turn 中为 null（`BufferedTurn.Commit` 置 nil），会话转写由官方会话后端 `session_events` 持有，故不要从平台 `session_event` 找历史（见 [../DATABASE-DESIGN.md](../DATABASE-DESIGN.md) §1.1）。outbox 行带 `ON CONFLICT ON CONSTRAINT outbox_tenant_id_kind_idempotency_key_key DO NOTHING`，保证 replay 收敛不报错。
+`commit_turn` 在单事务写入 `session_commit` + `session_head` + `outbox`（`kind='reply'`，`idempotency_key = format('%s:%s', kind, idempotency_key)`）。**注意**：`p_events` 在生产 durable turn 中为 null（`BufferedTurn.Commit` 置 nil），会话转写由官方会话后端 `session_events` 持有，故不要从平台 `session_event` 找历史（见本包 [REFERENCE-IMPLEMENTATION.md](REFERENCE-IMPLEMENTATION.md) 的会话与 DDL 章节）。outbox 行带 `ON CONFLICT ON CONSTRAINT outbox_tenant_id_kind_idempotency_key_key DO NOTHING`，保证 replay 收敛不报错。
 
 relay 至少一次发布：`ClaimOutbox(kind,state='pending') → 发布 → MarkPublished`。发布失败则 `MarkRetry`（回到 `retry_wait` + `next_attempt_at`），由扫描补发。
 
@@ -232,8 +232,9 @@ sequenceDiagram
 
     D->>L: ClaimDelivery(sending, attempt+1)
     D->>P: Deliver(client_request_id)
+    Note over D: [P4 barrier 命中] 强杀（provider 调用前）
+    D->>P: Deliver(client_request_id)
     P-->>D: 200 + provider_message_id
-    Note over D: [P4 barrier 命中] 强杀 (sent 未持久化)
     D--xL: state 停在 sending, claim_until 过期
     Note over L: 存活 delivery 扫描
     D2->>L: ClaimDelivery → 旧 sending 置 ambiguous/owner_lost → 重新 claim
@@ -270,7 +271,7 @@ sequenceDiagram
 | P1 | `preprocess_job.state`, `dispatched_at` | `state='ready' AND dispatched_at IS NULL` → 可继续 dispatch |
 | P2 | `execution_record.outcome`, Redis `lease`, `session_head.last_fence` | `outcome IN ('running','pending')` 且 lease 过期 → reclaim + 新 fence |
 | P3 | `session_commit.outcome`, `outbox.state`, `result_payload` | 终态 session_commit + `outbox.state='pending'` → 重放发送 |
-| P4 | `delivery_ledger.state`, `claim_until`, `provider_message_id` | `sending` 且 `claim_until<=now()` → 回收为 ambiguous 后重 claim |
+| P4 | `delivery_ledger.state`, `claim_until`, `client_request_id` | `sending` 且 `claim_until<=now()` → 接管并从 provider 调用前继续；真实调用结果未知才转 `ambiguous` |
 
 > 注意：`preprocess_job` 的 `prepared_payload_ref` 与 `channel_binding_id` 必须随 job 持久化，否则转入异步链路后 tenant 归属与 payload 会丢失。
 
@@ -325,3 +326,7 @@ ReconciliationUnknown → 继续 defer
 | P2 | PostgreSQL `execution_record` + Redis lease | `running`/`pending` + fence | worker reclaim | 删 lease / 早 ACK |
 | P3 | PostgreSQL `session_commit` + `outbox` | 终态 + `pending` reply | relay + delivery | 重跑模型 |
 | P4 | PostgreSQL `delivery_ledger` | `sending`/`ambiguous` | delivery + reconcile | 盲重发 / 伪造 receipt |
+
+## 当前实现增量：工具执行状态机
+
+`tool_execution` 是 P2 内部的第二层状态机：`pending -> running -> succeeded|failed|effect_unknown`。Claim 只能创建记录，或接管 lease 已过期的 `running` 记录；每次接管增加 `attempt` 与 `fence`。`Renew`/`Finish` 必须同时匹配 `lease_owner+fence`，避免旧节点完成迟到副作用。详细字段与 SQL 见 `REFERENCE-IMPLEMENTATION.md` 的当前实现增量。

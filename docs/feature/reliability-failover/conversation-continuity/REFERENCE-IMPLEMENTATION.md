@@ -18,6 +18,48 @@
 
 ---
 
+## 1.5 先看数据：一次对话靠哪些 durable fact 续上
+
+先不要读 SQL。下面的每个方块是一类“节点全挂后还能读到”的事实；箭头表示同一 `tenant_id + request_id` 的推进关系。方块内只保留理解接管所需的字段分组，完整字段、约束和索引仍在下一章。
+
+```mermaid
+flowchart LR
+  B["Bot Binding\n定位：tenant_id + binding_id + config_version\n作用：验签后确定 Bot/租户"]
+  I["inbox\n身份：tenant_id + channel + account + external_message_id\n内容：request_id, app_id, session_id, state, payload_ref"]
+  H["session_head\n身份：tenant_id + app_id + session_id\n并发：version, last_fence, next_input_seq"]
+  C["session_commit\n身份：tenant + app + session + commit_id\n结果：request_id, input_seq, fence, outcome, result_ref"]
+  O["outbox\n身份：tenant_id + outbox_id\n发布：kind, idempotency_key, state, claim_owner/until"]
+  L["delivery_ledger\n身份：tenant + delivery_key + segment_no\n投递：client_request_id, state, claim_owner/until, provider_message_id"]
+  B --> I --> H --> C --> O --> L
+```
+
+| 读者问题 | 先看哪张表 | 接管时如何使用 |
+|---|---|---|
+| 这条渠道消息属于哪个 Bot/tenant？ | `channel_binding`、`inbox` | Binding 验签后写入不可任意改写的 tenant/request 身份。 |
+| 原会话的顺序和旧 owner 在哪里？ | `session_head`、`session_commit` | 新 Worker 读取 `last_fence` 和版本，以更高 fence 提交。 |
+| 节点死在提交后、发送前怎么办？ | `outbox` | Relay 重领未发布/过期 claim 的 reply，而不是重跑模型。 |
+| 最终回复会不会串 Bot 或重复？ | `delivery_ledger` | 冻结的 route + 每片段稳定 `client_request_id` + claim 条件更新。 |
+
+---
+
+## 1.6 DDL 的表格版：字段按职责阅读
+
+下表不省略决定正确性的字段；`created_at`、`updated_at` 等纯审计字段归入“版本/时间”。字段类型、默认值、CHECK、外键与全部索引以紧随其后的 SQL 为准。
+
+| 表 | 主键 / 关键唯一键 | 身份与路由字段 | 状态、并发与重试字段 | 内容 / 结果字段 | 这张表解决什么 |
+|---|---|---|---|---|---|
+| `channel_binding` | `(tenant_id, config_version, binding_id)` | `tenant_id`, `binding_id`, `channel`, `external_account_id`, `agent_app_id` | `config_version` | 渠道配置与凭据引用 | 将已验签回调固定映射为 Bot、tenant 与 app。 |
+| `inbox` | PK `(tenant_id, channel, external_account_id, external_message_id)`；UQ `(tenant_id, request_id)` | `tenant_id`, `channel`, `external_account_id`, `external_message_id`, `external_chat_id`, `external_user_id`, `agent_app_id`, `session_id`, `request_id` | `state`, `input_seq`, `version`, `key_version` | `payload_ref`, `payload_digest`, `result_ref`, `terminal_reason` | provider 重传去重；保存不可串租户的原始输入身份。 |
+| `preprocess_job` | PK `(tenant_id, job_id)` | `tenant_id`, `request_id`, `agent_app_id`, `session_id`, `channel_binding_id`, `config_version` | `state`, `attempt`, `lease_owner`, `lease_until`, `not_before`, `dispatched_at`, `version` | `payload_ref`, `prepared_payload_ref`, `reject_reason` | P1：先把可重领的预处理/dispatch 工作落库。 |
+| `execution_record` | PK `(tenant_id, request_id)` | `tenant_id`, `request_id`, `agent_app_id`, `session_id`, `input_seq` | `outcome`, `park_attempt`, `not_before`, `park_deadline`, `cancel_*`, `version` | `payload_ref`, `result_ref`, `blocked_reason` | 表示原输入正在执行、停放还是已终态。 |
+| `session_head` | PK `(tenant_id, agent_app_id, session_id)` | `tenant_id`, `agent_app_id`, `session_id` | `version`, `last_fence`, `next_input_seq`, `last_allocated_input_seq`, `last_session_seq` | `state_json`, `summary_id` | 原会话顺序与 fence 的权威行；新 owner 必须从这里校准。 |
+| `session_commit` | PK `(tenant_id, agent_app_id, session_id, commit_id)`；终态唯一索引 `(tenant, app, session, input_seq)` | `tenant_id`, `agent_app_id`, `session_id`, `request_id`, `input_seq`, `commit_id` | `fence`, `session_version`, `outcome` | `result_ref`, `reply_cursor`, `request_digest` | 一次有效 terminal commit；旧 fence 无法覆盖。 |
+| `outbox` | PK `(tenant_id, outbox_id)`；UQ `(tenant_id, kind, idempotency_key)` | `tenant_id`, `aggregate_id`, `kind`, `event_seq`, `idempotency_key` | `state`, `version`, `attempt`, `next_attempt_at`, `claim_owner`, `claim_until`, `published_at` | `payload_ref`, `traceparent` | 提交结果与发布回复解耦；P3 由它重领/重发 event。 |
+| `delivery_ledger` | PK `(tenant_id, delivery_key, segment_no)` | `tenant_id`, `delivery_key`, `segment_no`, `segment_count`, `client_request_id` | `state`, `version`, `attempt`, `not_before`, `claim_owner`, `claim_until`, `reconcile_attempt`, `last_error_class` | `provider_message_id`, `content_digest`, `renderer_version`, `format_version` | 每个回复片段的唯一投递事实，避免跨 Bot/节点重复发送。 |
+| `inbound_payload` / `prepared_payload` / `result_payload` | 各自 `(tenant_id, request_id, *_ref)` | `tenant_id`, `request_id`, 引用 ID | `key_version`、版本/时间 | 密文内容、摘要、内容类型 | 将输入、预处理产物和最终结果与业务状态分离保存。 |
+
+---
+
 ## 2. 完整 DDL（本子系统全部表 + 约束 + 索引，逐字）
 
 > 行号标注取自 `migrations/000001_service_schema.up.sql`，便于对照但不影响照抄实现。
@@ -635,14 +677,13 @@ deliverSegment(event, adapter, plan, segmentNo, content):
      sent/failed -> nil
      ambiguous   -> reconcile()
      pending/sending/retry_wait -> DeferredError{NotBefore}
-  P3 barrier(Wait)                                       # claim 后、adapter 前
+  P4 barrier(Wait)                                       # ClaimDelivery 后、provider 调用前
   result, deliverErr = deliverWithClaimRenewal(adapter, request, record, claimTTL)  # 后台按 claimTTL/3 续租
   if deliverErr is AmbiguousError: FinishDelivery(ambiguous, 'response_lost'); return
   if deliverErr is PermanentError: finishFailed(reconcile=false); return
   if deliverErr is RetryAfterError: finishRetry(retryAfter); return
   if !result.Delivered: finishRetry(ErrBackendUnavailable); return
   if result.ProviderMessageID=="": FinishDelivery(ambiguous, 'missing_provider_message_id'); return
-  P4 barrier(Wait)                                       # provider receipt 后、持久化 sent 前
   record.State=sent; record.ProviderMessageID=result.ProviderMessageID
   FinishDelivery(record)
 ```
@@ -687,9 +728,7 @@ RETURNING ...;
 | 次 Bot：`WECOM_SECONDARY_CORP_ID`、`WECOM_SECONDARY_AGENT_ID`、`WECOM_SECONDARY_APP_SECRET`、`WECOM_SECONDARY_CALLBACK_TOKEN`、`WECOM_SECONDARY_ENCODING_AES_KEY` | 第二 Bot 凭据 | 任一缺失 → `secondary WeCom local configuration is incomplete`；`(Corp ID, Agent ID)` 与主 Bot 相同 → `... is incompatible` |
 | `TRPC_WECOM_HA_ENTRY_BACKENDS` | 入口后端 | ≥2，http，去重 |
 | `TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL` | 探测周期 | 默认 1s，范围 [100ms, 1m] |
-| `TRPC_INFLIGHT_TEST_BARRIER` | P1–P4 暂停点 | 空=关闭（生产默认） |
-| `TRPC_INFLIGHT_TEST_BARRIER_INSTANCE_ID` | 命中哪个槽位 | `auto` 或具体 instance id |
-| `TRPC_INFLIGHT_TEST_BARRIER_TENANT_ID` | 限定租户 | 空=任意租户 |
+| `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED` | 注册 P1–P4 本地测试控制面 | `true` 仅用于 `webui-multinode` 演练 |
 | `TRPC_WEBUI_LOCAL_TOKEN` / `X-TRPC-Local-Token` | 控制面鉴权 | 仅本地演练 |
 | `TRPC_WECOM_REAL_ACCEPTANCE` | 真实 WeCom 验收状态 | `assumed`（默认）/ `recorded` |
 
