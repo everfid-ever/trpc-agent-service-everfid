@@ -386,7 +386,38 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 			return runtime.ErrCapabilityUnsupported
 		}
 		var encoded []byte
-		if continuation.State == governance.ConfirmationApproved {
+		executeTool := continuation.State == governance.ConfirmationApproved
+		if continuation.State == governance.ConfirmationConsumed {
+			attempt, attemptErr := w.Confirmations.GetToolAttempt(ctx, envelope.TenantID, grant.GrantID)
+			if attemptErr != nil {
+				return attemptErr
+			}
+			if attempt.State == governance.ToolAttemptFailed {
+				return w.commitContinuationFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, governance.ReasonToolAttemptFailed)
+			}
+			stored, storedErr := toolResults.GetToolResult(ctx, envelope.TenantID, grant.GrantID)
+			if storedErr == nil {
+				if stored.RequestID != envelope.RequestID || stored.ResultRef != attempt.ResultRef && attempt.State == governance.ToolAttemptSucceeded {
+					return runtime.ErrVersionMismatch
+				}
+				if attempt.State == governance.ToolAttemptEffectUnknown {
+					if _, finishErr := w.Confirmations.FinishToolAttempt(ctx, governance.FinishToolAttemptRequest{TenantID: envelope.TenantID, GrantID: grant.GrantID,
+						State: governance.ToolAttemptSucceeded, ResultRef: stored.ResultRef}); finishErr != nil {
+						return finishErr
+					}
+				}
+				encoded = stored.Content
+			} else if attempt.State == governance.ToolAttemptEffectUnknown && errors.Is(storedErr, runtime.ErrNotFound) {
+				// The former owner consumed the grant but died before it made a
+				// durable result. Re-enter the exact guarded callable: its
+				// execution lease and recovery policy decide whether to query,
+				// replay idempotently, or refuse unsafe manual recovery.
+				executeTool = true
+			} else {
+				return w.commitContinuationFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, governance.ReasonToolEffectUnknown)
+			}
+		}
+		if executeTool {
 			if w.ContinuationTools == nil {
 				return runtime.ErrCapabilityUnsupported
 			}
@@ -412,6 +443,9 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 				if attemptErr == nil && attempt.State == governance.ToolAttemptFailed {
 					return w.commitContinuationFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, governance.ReasonToolAttemptFailed)
 				}
+				if errors.Is(callErr, runtime.ErrEffectUnknown) {
+					return w.commitContinuationFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, governance.ReasonToolEffectUnknown)
+				}
 				// A storage/response failure after the external effect is not proof
 				// that the tool failed. Leave the request retryable; the consumed
 				// path will recover a durable result or terminalize effect_unknown.
@@ -421,28 +455,6 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 			if err != nil {
 				return runtime.ErrInvariantViolation
 			}
-		} else {
-			attempt, attemptErr := w.Confirmations.GetToolAttempt(ctx, envelope.TenantID, grant.GrantID)
-			if attemptErr != nil {
-				return attemptErr
-			}
-			if attempt.State == governance.ToolAttemptFailed {
-				return w.commitContinuationFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, governance.ReasonToolAttemptFailed)
-			}
-			stored, storedErr := toolResults.GetToolResult(ctx, envelope.TenantID, grant.GrantID)
-			if storedErr != nil {
-				return w.commitContinuationFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, governance.ReasonToolEffectUnknown)
-			}
-			if stored.RequestID != envelope.RequestID || stored.ResultRef != attempt.ResultRef && attempt.State == governance.ToolAttemptSucceeded {
-				return runtime.ErrVersionMismatch
-			}
-			if attempt.State == governance.ToolAttemptEffectUnknown {
-				if _, finishErr := w.Confirmations.FinishToolAttempt(ctx, governance.FinishToolAttemptRequest{TenantID: envelope.TenantID, GrantID: grant.GrantID,
-					State: governance.ToolAttemptSucceeded, ResultRef: stored.ResultRef}); finishErr != nil {
-					return finishErr
-				}
-			}
-			encoded = stored.Content
 		}
 		if graphResume != nil {
 			if graphResume.ToolCallID != call.ID || graphResume.ToolName != call.Function.Name {

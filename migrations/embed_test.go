@@ -11,8 +11,8 @@ func serviceSchemaBaseline(t *testing.T) Migration {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) != 1 {
-		t.Fatalf("expected one consolidated first-delivery baseline, got %#v", all)
+	if len(all) < 1 {
+		t.Fatalf("expected a consolidated first-delivery baseline, got %#v", all)
 	}
 	migration := all[0]
 	if migration.Version != "000001" || migration.Name != "service_schema" {

@@ -85,6 +85,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	tenantpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/tenant/postgres"
 	servicetool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
+	toolexecutionpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/tool/execution/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool/localnote"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	agentmemory "trpc.group/trpc-go/trpc-agent-go/memory"
@@ -324,7 +325,7 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	agentFactory := serviceagent.Factory{Profiles: profiles, Models: models, Tools: tools, Skills: skills, Knowledge: knowledgeResolver,
 		Conditions:  agentcondition.DefaultRegistry(),
 		Checkpoints: graphCheckpoints,
-		Policies:    governanceStore, Confirmations: governanceStore, ToolResults: payloads, Telemetry: telemetryProvider}
+		Policies:    governanceStore, Confirmations: governanceStore, ToolResults: payloads, ToolExecutions: toolexecutionpostgres.New(db), Telemetry: telemetryProvider}
 	bundles := profilememory.NewBundleManager(func(ctx context.Context, key profile.ExecutionProfileKey) (profile.RuntimeBundle, func(context.Context) error, error) {
 		snapshot, resolveErr := profiles.Resolve(ctx, key)
 		if resolveErr != nil {

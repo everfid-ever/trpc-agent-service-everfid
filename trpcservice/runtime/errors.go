@@ -20,6 +20,7 @@ var (
 	ErrCommitConflict          = errors.New("commit conflict")
 	ErrInvariantViolation      = errors.New("storage invariant violation")
 	ErrIdempotencyCollision    = errors.New("idempotency collision")
+	ErrEffectUnknown           = errors.New("external effect status is unknown")
 	ErrBackendUnavailable      = errors.New("backend unavailable")
 	ErrExecutionBudgetExceeded = errors.New("execution budget exceeded")
 )

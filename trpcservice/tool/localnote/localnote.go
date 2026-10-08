@@ -48,6 +48,17 @@ func Registration(tenantID string) servicetool.Registration {
 
 type Tool struct{}
 
+func (Tool) RecoveryPolicy() servicetool.RecoveryPolicy { return servicetool.RecoveryIdempotentKey }
+
+func (Tool) RecoveryKey(ctx context.Context) (string, error) {
+	execution, ok := servicetool.RecoveryContext(ctx)
+	if !ok || execution.ToolCallID == "" || execution.ArgsDigest == "" {
+		return "", runtime.ErrTenantScope
+	}
+	sum := sha256.Sum256([]byte(execution.TenantID + "\x00" + execution.RequestID + "\x00" + execution.ToolCallID + "\x00" + execution.ArgsDigest))
+	return hex.EncodeToString(sum[:]), nil
+}
+
 func (Tool) Declaration() *agenttool.Declaration {
 	return &agenttool.Declaration{Name: ID,
 		Description: "Create a user-approved local note. This action always requires durable confirmation.",
@@ -93,9 +104,11 @@ func (Tool) Call(ctx context.Context, arguments []byte) (any, error) {
 		strings.ContainsRune(value.Title, 0) || strings.ContainsRune(value.Content, 0) {
 		return nil, runtime.ErrInvariantViolation
 	}
-	digestInput := execution.TenantID + "\x00" + execution.RequestID + "\x00" + execution.ToolCallID + "\x00" + execution.ArgsDigest
-	sum := sha256.Sum256([]byte(digestInput))
-	return Result{Status: "created", NoteID: "note_" + hex.EncodeToString(sum[:12]), Title: value.Title, Content: value.Content}, nil
+	recoveryKey, err := (Tool{}).RecoveryKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return Result{Status: "created", NoteID: "note_" + recoveryKey[:24], Title: value.Title, Content: value.Content}, nil
 }
 
 var _ agenttool.CallableTool = Tool{}

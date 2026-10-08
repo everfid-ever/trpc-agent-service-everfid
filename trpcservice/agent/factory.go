@@ -16,6 +16,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	servicetool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
+	toolexecution "github.com/liuzengh/trpc-agent-service/trpcservice/tool/execution"
 	agentcore "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/chainagent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/cycleagent"
@@ -76,20 +77,21 @@ type Factory struct {
 	// Capabilities is the code-owned admission registry used to turn an
 	// immutable profile into a RuntimePlan. A zero value selects the reviewed
 	// default registry so existing process wiring remains compatible.
-	Capabilities  CapabilityRegistry
-	Profiles      profile.ExecutionProfileResolver
-	Models        ModelResolver
-	Tools         ToolResolver
-	Skills        SkillResolver
-	Knowledge     KnowledgeResolver
-	Conditions    agentcondition.Resolver
-	Memory        agentmemory.Service
-	Checkpoints   CheckpointResolver
-	Callbacks     Callbacks
-	Policies      governance.Repository
-	Confirmations governance.ConfirmationCoordinator
-	ToolResults   messaging.ToolResultStore
-	Telemetry     telemetry.Provider
+	Capabilities   CapabilityRegistry
+	Profiles       profile.ExecutionProfileResolver
+	Models         ModelResolver
+	Tools          ToolResolver
+	Skills         SkillResolver
+	Knowledge      KnowledgeResolver
+	Conditions     agentcondition.Resolver
+	Memory         agentmemory.Service
+	Checkpoints    CheckpointResolver
+	Callbacks      Callbacks
+	Policies       governance.Repository
+	Confirmations  governance.ConfirmationCoordinator
+	ToolResults    messaging.ToolResultStore
+	ToolExecutions toolexecution.Store
+	Telemetry      telemetry.Provider
 }
 
 func (f Factory) Build(ctx context.Context, snapshot profile.ExecutionProfileSnapshot) (agentcore.Agent, error) {
@@ -173,7 +175,7 @@ func (f Factory) compileRuntimePlan(snapshot profile.ExecutionProfileSnapshot) (
 
 func (f Factory) toolSurfaceCompiler() ToolSurfaceCompiler {
 	return ToolSurfaceCompiler{Tools: f.Tools, Knowledge: f.Knowledge, Memory: f.Memory,
-		Policies: f.Policies, Confirmations: f.Confirmations, ToolResults: f.ToolResults, Telemetry: f.Telemetry}
+		Policies: f.Policies, Confirmations: f.Confirmations, ToolResults: f.ToolResults, ToolExecutions: f.ToolExecutions, Telemetry: f.Telemetry}
 }
 
 func (f Factory) build(ctx context.Context, plan RuntimePlan, name string, depth int,
@@ -426,7 +428,7 @@ func (f Factory) ResolveConfirmedTool(ctx context.Context, tenantID string, ref 
 	if err != nil {
 		return nil, err
 	}
-	guarded, err := servicetool.GuardCallablesWithConfirmation(f.Policies, f.Confirmations, f.ToolResults,
+	guarded, err := servicetool.GuardCallablesWithExecution(f.Policies, f.Confirmations, f.ToolResults, f.ToolExecutions,
 		[]governance.VersionedRef{{ID: ref.ID, Version: ref.Version}}, values)
 	if err != nil {
 		return nil, err

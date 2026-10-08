@@ -8,6 +8,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	servicetool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
+	toolexecution "github.com/liuzengh/trpc-agent-service/trpcservice/tool/execution"
 	upstreamknowledge "trpc.group/trpc-go/trpc-agent-go/knowledge"
 	knowledgetool "trpc.group/trpc-go/trpc-agent-go/knowledge/tool"
 	agentmemory "trpc.group/trpc-go/trpc-agent-go/memory"
@@ -19,13 +20,14 @@ import (
 // this boundary: every entry is revision-pinned, guarded, budgeted and traced
 // before llmagent receives it.
 type ToolSurfaceCompiler struct {
-	Tools         ToolResolver
-	Knowledge     KnowledgeResolver
-	Memory        agentmemory.Service
-	Policies      governance.Repository
-	Confirmations governance.ConfirmationCoordinator
-	ToolResults   messaging.ToolResultStore
-	Telemetry     telemetry.Provider
+	Tools          ToolResolver
+	Knowledge      KnowledgeResolver
+	Memory         agentmemory.Service
+	Policies       governance.Repository
+	Confirmations  governance.ConfirmationCoordinator
+	ToolResults    messaging.ToolResultStore
+	ToolExecutions toolexecution.Store
+	Telemetry      telemetry.Provider
 }
 
 func (c ToolSurfaceCompiler) Compile(ctx context.Context, plan RuntimePlan) ([]tool.Tool, error) {
@@ -82,7 +84,7 @@ func (c ToolSurfaceCompiler) Compile(ctx context.Context, plan RuntimePlan) ([]t
 	if c.Policies == nil {
 		return nil, runtime.ErrCapabilityUnsupported
 	}
-	guarded, err := servicetool.GuardCallablesWithConfirmation(c.Policies, c.Confirmations, c.ToolResults, refs, values)
+	guarded, err := servicetool.GuardCallablesWithExecution(c.Policies, c.Confirmations, c.ToolResults, c.ToolExecutions, refs, values)
 	if err != nil {
 		return nil, err
 	}
