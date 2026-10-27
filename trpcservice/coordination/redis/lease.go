@@ -43,6 +43,47 @@ end
 return redis.call('DEL', KEYS[1])
 `)
 
+var inspectScript = redisclient.NewScript(`
+return {redis.call('GET', KEYS[1]) or '', redis.call('PTTL', KEYS[1]), redis.call('GET', KEYS[2]) or '0'}
+`)
+
+func (m *Manager) Inspect(ctx context.Context, key coordination.SessionKey) (coordination.LeaseObservation, error) {
+	if err := validateKey(key); err != nil {
+		return coordination.LeaseObservation{}, err
+	}
+	leaseKey, fenceKey := m.keys(key)
+	values, err := inspectScript.Run(ctx, m.client, []string{leaseKey, fenceKey}).Slice()
+	if err != nil {
+		return coordination.LeaseObservation{}, err
+	}
+	if len(values) != 3 {
+		return coordination.LeaseObservation{}, runtime.ErrInvariantViolation
+	}
+	observation := coordination.LeaseObservation{Session: key, ObservedAt: time.Now().UTC()}
+	observation.Fence, err = strconv.ParseUint(fmt.Sprint(values[2]), 10, 64)
+	if err != nil {
+		return observation, runtime.ErrInvariantViolation
+	}
+	value := fmt.Sprint(values[0])
+	if value == "" {
+		return observation, nil
+	}
+	parts := strings.Split(value, "|")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
+		return observation, runtime.ErrInvariantViolation
+	}
+	observation.Fence, err = strconv.ParseUint(parts[2], 10, 64)
+	if err != nil || observation.Fence == 0 {
+		return observation, runtime.ErrInvariantViolation
+	}
+	remaining := asInt64(values[1])
+	if remaining < 0 {
+		return observation, runtime.ErrInvariantViolation
+	}
+	observation.WorkerID, observation.Held, observation.RemainingMillis = parts[0], true, remaining
+	return observation, nil
+}
+
 var ensureFenceScript = redisclient.NewScript(`
 local function normalize(value)
   local normalized = string.gsub(value, '^0+', '')

@@ -67,6 +67,11 @@ func TestLoadWebUILocalConfigDefaultsAndRejectsUnsafeInput(t *testing.T) {
 		t.Fatalf("failover config=%+v err=%v", configured, err)
 	}
 	status := cloneEnvironment(base)
+	operations := cloneEnvironment(base)
+	operations["TRPC_RUNTIME_OPERATIONS_TOKEN"] = "independent-operations-token-at-least-32-chars"
+	if value, err := loadWebUILocalConfig(mapEnvironment(operations)); err != nil || value.OperationsToken != operations["TRPC_RUNTIME_OPERATIONS_TOKEN"] {
+		t.Fatal("independent operations token was not loaded")
+	}
 	status["TRPC_WEBUI_LOCAL_STATUS_ENABLED"] = "true"
 	configured, err = loadWebUILocalConfig(mapEnvironment(status))
 	if err != nil || !configured.StatusEnabled {
@@ -77,6 +82,8 @@ func TestLoadWebUILocalConfigDefaultsAndRejectsUnsafeInput(t *testing.T) {
 		{"TRPC_WEBUI_DEEPSEEK_KEY_FILE", "relative/key"},
 		{"TRPC_WEBUI_LOCAL_SECRET_ROOT", "relative/root"},
 		{"TRPC_WEBUI_LOCAL_INSTANCE_ID", "node_a"},
+		{"TRPC_RUNTIME_OPERATIONS_TOKEN", "short"},
+		{"TRPC_RUNTIME_OPERATIONS_TOKEN", webUILocalToken},
 	} {
 		candidate := cloneEnvironment(base)
 		candidate[item.name] = item.value

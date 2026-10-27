@@ -42,6 +42,8 @@ type Consumer struct {
 	DrainTimeout       time.Duration
 	Lifecycle          *Lifecycle
 	OnDeliveryError    func(context.Context, broker.Delivery, error)
+	// OnPoll reports queue accessibility, including successful idle reclaims.
+	OnPoll func(error)
 }
 
 func (w Consumer) Run(ctx context.Context) error {
@@ -133,6 +135,9 @@ func (w Consumer) Run(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				deliveries, err := w.Broker.Reclaim(consumeCtx, broker.ReclaimOptions{ConsumerID: w.WorkerID, Limit: w.ReclaimLimit})
+				if w.OnPoll != nil {
+					w.OnPoll(err)
+				}
 				if err != nil {
 					w.report(consumeCtx, broker.Delivery{}, err)
 					continue

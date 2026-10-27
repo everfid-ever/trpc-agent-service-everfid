@@ -269,7 +269,7 @@ WHERE tenant_id=$1 AND active_config_version IS NULL RETURNING version`, key.Ten
 func TestDeliveryLedgerPostgreSQL16(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
-	if _, err := db.ExecContext(ctx, `TRUNCATE delivery_ledger`); err != nil {
+	if _, err := db.ExecContext(ctx, `TRUNCATE delivery_resolution,delivery_ledger`); err != nil {
 		t.Fatal(err)
 	}
 	store := messagingpostgres.New(db)

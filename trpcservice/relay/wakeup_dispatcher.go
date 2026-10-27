@@ -99,6 +99,7 @@ type WakeupDispatcher struct {
 	ReclaimLimit    int
 	OnError         func(context.Context, WakeupDelivery, error)
 	OnBlocked       func(context.Context, gateway.ExecutionKey)
+	OnPoll          func(error)
 }
 
 func (d WakeupDispatcher) Run(ctx context.Context) error {
@@ -124,6 +125,9 @@ func (d WakeupDispatcher) Run(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				deliveries, err := d.Wakeups.ReclaimWakeups(runCtx, WakeupReclaimOptions{ConsumerID: d.ConsumerID, Limit: d.ReclaimLimit})
+				if d.OnPoll != nil {
+					d.OnPoll(err)
+				}
 				if err != nil {
 					d.report(runCtx, WakeupDelivery{}, err)
 					continue

@@ -118,3 +118,67 @@ func waitValue(t *testing.T, values <-chan string) string {
 		return ""
 	}
 }
+
+type observedRunner struct {
+	polls   <-chan error
+	observe func(error)
+}
+
+func (r observedRunner) WithPollObserver(observe func(error)) ConsumerRunner {
+	r.observe = observe
+	return r
+}
+func (r observedRunner) Run(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-r.polls:
+			r.observe(err)
+		}
+	}
+}
+
+func TestSupervisorWaitsForQueuePollAndRevokesHealth(t *testing.T) {
+	destination := channel.ReplyDestination{TenantID: "tenant", Channel: "wecom", ChannelBindingID: "binding", ExternalAccountID: "corp"}
+	catalog := &catalogStub{destinations: []channel.ReplyDestination{destination}}
+	polls := make(chan error)
+	health := make(chan bool, 100)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	s := Supervisor{Catalog: catalog, RefreshInterval: 5 * time.Millisecond,
+		NewConsumer: func(channel.ReplyDestination) (ConsumerRunner, error) { return observedRunner{polls: polls}, nil },
+		OnHealth: func(err error) {
+			select {
+			case health <- err == nil:
+			case <-ctx.Done():
+			}
+		},
+	}
+	go func() { done <- s.Run(ctx) }()
+	waitHealth := func(want bool) {
+		t.Helper()
+		for {
+			select {
+			case got := <-health:
+				if got == want {
+					return
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("health never became %v", want)
+			}
+		}
+	}
+	waitHealth(false)
+	polls <- nil
+	waitHealth(true)
+	polls <- context.DeadlineExceeded
+	waitHealth(false)
+	polls <- nil
+	waitHealth(true)
+	cancel()
+	if err := <-done; err != context.Canceled {
+		t.Fatal(err)
+	}
+}

@@ -26,7 +26,21 @@ type Consumer struct {
 	ReclaimInterval time.Duration
 	ReclaimLimit    int
 	OnDeliveryError func(channel.ReplyDelivery, error)
+	OnPoll          func(error)
 	Telemetry       telemetry.Provider
+}
+
+// WithPollObserver lets the supervisor wait for real queue access rather than
+// considering a newly launched account consumer ready immediately.
+func (c Consumer) WithPollObserver(observe func(error)) ConsumerRunner {
+	previous := c.OnPoll
+	c.OnPoll = func(err error) {
+		if previous != nil {
+			previous(err)
+		}
+		observe(err)
+	}
+	return c
 }
 
 func (c Consumer) Run(ctx context.Context) error {
@@ -63,6 +77,9 @@ func (c Consumer) ReclaimOnce(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	deliveries, err := c.Queue.ReclaimReplies(ctx, c.Destination, channel.ReplyConsumerOptions{ConsumerID: c.ConsumerID, Limit: c.ReclaimLimit})
+	if c.OnPoll != nil {
+		c.OnPoll(err)
+	}
 	if err != nil {
 		return 0, err
 	}

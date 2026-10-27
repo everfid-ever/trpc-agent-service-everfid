@@ -128,6 +128,8 @@ const (
 )
 
 type webUILocalConfig struct {
+	OperationsToken                                                            string
+	ProcessStartID                                                             string
 	PostgresDSN, RedisAddress, ListenAddress                                   string
 	RedisEnvironment, SecretRoot, APIKeyFile, SkillStagingRoot, QdrantEndpoint string
 	RouteKey, Token, InstanceID, ClamAVAddress                                 string
@@ -191,13 +193,11 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	if err != nil {
 		return fmt.Errorf("configuration rejected: %w", err)
 	}
-	processStartID := ""
-	if configValue.StatusEnabled {
-		processStartID, err = newWebUILocalProcessStartID()
-		if err != nil {
-			return errors.New("process identity initialization failed")
-		}
+	processStartID, err := newWebUILocalProcessStartID()
+	if err != nil {
+		return errors.New("process identity initialization failed")
 	}
+	configValue.ProcessStartID = processStartID
 	telemetryProvider, err := newRoleTelemetry(parent, getenv, "webui-local", logger)
 	if err != nil {
 		return fmt.Errorf("telemetry configuration rejected: %w", err)
@@ -357,6 +357,11 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	})
 	defer bundles.Close(context.Background())
 	var failoverBarrier *inflight.Controller
+	owners := make(map[string]string)
+	for _, component := range []string{"preprocess", "dispatch-relay", "worker", "reply-relay", "wakeup-relay", "wakeup", "delivery", "confirmation-expiry"} {
+		owners[component] = configValue.instanceName(component)
+	}
+	health := newRuntimeHealth(owners)
 	if configValue.FailoverTestEnabled {
 		failoverBarrier = &inflight.Controller{}
 	}
@@ -367,6 +372,7 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		Governance: governance.Service{Repository: governanceStore, Ledger: governanceStore, Decisions: governanceStore}, Confirmations: governanceStore,
 		ContinuationTools: agentFactory, Telemetry: telemetryProvider, Barrier: failoverBarrier}
 	workerConsumer := worker.Consumer{WorkerID: configValue.instanceName("worker"), Shards: []broker.Shard{0, 1, 2, 3}, Broker: streamBroker,
+		OnPoll: func(err error) { health.observe("worker", err) },
 		Leases: leases, Sessions: sessionpostgres.NewWithTelemetry(db, telemetryProvider), Parker: tasks, Statuses: tasks, Executor: executor,
 		LeaseTTL: 30 * time.Second, RenewInterval: 10 * time.Second, RetryWait: 250 * time.Millisecond,
 		ReclaimInterval: 5 * time.Second, ReclaimLimit: 100, DrainTimeout: 30 * time.Second,
@@ -395,7 +401,8 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		ClaimTTL: 30 * time.Second, ClaimRenewInterval: 10 * time.Second, PollInterval: 100 * time.Millisecond,
 		Telemetry: telemetryProvider}
 	wakeupDispatcher := relay.WakeupDispatcher{ConsumerID: configValue.instanceName("wakeup"), Wakeups: wakeupQueue,
-		Store: tasks, Dispatch: streamBroker, ShardCount: 4, ReclaimInterval: 5 * time.Second, ReclaimLimit: 100}
+		OnPoll: func(err error) { health.observe("wakeup", err) },
+		Store:  tasks, Dispatch: streamBroker, ShardCount: 4, ReclaimInterval: 5 * time.Second, ReclaimLimit: 100}
 
 	replyQueue, err := relayredis.NewReplyQueue(redis, publisher, relayredis.ReplyQueueConfig{
 		Group: "webui-delivery", ReadBlock: 250 * time.Millisecond, ReclaimIdle: 30 * time.Second})
@@ -410,9 +417,16 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		Owner: configValue.instanceName("delivery"), ClaimTTL: 30 * time.Second, ClaimRenewInterval: 10 * time.Second,
 		DefaultRetryDelay: time.Second, MaxRetryDelay: time.Minute, MaxAttempts: 8, MaxReconcileAttempts: 8, Barrier: failoverBarrier}
 	deliverySupervisor := channeldelivery.Supervisor{Catalog: deliveryCatalog, RefreshInterval: time.Second,
+		OnHealth: func(err error) { health.observe("delivery", err) },
 		NewConsumer: func(destination channel.ReplyDestination) (channeldelivery.ConsumerRunner, error) {
 			return channeldelivery.Consumer{Queue: replyQueue, Deliverer: deliveryService, Destination: destination,
 				ConsumerID: configValue.instanceName("delivery"), ReclaimInterval: 5 * time.Second, ReclaimLimit: 100,
+				OnDeliveryError: func(delivery channel.ReplyDelivery, err error) {
+					var deferred channeldelivery.DeferredError
+					if !errors.As(err, &deferred) {
+						logger.Printf("reply delivery requires attention tenant=%q request=%q delivery=%q: %v", delivery.Event.TenantID, delivery.Event.RequestID, delivery.Event.DeliveryKey, err)
+					}
+				},
 				Telemetry: telemetryProvider}, nil
 		}, OnError: func(supervisorErr error) { logger.Printf("webui delivery degraded: %v", supervisorErr) }}
 
@@ -424,7 +438,10 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	}
 	mux.HandleFunc("/livez", func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/readyz", func(writer http.ResponseWriter, request *http.Request) {
-		if db.PingContext(request.Context()) != nil || redis.Ping(request.Context()).Err() != nil || malware.Probe(request.Context()) != nil {
+		ctx, cancel := context.WithTimeout(request.Context(), 2*time.Second)
+		defer cancel()
+		ready, _ := health.snapshot()
+		if !ready || db.PingContext(ctx) != nil || redis.Ping(ctx).Err() != nil || malware.Probe(ctx) != nil {
 			http.Error(writer, "not ready", http.StatusServiceUnavailable)
 			return
 		}
@@ -433,11 +450,16 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	if failoverBarrier != nil {
 		registerWebUILocalFailoverTestEndpoints(mux, configValue.Token, failoverBarrier)
 	}
-	if processStartID != "" {
+	if configValue.StatusEnabled {
 		mux.HandleFunc("/statusz", func(writer http.ResponseWriter, _ *http.Request) {
 			writer.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(writer).Encode(map[string]string{"instance_id": configValue.InstanceID, "process_start_id": processStartID})
+			ready, components := health.snapshot()
+			_ = json.NewEncoder(writer).Encode(map[string]any{"instance_id": configValue.InstanceID, "process_start_id": processStartID,
+				"components_ready": ready, "owners": owners, "components": components, "channel_mode": "http_callback"})
 		})
+	}
+	if configValue.OperationsToken != "" {
+		registerRuntimeOperations(mux, configValue.OperationsToken, db, inbox, leases)
 	}
 	server := &http.Server{Addr: configValue.ListenAddress, Handler: mux, ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
@@ -459,7 +481,7 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		}()
 	}
 	start("preprocess", func(ctx context.Context) error {
-		return runPreprocessLoop(ctx, preprocessor.RunOnce, 100*time.Millisecond, 100, logger)
+		return runPreprocessLoop(ctx, health.poll("preprocess", func(ctx context.Context) (int, error) { return preprocessor.RunOnce(ctx, 100) }), 100*time.Millisecond, 100, logger)
 	})
 	start("progress publisher", progressPublisher.Run)
 	start("confirmation expiry reconciler", func(ctx context.Context) error {
@@ -472,31 +494,34 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 				return ctx.Err()
 			case <-ticker.C:
 				if _, expiryErr := reconciler.RunOnce(ctx); expiryErr != nil {
+					health.observe("confirmation-expiry", expiryErr)
 					logger.Printf("webui confirmation expiry degraded: %v", expiryErr)
+				} else {
+					health.observe("confirmation-expiry", nil)
 				}
 			}
 		}
 	})
 	start("dispatch relay", func(ctx context.Context) error {
-		return runRecoverableLoop(ctx, "webui dispatch relay", dispatchRelay.Run, 250*time.Millisecond, logger)
+		return runPreprocessLoop(ctx, health.poll("dispatch-relay", dispatchRelay.RunOnce), 100*time.Millisecond, 100, logger)
 	})
 	start("worker", func(ctx context.Context) error {
-		return runRecoverableLoop(ctx, "webui worker", workerConsumer.Run, 250*time.Millisecond, logger)
+		return runRecoverableLoop(ctx, "webui worker", health.run("worker", workerConsumer.Run), 250*time.Millisecond, logger)
 	})
 	start("reply relay", func(ctx context.Context) error {
-		return runRecoverableLoop(ctx, "webui reply relay", replyRelay.Run, 250*time.Millisecond, logger)
+		return runPreprocessLoop(ctx, health.poll("reply-relay", replyRelay.RunOnce), 100*time.Millisecond, 100, logger)
 	})
 	start("wakeup relay", func(ctx context.Context) error {
-		return runRecoverableLoop(ctx, "webui wakeup relay", wakeupRelay.Run, 250*time.Millisecond, logger)
+		return runPreprocessLoop(ctx, health.poll("wakeup-relay", wakeupRelay.RunOnce), 100*time.Millisecond, 100, logger)
 	})
 	start("wakeup dispatcher", func(ctx context.Context) error {
-		return runRecoverableLoop(ctx, "webui wakeup dispatcher", wakeupDispatcher.Run, 250*time.Millisecond, logger)
+		return runRecoverableLoop(ctx, "webui wakeup dispatcher", health.run("wakeup", wakeupDispatcher.Run), 250*time.Millisecond, logger)
 	})
 	start("delivery", func(ctx context.Context) error {
-		return runRecoverableLoop(ctx, "webui delivery", deliverySupervisor.Run, 250*time.Millisecond, logger)
+		return runRecoverableLoop(ctx, "webui delivery", health.run("delivery", deliverySupervisor.Run), 250*time.Millisecond, logger)
 	})
 	start("http", func(context.Context) error { return server.ListenAndServe() })
-	logger.Printf("WebUI local node=%q ready: http://localhost%s/webui/ route=%q account=%q model=deepseek",
+	logger.Printf("WebUI local node=%q started; business readiness available at /readyz: http://localhost%s/webui/ route=%q account=%q model=deepseek",
 		configValue.InstanceID, configValue.ListenAddress, configValue.RouteKey, webUILocalAccountID)
 
 	var terminalErr error
@@ -504,6 +529,7 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	case <-processCtx.Done():
 	case terminalErr = <-errorsCh:
 	}
+	health.stop()
 	stop()
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelShutdown()
@@ -555,7 +581,8 @@ func loadWebUILocalConfig(getenv func(string) string) (webUILocalConfig, error) 
 		return webUILocalConfig{}, errors.New("Feishu local runtime is no longer supported")
 	}
 	value := webUILocalConfig{PostgresDSN: strings.TrimSpace(getenv("TRPC_POSTGRES_DSN")),
-		RedisAddress: strings.TrimSpace(getenv("TRPC_REDIS_ADDRESS")), ListenAddress: valueOr(getenv("TRPC_LISTEN_ADDRESS"), ":8080"),
+		OperationsToken: getenv("TRPC_RUNTIME_OPERATIONS_TOKEN"),
+		RedisAddress:    strings.TrimSpace(getenv("TRPC_REDIS_ADDRESS")), ListenAddress: valueOr(getenv("TRPC_LISTEN_ADDRESS"), ":8080"),
 		RedisEnvironment:             valueOr(getenv("TRPC_REDIS_ENVIRONMENT"), "local-runtime"),
 		SecretRoot:                   valueOr(getenv("TRPC_WEBUI_LOCAL_SECRET_ROOT"), "/tmp/trpc-webui-secrets"),
 		SkillStagingRoot:             valueOr(getenv("TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT"), "/tmp/trpc-webui-skills"),
@@ -584,6 +611,9 @@ func loadWebUILocalConfig(getenv func(string) string) (webUILocalConfig, error) 
 		WeComSecondaryAppSecret:      strings.TrimSpace(getenv("WECOM_SECONDARY_APP_SECRET")),
 		WeComSecondaryCallbackToken:  strings.TrimSpace(getenv("WECOM_SECONDARY_CALLBACK_TOKEN")),
 		WeComSecondaryEncodingAESKey: strings.TrimSpace(getenv("WECOM_SECONDARY_ENCODING_AES_KEY")),
+	}
+	if value.OperationsToken != "" && (len(value.OperationsToken) < 32 || strings.TrimSpace(value.OperationsToken) != value.OperationsToken || value.OperationsToken == value.Token) {
+		return webUILocalConfig{}, errors.New("operations token must be independent and contain at least 32 characters")
 	}
 	if value.PostgresDSN == "" || value.RedisAddress == "" || strings.TrimSpace(value.Token) != value.Token || len(value.Token) < 16 ||
 		strings.TrimSpace(value.RouteKey) != value.RouteKey || value.RouteKey == "" || strings.TrimSpace(value.ClamAVAddress) != value.ClamAVAddress || value.ClamAVAddress == "" || !filepath.IsAbs(value.APIKeyFile) || !filepath.IsAbs(value.SecretRoot) ||
@@ -637,7 +667,11 @@ func validWebUILocalInstanceID(value string) bool {
 }
 
 func (value webUILocalConfig) instanceName(component string) string {
-	return "webui-local-" + component + "-" + value.InstanceID
+	name := "webui-local-" + component + "-" + value.InstanceID
+	if value.ProcessStartID != "" {
+		name += "-" + value.ProcessStartID
+	}
+	return name
 }
 
 func newWebUILocalProcessStartID() (string, error) {

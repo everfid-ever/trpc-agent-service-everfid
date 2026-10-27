@@ -21,3 +21,18 @@ type LeaseManager interface {
 	Release(context.Context, Lease) error
 	EnsureFenceAtLeast(context.Context, SessionKey, uint64) error
 }
+
+// LeaseObservation deliberately omits LeaseID: inspection must not hand out
+// the capability used by the lease owner to renew or release execution rights.
+type LeaseObservation struct {
+	Session         SessionKey `json:"session"`
+	WorkerID        string     `json:"worker_id,omitempty"`
+	Fence           uint64     `json:"fence"`
+	Held            bool       `json:"held"`
+	RemainingMillis int64      `json:"remaining_ms"`
+	ObservedAt      time.Time  `json:"observed_at"`
+}
+
+type LeaseInspector interface {
+	Inspect(context.Context, SessionKey) (LeaseObservation, error)
+}
