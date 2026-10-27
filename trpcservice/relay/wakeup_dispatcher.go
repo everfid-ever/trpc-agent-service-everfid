@@ -7,6 +7,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/broker"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/drain"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 )
 
@@ -100,9 +101,13 @@ type WakeupDispatcher struct {
 	OnError         func(context.Context, WakeupDelivery, error)
 	OnBlocked       func(context.Context, gateway.ExecutionKey)
 	OnPoll          func(error)
+	Drain           <-chan struct{}
 }
 
 func (d WakeupDispatcher) Run(ctx context.Context) error {
+	if drain.Signaled(d.Drain) {
+		return nil
+	}
 	if d.ConsumerID == "" || d.Wakeups == nil || d.Store == nil || d.Dispatch == nil || d.ShardCount == 0 {
 		return runtime.ErrInvariantViolation
 	}
@@ -112,8 +117,33 @@ func (d WakeupDispatcher) Run(ctx context.Context) error {
 	if d.ReclaimLimit <= 0 {
 		d.ReclaimLimit = 100
 	}
-	runCtx, cancel := context.WithCancel(ctx)
+	workCtx, cancelWork := context.WithCancel(ctx)
+	defer cancelWork()
+	runCtx, cancel := context.WithCancel(workCtx)
 	defer cancel()
+	gate := drain.New()
+	finished := make(chan struct{})
+	defer close(finished)
+	go func() {
+		select {
+		case <-finished:
+		case <-ctx.Done():
+		case <-d.Drain:
+			gate.Begin()
+			cancel()
+		}
+	}()
+	handle := func(delivery WakeupDelivery) error {
+		leave, ok := gate.Enter()
+		if !ok {
+			return context.Canceled
+		}
+		defer leave()
+		if drain.Signaled(d.Drain) {
+			return context.Canceled
+		}
+		return d.handle(workCtx, delivery)
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -133,22 +163,31 @@ func (d WakeupDispatcher) Run(ctx context.Context) error {
 					continue
 				}
 				for _, delivery := range deliveries {
-					if err := d.handle(runCtx, delivery); err != nil && runCtx.Err() == nil {
+					if runCtx.Err() != nil {
+						return
+					}
+					if err := handle(delivery); err != nil && workCtx.Err() == nil {
 						d.report(runCtx, delivery, err)
 					}
 				}
 			}
 		}
 	}()
-	err := d.Wakeups.Consume(runCtx, WakeupConsumerOptions{ConsumerID: d.ConsumerID}, func(deliveryCtx context.Context, delivery WakeupDelivery) error {
-		if err := d.handle(deliveryCtx, delivery); err != nil {
-			d.report(deliveryCtx, delivery, err)
+	err := d.Wakeups.Consume(runCtx, WakeupConsumerOptions{ConsumerID: d.ConsumerID}, func(_ context.Context, delivery WakeupDelivery) error {
+		if err := handle(delivery); err != nil {
+			d.report(workCtx, delivery, err)
 		}
 		// Failed handling deliberately leaves the entry pending for reclaim.
 		return nil
 	})
 	cancel()
+	if !drain.Signaled(d.Drain) {
+		cancelWork()
+	}
 	<-done
+	if drain.Signaled(d.Drain) {
+		return workCtx.Err()
+	}
 	return err
 }
 

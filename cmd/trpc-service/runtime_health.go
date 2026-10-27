@@ -72,6 +72,16 @@ func (h *runtimeHealth) stop() {
 	}
 }
 
+func (h *runtimeHealth) beginDrain() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopping = true
+	for name, c := range h.components {
+		c.State, c.Reason = "draining", "planned_stop"
+		h.components[name] = c
+	}
+}
+
 func (h *runtimeHealth) run(name string, operation func(context.Context) error) func(context.Context) error {
 	return func(ctx context.Context) error {
 		err := operation(ctx)

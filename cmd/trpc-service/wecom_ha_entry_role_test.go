@@ -21,8 +21,11 @@ func TestLoadWeComHAEntryConfig(t *testing.T) {
 		t.Fatalf("config=%+v err=%v", config, err)
 	}
 	for name, value := range map[string]string{
-		"TRPC_WECOM_HA_ENTRY_BACKENDS":       "http://node-a:8080",
-		"TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL": "10ms",
+		"TRPC_WECOM_HA_ENTRY_BACKENDS":           "http://node-a:8080",
+		"TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL":     "10ms",
+		"TRPC_WECOM_HA_ENTRY_PROBE_TIMEOUT":      "0s",
+		"TRPC_WECOM_HA_ENTRY_REQUEST_TIMEOUT":    "60s",
+		"TRPC_WECOM_HA_ENTRY_RECOVERY_SUCCESSES": "0",
 	} {
 		candidate := cloneEnvironment(values)
 		candidate[name] = value

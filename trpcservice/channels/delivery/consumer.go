@@ -7,6 +7,7 @@ import (
 	"time"
 
 	channel "github.com/liuzengh/trpc-agent-service/trpcservice/channels/contract"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/drain"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 )
@@ -28,6 +29,8 @@ type Consumer struct {
 	OnDeliveryError func(channel.ReplyDelivery, error)
 	OnPoll          func(error)
 	Telemetry       telemetry.Provider
+	Drain           <-chan struct{}
+	DrainTimeout    time.Duration
 }
 
 // WithPollObserver lets the supervisor wait for real queue access rather than
@@ -43,6 +46,8 @@ func (c Consumer) WithPollObserver(observe func(error)) ConsumerRunner {
 	return c
 }
 
+func (c Consumer) WithDrain(signal <-chan struct{}) ConsumerRunner { c.Drain = signal; return c }
+
 func (c Consumer) Run(ctx context.Context) error {
 	if err := c.validate(); err != nil {
 		return err
@@ -50,29 +55,81 @@ func (c Consumer) Run(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	runCtx, cancel := context.WithCancel(ctx)
+	if drain.Signaled(c.Drain) {
+		return nil
+	}
+	workCtx, cancelWork := context.WithCancel(ctx)
+	defer cancelWork()
+	runCtx, cancel := context.WithCancel(workCtx)
 	defer cancel()
+	gate := drain.New()
+	finished := make(chan struct{})
+	defer close(finished)
+	go func() {
+		select {
+		case <-finished:
+			return
+		case <-ctx.Done():
+			return
+		case <-c.Drain:
+			gate.Begin()
+			cancel()
+		}
+		timeout := c.DrainTimeout
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-finished:
+		case <-ctx.Done():
+		case <-timer.C:
+			cancelWork()
+		}
+	}()
+	process := func(_ context.Context, delivery channel.ReplyDelivery) error {
+		leave, ok := gate.Enter()
+		if !ok {
+			return context.Canceled
+		}
+		defer leave()
+		if drain.Signaled(c.Drain) {
+			return context.Canceled
+		}
+		return c.process(workCtx, delivery)
+	}
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		errCh <- c.Queue.ConsumeReplies(runCtx, c.Destination, channel.ReplyConsumerOptions{ConsumerID: c.ConsumerID}, c.process)
+		errCh <- c.Queue.ConsumeReplies(runCtx, c.Destination, channel.ReplyConsumerOptions{ConsumerID: c.ConsumerID}, process)
 	}()
 	go func() {
 		defer wg.Done()
-		errCh <- c.reclaimLoop(runCtx)
+		errCh <- c.reclaimLoop(runCtx, process)
 	}()
 	err := <-errCh
 	cancel()
+	if !drain.Signaled(c.Drain) {
+		cancelWork()
+	}
 	wg.Wait()
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+	if drain.Signaled(c.Drain) {
+		return workCtx.Err()
 	}
 	return err
 }
 
 func (c Consumer) ReclaimOnce(ctx context.Context) (int, error) {
+	return c.reclaimOnce(ctx, c.process)
+}
+
+func (c Consumer) reclaimOnce(ctx context.Context, process func(context.Context, channel.ReplyDelivery) error) (int, error) {
 	if err := c.validate(); err != nil {
 		return 0, err
 	}
@@ -85,7 +142,10 @@ func (c Consumer) ReclaimOnce(ctx context.Context) (int, error) {
 	}
 	processed := 0
 	for _, delivery := range deliveries {
-		if err := c.process(ctx, delivery); err != nil {
+		if ctx.Err() != nil || drain.Signaled(c.Drain) {
+			return processed, context.Canceled
+		}
+		if err := process(ctx, delivery); err != nil {
 			return processed, err
 		}
 		processed++
@@ -93,7 +153,7 @@ func (c Consumer) ReclaimOnce(ctx context.Context) (int, error) {
 	return processed, nil
 }
 
-func (c Consumer) reclaimLoop(ctx context.Context) error {
+func (c Consumer) reclaimLoop(ctx context.Context, process func(context.Context, channel.ReplyDelivery) error) error {
 	interval := c.ReclaimInterval
 	if interval <= 0 {
 		interval = time.Second
@@ -105,7 +165,7 @@ func (c Consumer) reclaimLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if _, err := c.ReclaimOnce(ctx); err != nil {
+			if _, err := c.reclaimOnce(ctx, process); err != nil {
 				return err
 			}
 		}

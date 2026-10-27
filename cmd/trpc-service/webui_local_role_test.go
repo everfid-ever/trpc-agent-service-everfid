@@ -83,6 +83,8 @@ func TestLoadWebUILocalConfigDefaultsAndRejectsUnsafeInput(t *testing.T) {
 		{"TRPC_WEBUI_LOCAL_SECRET_ROOT", "relative/root"},
 		{"TRPC_WEBUI_LOCAL_INSTANCE_ID", "node_a"},
 		{"TRPC_RUNTIME_OPERATIONS_TOKEN", "short"},
+		{"TRPC_RUNTIME_DRAIN_TIMEOUT", "0s"},
+		{"TRPC_RUNTIME_DRAIN_TIMEOUT", "6m"},
 		{"TRPC_RUNTIME_OPERATIONS_TOKEN", webUILocalToken},
 	} {
 		candidate := cloneEnvironment(base)

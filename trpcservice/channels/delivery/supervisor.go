@@ -7,6 +7,7 @@ import (
 	"time"
 
 	channel "github.com/liuzengh/trpc-agent-service/trpcservice/channels/contract"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/drain"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 )
 
@@ -24,6 +25,7 @@ type Supervisor struct {
 	OnError         func(error)
 	// OnHealth reports successful catalog synchronization and consumer exits.
 	OnHealth func(error)
+	Drain    <-chan struct{}
 }
 
 type runningConsumer struct {
@@ -49,6 +51,9 @@ type consumerExit struct {
 }
 
 func (s Supervisor) Run(ctx context.Context) error {
+	if drain.Signaled(s.Drain) {
+		return nil
+	}
 	if ctx == nil || s.Catalog == nil || s.NewConsumer == nil || s.RefreshInterval <= 0 {
 		return runtime.ErrInvariantViolation
 	}
@@ -93,6 +98,15 @@ func (s Supervisor) Run(ctx context.Context) error {
 			runner, err := s.NewConsumer(desired[key])
 			if err != nil {
 				return err
+			}
+			if s.Drain != nil {
+				cooperative, ok := runner.(interface {
+					WithDrain(<-chan struct{}) ConsumerRunner
+				})
+				if !ok {
+					return runtime.ErrCapabilityUnsupported
+				}
+				runner = cooperative.WithDrain(s.Drain)
 			}
 			generation++
 			consumerCtx, consumerCancel := context.WithCancel(runCtx)
@@ -142,8 +156,17 @@ func (s Supervisor) Run(ctx context.Context) error {
 	}
 	ticker := time.NewTicker(s.RefreshInterval)
 	defer ticker.Stop()
+	drainSignal := s.Drain
+	draining := false
 	for {
 		select {
+		case <-drainSignal:
+			draining = true
+			drainSignal = nil
+			ticker.Stop()
+			if len(active) == 0 {
+				return nil
+			}
 		case <-runCtx.Done():
 			for _, current := range active {
 				current.cancel()
@@ -152,6 +175,9 @@ func (s Supervisor) Run(ctx context.Context) error {
 		case exited := <-exits:
 			if current, ok := active[exited.key]; ok && current.generation == exited.generation {
 				delete(active, exited.key)
+				if draining && len(active) == 0 {
+					return nil
+				}
 				if s.OnHealth != nil {
 					s.OnHealth(runtime.ErrBackendUnavailable)
 				}
@@ -169,6 +195,9 @@ func (s Supervisor) Run(ctx context.Context) error {
 				}
 			}
 		case <-ticker.C:
+			if drain.Signaled(s.Drain) {
+				continue
+			}
 			if err := syncHealth(); err != nil && s.OnError != nil {
 				s.OnError(err)
 			}

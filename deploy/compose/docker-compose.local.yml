@@ -188,6 +188,7 @@ services:
       - path: .env.local
         required: false
     environment:
+      TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY: "false"
       TRPC_POSTGRES_DSN: postgres://${TRPC_LOCAL_POSTGRES_USER:-postgres}:${TRPC_LOCAL_POSTGRES_PASSWORD:-postgres}@postgres:5432/${TRPC_LOCAL_POSTGRES_DB:-trpc_agent_service_test}?sslmode=disable
       TRPC_REDIS_ADDRESS: redis:6379
       TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
@@ -213,6 +214,10 @@ services:
       dockerfile: deploy/compose/Dockerfile
     profiles: ["webui-multinode"]
     command: ["webui-local"]
+    read_only: true
+    stop_grace_period: ${TRPC_LOCAL_APP_STOP_GRACE_PERIOD:-45s}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m,mode=1777
     env_file:
       - path: .env.local
         required: false
@@ -223,6 +228,7 @@ services:
       TRPC_LISTEN_ADDRESS: ":8080"
       TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
       TRPC_WEBUI_LOCAL_INSTANCE_ID: node-a
+      TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY: "true"
       TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED: "true"
       TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
       TRPC_OTEL_ENDPOINT: http://otel-collector:4318
@@ -231,7 +237,7 @@ services:
     secrets:
       - deepseek_api_key
     volumes:
-      - webui-local-skills:/var/lib/trpc-webui-local/skills
+      - webui-local-skills:/var/lib/trpc-webui-local/skills:ro
     ports:
       - "${TRPC_LOCAL_MULTINODE_NODE_A_PORT:-58083}:8080"
     depends_on:
@@ -248,6 +254,10 @@ services:
       dockerfile: deploy/compose/Dockerfile
     profiles: ["webui-multinode"]
     command: ["webui-local"]
+    read_only: true
+    stop_grace_period: ${TRPC_LOCAL_APP_STOP_GRACE_PERIOD:-45s}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m,mode=1777
     env_file:
       - path: .env.local
         required: false
@@ -258,6 +268,7 @@ services:
       TRPC_LISTEN_ADDRESS: ":8080"
       TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
       TRPC_WEBUI_LOCAL_INSTANCE_ID: node-b
+      TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY: "true"
       TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED: "true"
       TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
       TRPC_OTEL_ENDPOINT: http://otel-collector:4318
@@ -266,7 +277,7 @@ services:
     secrets:
       - deepseek_api_key
     volumes:
-      - webui-local-skills:/var/lib/trpc-webui-local/skills
+      - webui-local-skills:/var/lib/trpc-webui-local/skills:ro
     ports:
       - "${TRPC_LOCAL_MULTINODE_NODE_B_PORT:-58084}:8080"
     depends_on:
@@ -291,6 +302,7 @@ services:
       - path: secrets/wecom.env
         required: true
     environment:
+      TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY: "false"
       TRPC_POSTGRES_DSN: postgres://${TRPC_LOCAL_POSTGRES_USER:-postgres}:${TRPC_LOCAL_POSTGRES_PASSWORD:-postgres}@postgres:5432/${TRPC_LOCAL_POSTGRES_DB:-trpc_agent_service_test}?sslmode=disable
       TRPC_REDIS_ADDRESS: redis:6379
       TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-bootstrap
@@ -319,6 +331,10 @@ services:
     profiles: ["wecom-ha-local"]
     command: ["wecom-local"]
     restart: "no"
+    read_only: true
+    stop_grace_period: ${TRPC_LOCAL_APP_STOP_GRACE_PERIOD:-45s}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m,mode=1777
     env_file:
       - path: .env.local
         required: false
@@ -330,6 +346,7 @@ services:
       TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS: clamav:3310
       TRPC_LISTEN_ADDRESS: ":8080"
       TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-node-a
+      TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY: "true"
       TRPC_WEBUI_LOCAL_STATUS_ENABLED: "true"
       TRPC_WECOM_LOCAL_ENABLED: "true"
       TRPC_WECOM_SECONDARY_LOCAL_ENABLED: "true"
@@ -341,7 +358,7 @@ services:
     secrets:
       - deepseek_api_key
     volumes:
-      - webui-local-skills:/var/lib/trpc-webui-local/skills
+      - webui-local-skills:/var/lib/trpc-webui-local/skills:ro
     ports:
       - "${TRPC_LOCAL_WECOM_HA_NODE_A_PORT:-58088}:8080"
     depends_on:
@@ -359,6 +376,10 @@ services:
     profiles: ["wecom-ha-local"]
     command: ["wecom-local"]
     restart: "no"
+    read_only: true
+    stop_grace_period: ${TRPC_LOCAL_APP_STOP_GRACE_PERIOD:-45s}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m,mode=1777
     env_file:
       - path: .env.local
         required: false
@@ -370,6 +391,7 @@ services:
       TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS: clamav:3310
       TRPC_LISTEN_ADDRESS: ":8080"
       TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-node-b
+      TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY: "true"
       TRPC_WEBUI_LOCAL_STATUS_ENABLED: "true"
       TRPC_WECOM_LOCAL_ENABLED: "true"
       TRPC_WECOM_SECONDARY_LOCAL_ENABLED: "true"
@@ -381,7 +403,7 @@ services:
     secrets:
       - deepseek_api_key
     volumes:
-      - webui-local-skills:/var/lib/trpc-webui-local/skills
+      - webui-local-skills:/var/lib/trpc-webui-local/skills:ro
     ports:
       - "${TRPC_LOCAL_WECOM_HA_NODE_B_PORT:-58089}:8080"
     depends_on:

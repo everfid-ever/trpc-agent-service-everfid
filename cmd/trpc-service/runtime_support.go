@@ -87,6 +87,9 @@ func runPreprocessLoop(ctx context.Context, runOnce func(context.Context, int) (
 	}
 	for {
 		if _, err := runOnce(ctx, batch); err != nil {
+			if errors.Is(err, errRuntimeDrained) {
+				return nil
+			}
 			if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 				return ctx.Err()
 			}

@@ -48,6 +48,11 @@ type Consumer struct {
 }
 
 func (w Consumer) Run(ctx context.Context) error {
+	select {
+	case <-w.Drain:
+		return nil
+	default:
+	}
 	if w.WorkerID == "" || len(w.Shards) == 0 || w.Broker == nil || w.Leases == nil || w.Sessions == nil || w.Statuses == nil || w.Executor == nil {
 		return runtime.ErrInvariantViolation
 	}
@@ -173,7 +178,7 @@ func (w Consumer) Run(ctx context.Context) error {
 	close(runFinished)
 	<-drainWatchDone
 	if draining.Load() && ctx.Err() == nil {
-		return nil
+		return workCtx.Err()
 	}
 	return err
 }

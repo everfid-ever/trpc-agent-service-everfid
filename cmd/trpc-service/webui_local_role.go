@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -67,6 +68,7 @@ import (
 	providerpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/provider/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/relay"
 	relayredis "github.com/liuzengh/trpc-agent-service/trpcservice/relay/redis"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/drain"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/inflight"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/secrets"
@@ -129,6 +131,8 @@ const (
 )
 
 type webUILocalConfig struct {
+	DrainTimeout                                                               time.Duration
+	ReadOnlySkills                                                             bool
 	OperationsToken                                                            string
 	ProcessStartID                                                             string
 	PostgresDSN, RedisAddress, ListenAddress                                   string
@@ -364,6 +368,7 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		owners[component] = configValue.instanceName(component)
 	}
 	health := newRuntimeHealth(owners)
+	drainGate := drain.New()
 	if configValue.FailoverTestEnabled {
 		failoverBarrier = &inflight.Controller{}
 	}
@@ -374,11 +379,12 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		Governance: governance.Service{Repository: governanceStore, Ledger: governanceStore, Decisions: governanceStore}, Confirmations: governanceStore,
 		ContinuationTools: agentFactory, Telemetry: telemetryProvider, Barrier: failoverBarrier}
 	workerConsumer := worker.Consumer{WorkerID: configValue.instanceName("worker"), Shards: []broker.Shard{0, 1, 2, 3}, Broker: streamBroker,
+		Drain:    drainGate.Signal(),
 		Attempts: tasks,
 		OnPoll:   func(err error) { health.observe("worker", err) },
 		Leases:   leases, Sessions: sessionpostgres.NewWithTelemetry(db, telemetryProvider), Parker: tasks, Statuses: tasks, Executor: executor,
 		LeaseTTL: 30 * time.Second, RenewInterval: 10 * time.Second, RetryWait: 250 * time.Millisecond,
-		ReclaimInterval: 5 * time.Second, ReclaimLimit: 100, DrainTimeout: 30 * time.Second,
+		ReclaimInterval: 5 * time.Second, ReclaimLimit: 100, DrainTimeout: configValue.DrainTimeout + time.Second,
 		OnDeliveryError: func(_ context.Context, delivery broker.Delivery, deliveryErr error) {
 			logger.Printf("webui worker delivery degraded request=%q: %v", delivery.Envelope.RequestID, deliveryErr)
 		}}
@@ -404,6 +410,7 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		ClaimTTL: 30 * time.Second, ClaimRenewInterval: 10 * time.Second, PollInterval: 100 * time.Millisecond,
 		Telemetry: telemetryProvider}
 	wakeupDispatcher := relay.WakeupDispatcher{ConsumerID: configValue.instanceName("wakeup"), Wakeups: wakeupQueue,
+		Drain:  drainGate.Signal(),
 		OnPoll: func(err error) { health.observe("wakeup", err) },
 		Store:  tasks, Dispatch: streamBroker, ShardCount: 4, ReclaimInterval: 5 * time.Second, ReclaimLimit: 100}
 
@@ -420,9 +427,11 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		Owner: configValue.instanceName("delivery"), ClaimTTL: 30 * time.Second, ClaimRenewInterval: 10 * time.Second,
 		DefaultRetryDelay: time.Second, MaxRetryDelay: time.Minute, MaxAttempts: 8, MaxReconcileAttempts: 8, Barrier: failoverBarrier}
 	deliverySupervisor := channeldelivery.Supervisor{Catalog: deliveryCatalog, RefreshInterval: time.Second,
+		Drain:    drainGate.Signal(),
 		OnHealth: func(err error) { health.observe("delivery", err) },
 		NewConsumer: func(destination channel.ReplyDestination) (channeldelivery.ConsumerRunner, error) {
 			return channeldelivery.Consumer{Queue: replyQueue, Deliverer: deliveryService, Destination: destination,
+				Drain: drainGate.Signal(), DrainTimeout: configValue.DrainTimeout + time.Second,
 				ConsumerID: configValue.instanceName("delivery"), ReclaimInterval: 5 * time.Second, ReclaimLimit: 100,
 				OnDeliveryError: func(delivery channel.ReplyDelivery, err error) {
 					var deferred channeldelivery.DeferredError
@@ -464,18 +473,35 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	if configValue.OperationsToken != "" {
 		registerRuntimeOperations(mux, configValue.OperationsToken, db, inbox, leases)
 	}
-	server := &http.Server{Addr: configValue.ListenAddress, Handler: mux, ReadHeaderTimeout: 5 * time.Second,
+	// Parent cancellation requests a drain; active work has a separate context
+	// so SIGTERM does not cancel it before the bounded drain completes.
+	signalCtx, stopSignals := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	processCtx, stop := context.WithCancel(context.WithoutCancel(parent))
+	defer stop()
+	server := &http.Server{Addr: configValue.ListenAddress, Handler: drainingHTTP(mux, drainGate), ReadHeaderTimeout: 5 * time.Second,
+		BaseContext: func(net.Listener) context.Context { return processCtx },
 		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 
-	processCtx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	errorsCh := make(chan error, 8)
 	var background sync.WaitGroup
+	var draining sync.WaitGroup
 	start := func(name string, operation func(context.Context) error) {
 		background.Add(1)
+		mustDrain := name != "http" && name != "progress publisher"
+		if mustDrain {
+			draining.Add(1)
+		}
 		go func() {
 			defer background.Done()
-			if operationErr := operation(processCtx); operationErr != nil && !errors.Is(operationErr, context.Canceled) {
+			if mustDrain {
+				defer draining.Done()
+			}
+			operationErr := operation(processCtx)
+			if operationErr == nil && !drainGate.Draining() && processCtx.Err() == nil {
+				operationErr = errors.New("component stopped unexpectedly")
+			}
+			if operationErr != nil && !errors.Is(operationErr, context.Canceled) && !drainGate.Draining() {
 				select {
 				case errorsCh <- fmt.Errorf("%s stopped: %w", name, operationErr):
 				case <-processCtx.Done():
@@ -484,7 +510,7 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		}()
 	}
 	start("preprocess", func(ctx context.Context) error {
-		return runPreprocessLoop(ctx, health.poll("preprocess", func(ctx context.Context) (int, error) { return preprocessor.RunOnce(ctx, 100) }), 100*time.Millisecond, 100, logger)
+		return runPreprocessLoop(ctx, drainPoll(drainGate, health.poll("preprocess", func(ctx context.Context) (int, error) { return preprocessor.RunOnce(ctx, 100) })), 100*time.Millisecond, 100, logger)
 	})
 	start("progress publisher", progressPublisher.Run)
 	start("confirmation expiry reconciler", func(ctx context.Context) error {
@@ -493,35 +519,42 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		defer ticker.Stop()
 		for {
 			select {
+			case <-drainGate.Signal():
+				return nil
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-ticker.C:
+				leave, ok := drainGate.Enter()
+				if !ok {
+					return nil
+				}
 				if _, expiryErr := reconciler.RunOnce(ctx); expiryErr != nil {
 					health.observe("confirmation-expiry", expiryErr)
 					logger.Printf("webui confirmation expiry degraded: %v", expiryErr)
 				} else {
 					health.observe("confirmation-expiry", nil)
 				}
+				leave()
 			}
 		}
 	})
 	start("dispatch relay", func(ctx context.Context) error {
-		return runPreprocessLoop(ctx, health.poll("dispatch-relay", dispatchRelay.RunOnce), 100*time.Millisecond, 100, logger)
+		return runPreprocessLoop(ctx, drainPoll(drainGate, health.poll("dispatch-relay", dispatchRelay.RunOnce)), 100*time.Millisecond, 100, logger)
 	})
 	start("worker", func(ctx context.Context) error {
-		return runRecoverableLoop(ctx, "webui worker", health.run("worker", workerConsumer.Run), 250*time.Millisecond, logger)
+		return runUntilDrained(ctx, drainGate.Signal(), "webui worker", health.run("worker", workerConsumer.Run), logger)
 	})
 	start("reply relay", func(ctx context.Context) error {
-		return runPreprocessLoop(ctx, health.poll("reply-relay", replyRelay.RunOnce), 100*time.Millisecond, 100, logger)
+		return runPreprocessLoop(ctx, drainPoll(drainGate, health.poll("reply-relay", replyRelay.RunOnce)), 100*time.Millisecond, 100, logger)
 	})
 	start("wakeup relay", func(ctx context.Context) error {
-		return runPreprocessLoop(ctx, health.poll("wakeup-relay", wakeupRelay.RunOnce), 100*time.Millisecond, 100, logger)
+		return runPreprocessLoop(ctx, drainPoll(drainGate, health.poll("wakeup-relay", wakeupRelay.RunOnce)), 100*time.Millisecond, 100, logger)
 	})
 	start("wakeup dispatcher", func(ctx context.Context) error {
-		return runRecoverableLoop(ctx, "webui wakeup dispatcher", health.run("wakeup", wakeupDispatcher.Run), 250*time.Millisecond, logger)
+		return runUntilDrained(ctx, drainGate.Signal(), "webui wakeup dispatcher", health.run("wakeup", wakeupDispatcher.Run), logger)
 	})
 	start("delivery", func(ctx context.Context) error {
-		return runRecoverableLoop(ctx, "webui delivery", health.run("delivery", deliverySupervisor.Run), 250*time.Millisecond, logger)
+		return runUntilDrained(ctx, drainGate.Signal(), "webui delivery", health.run("delivery", deliverySupervisor.Run), logger)
 	})
 	start("http", func(context.Context) error { return server.ListenAndServe() })
 	logger.Printf("WebUI local node=%q started; business readiness available at /readyz: http://localhost%s/webui/ route=%q account=%q model=deepseek",
@@ -529,14 +562,30 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 
 	var terminalErr error
 	select {
-	case <-processCtx.Done():
+	case <-signalCtx.Done():
 	case terminalErr = <-errorsCh:
 	}
-	health.stop()
-	stop()
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
+	health.beginDrain()
+	drainGate.Begin()
+	logger.Printf("runtime drain started instance=%q timeout=%s", configValue.InstanceID, configValue.DrainTimeout)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), configValue.DrainTimeout)
 	defer cancelShutdown()
-	_ = server.Shutdown(shutdownCtx)
+	httpDone := make(chan error, 1)
+	go func() { httpDone <- server.Shutdown(shutdownCtx) }()
+	drainDone := make(chan struct{})
+	go func() { draining.Wait(); close(drainDone) }()
+	select {
+	case <-drainDone:
+		logger.Printf("runtime drain completed instance=%q", configValue.InstanceID)
+	case <-shutdownCtx.Done():
+		terminalErr = errors.Join(terminalErr, errors.New("runtime drain timed out; durable work left for takeover"))
+	}
+	stop()
+	if httpErr := <-httpDone; httpErr != nil {
+		_ = server.Close()
+		terminalErr = errors.Join(terminalErr, httpErr)
+	}
+	health.stop()
 	done := make(chan struct{})
 	go func() { background.Wait(); close(done) }()
 	select {
@@ -584,6 +633,8 @@ func loadWebUILocalConfig(getenv func(string) string) (webUILocalConfig, error) 
 		return webUILocalConfig{}, errors.New("Feishu local runtime is no longer supported")
 	}
 	value := webUILocalConfig{PostgresDSN: strings.TrimSpace(getenv("TRPC_POSTGRES_DSN")),
+		DrainTimeout:    30 * time.Second,
+		ReadOnlySkills:  strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY")), "true"),
 		OperationsToken: getenv("TRPC_RUNTIME_OPERATIONS_TOKEN"),
 		RedisAddress:    strings.TrimSpace(getenv("TRPC_REDIS_ADDRESS")), ListenAddress: valueOr(getenv("TRPC_LISTEN_ADDRESS"), ":8080"),
 		RedisEnvironment:             valueOr(getenv("TRPC_REDIS_ENVIRONMENT"), "local-runtime"),
@@ -614,6 +665,13 @@ func loadWebUILocalConfig(getenv func(string) string) (webUILocalConfig, error) 
 		WeComSecondaryAppSecret:      strings.TrimSpace(getenv("WECOM_SECONDARY_APP_SECRET")),
 		WeComSecondaryCallbackToken:  strings.TrimSpace(getenv("WECOM_SECONDARY_CALLBACK_TOKEN")),
 		WeComSecondaryEncodingAESKey: strings.TrimSpace(getenv("WECOM_SECONDARY_ENCODING_AES_KEY")),
+	}
+	if raw := strings.TrimSpace(getenv("TRPC_RUNTIME_DRAIN_TIMEOUT")); raw != "" {
+		duration, err := time.ParseDuration(raw)
+		if err != nil || duration < time.Second || duration > 5*time.Minute {
+			return webUILocalConfig{}, errors.New("invalid runtime drain timeout")
+		}
+		value.DrainTimeout = duration
 	}
 	if value.OperationsToken != "" && (len(value.OperationsToken) < 32 || strings.TrimSpace(value.OperationsToken) != value.OperationsToken || value.OperationsToken == value.Token) {
 		return webUILocalConfig{}, errors.New("operations token must be independent and contain at least 32 characters")
@@ -790,10 +848,7 @@ func bootstrapWebUILocal(ctx context.Context, db *sql.DB, configValue webUILocal
 	// Worker. Keep their content root distinct from the secret projection; a
 	// local WebUI runtime must never make credentials discoverable as Skill
 	// files, even in a disposable Compose volume.
-	if err := os.MkdirAll(configValue.SkillStagingRoot, 0o700); err != nil {
-		return webUILocalBootstrap{}, err
-	}
-	if err := os.Chmod(configValue.SkillStagingRoot, 0o700); err != nil {
+	if err := ensureSkillDirectory(configValue.SkillStagingRoot, configValue.ReadOnlySkills); err != nil {
 		return webUILocalBootstrap{}, err
 	}
 
@@ -1183,18 +1238,9 @@ func ensureWebUILocalKnowledgeFixture(ctx context.Context, db *sql.DB, providers
 	}
 	packageRoot := filepath.Join(value.SkillStagingRoot, webUILocalTenantID, "webui-local-v1")
 	skillRoot := filepath.Join(packageRoot, webUILocalSkillID)
-	if err := os.MkdirAll(skillRoot, 0o700); err != nil {
-		return agentapp.SkillRef{}, agentapp.VersionedRef{}, err
-	}
 	skillContent := []byte("---\nname: webui_local_guide\ndescription: Local WebUI Knowledge demo guidance\n---\nUse knowledge search when the user asks about the local demo guide.\n")
 	skillFile := filepath.Join(skillRoot, "SKILL.md")
-	if existing, err := os.ReadFile(skillFile); err == nil && !bytes.Equal(existing, skillContent) {
-		return agentapp.SkillRef{}, agentapp.VersionedRef{}, errors.New("WebUI local Skill fixture changed; recreate the Compose volume")
-	} else if errors.Is(err, os.ErrNotExist) {
-		if err = os.WriteFile(skillFile, skillContent, 0o600); err != nil {
-			return agentapp.SkillRef{}, agentapp.VersionedRef{}, err
-		}
-	} else if err != nil {
+	if err := ensureSkillFile(value.SkillStagingRoot, skillFile, skillContent, value.ReadOnlySkills); err != nil {
 		return agentapp.SkillRef{}, agentapp.VersionedRef{}, err
 	}
 	digest, err := serviceskill.DigestRoot(packageRoot)
