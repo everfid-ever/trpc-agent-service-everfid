@@ -2,6 +2,8 @@ package tool
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"testing"
 	"time"
@@ -37,6 +39,17 @@ type executionStore struct {
 	claim    toolexecution.Record
 	claimed  bool
 	finished toolexecution.Record
+}
+
+func (s *executionStore) Complete(_ context.Context, record toolexecution.Record, data []byte, _ int64) (toolexecution.Record, error) {
+	sum := sha256.Sum256(data)
+	record.State = toolexecution.Succeeded
+	record.ResultRef = "tool-result://sha256/" + hex.EncodeToString(sum[:])
+	s.finished = record
+	return record, nil
+}
+func (*executionStore) LoadResult(context.Context, toolexecution.Key) ([]byte, error) {
+	return nil, runtime.ErrNotFound
 }
 
 func (s *executionStore) Claim(_ context.Context, record toolexecution.Record, claim toolexecution.Claim) (toolexecution.Record, bool, error) {

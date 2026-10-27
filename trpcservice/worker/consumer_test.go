@@ -110,6 +110,51 @@ func (*brokerStub) Reclaim(context.Context, broker.ReclaimOptions) ([]broker.Del
 
 type leaseExecutorFunc func(context.Context, runtime.ExecutionEnvelope, uint64, func(context.Context) error) error
 
+type attemptRecorder struct {
+	beginErr         error
+	begins, finishes int
+	completed        bool
+}
+
+func (s *attemptRecorder) BeginExecutionAttempt(_ context.Context, key gateway.ExecutionKey, owner string, fence uint64) (gateway.ExecutionAttempt, error) {
+	s.begins++
+	return gateway.ExecutionAttempt{ExecutionKey: key, WorkerID: owner, Fence: fence, Number: int64(s.begins)}, s.beginErr
+}
+func (s *attemptRecorder) FinishExecutionAttempt(_ context.Context, _ gateway.ExecutionAttempt, completed bool) error {
+	s.finishes++
+	s.completed = completed
+	return nil
+}
+
+func TestConsumerRecordsAttemptBeforeExecutionAndDoesNotAckFailures(t *testing.T) {
+	for _, failure := range []bool{false, true} {
+		recorder := &attemptRecorder{}
+		messages := &brokerStub{}
+		invocations := 0
+		consumer := Consumer{WorkerID: "worker", Broker: messages, Leases: &leaseStub{}, Sessions: sessionmemory.New(), Statuses: &executionReaderStub{}, LeaseTTL: time.Second, RenewInterval: time.Hour, Attempts: recorder,
+			Executor: leaseExecutorFunc(func(context.Context, runtime.ExecutionEnvelope, uint64, func(context.Context) error) error {
+				invocations++
+				if recorder.begins != 1 {
+					t.Fatal("execution preceded durable attempt")
+				}
+				if failure {
+					return runtime.ErrBackendUnavailable
+				}
+				return nil
+			})}
+		delivery := broker.Delivery{ID: "message", Envelope: runtime.ExecutionEnvelope{TenantID: "tenant", AgentAppID: "app", SessionID: "session", RequestID: "request", InputSeq: 1}}
+		err := consumer.handle(context.Background(), delivery)
+		if invocations != 1 || recorder.finishes != 1 || recorder.completed == failure || messages.acked == failure || (err != nil) != failure {
+			t.Fatalf("attempt=%+v ack=%v err=%v", recorder, messages.acked, err)
+		}
+		recorder.beginErr = runtime.ErrBackendUnavailable
+		before := invocations
+		if err = consumer.handle(context.Background(), delivery); err == nil || invocations != before {
+			t.Fatal("executed without recording attempt")
+		}
+	}
+}
+
 func (f leaseExecutorFunc) ExecuteWithLease(ctx context.Context, envelope runtime.ExecutionEnvelope, fence uint64, guard func(context.Context) error) error {
 	return f(ctx, envelope, fence, guard)
 }

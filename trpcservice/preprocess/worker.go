@@ -87,7 +87,7 @@ func (w Worker) RunOnce(ctx context.Context, limit int) (int, error) {
 	for _, job := range jobs {
 		processed++
 		if w.Barrier != nil {
-			if err := w.Barrier.Wait(ctx, inflight.PointP1BeforeExecution); err != nil {
+			if err := w.Barrier.Wait(inflight.WithScope(ctx, job.TenantID, job.RequestID, ""), inflight.PointP1BeforeExecution); err != nil {
 				return processed, err
 			}
 		}

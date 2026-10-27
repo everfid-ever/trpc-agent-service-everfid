@@ -27,6 +27,8 @@ type RecoveryDescriptor interface {
 
 // RecoveryQuerier lets a queryable tool resolve a previously accepted
 // external operation by its stable idempotency key without replaying it.
+// completed=false must establish that the operation was NOT accepted and may
+// safely be started. Pending/unknown operations must return an error, not false.
 type RecoveryQuerier interface {
 	RecoveryDescriptor
 	QueryRecovery(context.Context, string) (result any, completed bool, err error)

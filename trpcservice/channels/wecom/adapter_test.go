@@ -158,7 +158,7 @@ func TestOfficialSenderClassifiesResponsesAndRefreshesInvalidTokenOnce(t *testin
 			return errors.As(err, &target) && target.RetryAfter == 2*time.Second
 		}},
 		{name: "server", status: 503, responses: []string{`{"errcode":-1,"errmsg":"busy"}`}, checkErr: func(err error) bool {
-			var target channel.RetryableDeliveryError
+			var target channel.AmbiguousDeliveryError
 			return errors.As(err, &target)
 		}},
 		{name: "invalid user", status: 200, responses: []string{`{"errcode":60111,"errmsg":"user not found"}`}, checkErr: func(err error) bool {

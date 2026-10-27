@@ -34,6 +34,21 @@ func (e *BudgetExceededError) Is(target error) bool { return target == ErrExecut
 
 type executionBudgetKey struct{}
 type llmCallObserverKey struct{}
+type llmRequestObserverKey struct{}
+
+// Request attempts include transport retries, unlike logical model calls.
+func WithLLMRequestObserver(ctx context.Context, observer LLMCallObserver) context.Context {
+	return context.WithValue(ctx, llmRequestObserverKey{}, observer)
+}
+func ObserveLLMRequest(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if observer, ok := ctx.Value(llmRequestObserverKey{}).(LLMCallObserver); ok && observer != nil {
+		return observer(ctx)
+	}
+	return nil
+}
 
 type LLMCallObserver func(context.Context) error
 

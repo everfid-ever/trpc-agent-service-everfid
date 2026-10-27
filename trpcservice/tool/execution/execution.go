@@ -40,3 +40,9 @@ type Store interface {
 	Finish(context.Context, Record, State, string, string) (Record, error)
 	Get(context.Context, Key) (Record, error)
 }
+
+// DurableResults atomically fences completion and persists encrypted output.
+type DurableResults interface {
+	Complete(context.Context, Record, []byte, int64) (Record, error)
+	LoadResult(context.Context, Key) ([]byte, error)
+}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/profile"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/provider"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/inflight"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/secrets"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/secrets/generation"
@@ -95,7 +96,7 @@ func (r Resolver) ResolveModel(ctx context.Context, tenantID string, ref profile
 	opts := []openai.Option{
 		openai.WithAPIKey(apiKey),
 		openai.WithBaseURL(value.Endpoint),
-		openai.WithHTTPClientOptions(model.WithHTTPClientTimeout(timeout)),
+		openai.WithHTTPClientOptions(model.WithHTTPClientTimeout(timeout), model.WithHTTPClientTransport(inflight.ModelTransport{})),
 	}
 	if bufferSize > 0 {
 		opts = append(opts, openai.WithChannelBufferSize(bufferSize))

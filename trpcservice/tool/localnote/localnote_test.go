@@ -35,7 +35,7 @@ func TestToolCreatesStableResultOnlyForConfirmedArguments(t *testing.T) {
 	}
 	ctx := runtime.WithExecutionContext(context.Background(), runtime.ExecutionContext{TenantID: "tenant-a", RequestID: "request-a",
 		SubjectID: "user-a", ToolCallID: "call-a", ArgsDigest: digest})
-	value, err := (Tool{}).Call(ctx, arguments)
+	value, err := (Tool{Writer: memoryWriter{}}).Call(ctx, arguments)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestToolCreatesStableResultOnlyForConfirmedArguments(t *testing.T) {
 	if !ok || result.Status != "created" || result.NoteID == "" || result.Title != "Release note" || result.Content != "approved content" {
 		t.Fatalf("result=%#v", value)
 	}
-	replayed, err := (Tool{}).Call(ctx, []byte(`{"title":" Release note ","content":" approved content "}`))
+	replayed, err := (Tool{Writer: memoryWriter{}}).Call(ctx, []byte(`{"title":" Release note ","content":" approved content "}`))
 	if err != nil || replayed.(Result).NoteID != result.NoteID {
 		t.Fatalf("replay=%#v err=%v", replayed, err)
 	}
@@ -71,3 +71,7 @@ func TestToolRejectsUnknownAndUntrustedInput(t *testing.T) {
 }
 
 var _ agenttool.CallableTool = Tool{}
+
+type memoryWriter struct{}
+
+func (memoryWriter) Create(_ context.Context, note Note) (Result, error) { return note.Result, nil }

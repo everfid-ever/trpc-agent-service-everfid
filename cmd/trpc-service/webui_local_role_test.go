@@ -180,13 +180,13 @@ func TestWebUILocalFailoverTestEndpointsRequireTokenAndControlP2(t *testing.T) {
 	request.Header.Set("X-TRPC-Local-Token", "test-token-which-is-long")
 	response = httptest.NewRecorder()
 	mux.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || !barrier.Snapshot(inflight.PointP2BeforeTerminalCommit).Armed {
-		t.Fatalf("arm status=%d snapshot=%+v", response.Code, barrier.Snapshot(inflight.PointP2BeforeTerminalCommit))
+	if response.Code != http.StatusOK || !barrier.Snapshot(inflight.PointP2DuringModelResponse).Armed {
+		t.Fatalf("arm status=%d snapshot=%+v", response.Code, barrier.Snapshot(inflight.PointP2DuringModelResponse))
 	}
 
 	blocked := make(chan error, 1)
-	go func() { blocked <- barrier.Wait(context.Background(), inflight.PointP2BeforeTerminalCommit) }()
-	for deadline := time.Now().Add(time.Second); !barrier.Snapshot(inflight.PointP2BeforeTerminalCommit).Hit; {
+	go func() { blocked <- barrier.Wait(context.Background(), inflight.PointP2DuringModelResponse) }()
+	for deadline := time.Now().Add(time.Second); !barrier.Snapshot(inflight.PointP2DuringModelResponse).Hit; {
 		if time.Now().After(deadline) {
 			t.Fatal("P2 barrier was not hit")
 		}

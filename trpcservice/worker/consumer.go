@@ -43,7 +43,8 @@ type Consumer struct {
 	Lifecycle          *Lifecycle
 	OnDeliveryError    func(context.Context, broker.Delivery, error)
 	// OnPoll reports queue accessibility, including successful idle reclaims.
-	OnPoll func(error)
+	OnPoll   func(error)
+	Attempts gateway.ExecutionAttemptStore
 }
 
 func (w Consumer) Run(ctx context.Context) error {
@@ -251,7 +252,22 @@ func (w Consumer) handle(ctx context.Context, delivery broker.Delivery) error {
 	}
 	var executeErr error
 	for {
+		var attempt gateway.ExecutionAttempt
+		if w.Attempts != nil {
+			attempt, executeErr = w.Attempts.BeginExecutionAttempt(executionCtx, gateway.ExecutionKey{TenantID: delivery.Envelope.TenantID, RequestID: delivery.Envelope.RequestID}, w.WorkerID, lease.Fence)
+			if executeErr != nil {
+				break
+			}
+		}
 		executeErr = w.Executor.ExecuteWithLease(executionCtx, delivery.Envelope, lease.Fence, beforeCommit)
+		if w.Attempts != nil {
+			finishCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			finishErr := w.Attempts.FinishExecutionAttempt(finishCtx, attempt, executeErr == nil)
+			cancel()
+			if finishErr != nil {
+				executeErr = errors.Join(executeErr, finishErr)
+			}
+		}
 		if !errors.Is(executeErr, runtime.ErrInputNotReady) {
 			break
 		}

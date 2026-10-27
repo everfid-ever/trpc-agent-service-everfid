@@ -208,6 +208,33 @@ type tenantBoundCallable struct {
 
 func (t tenantBoundCallable) Declaration() *agenttool.Declaration { return t.inner.Declaration() }
 
+func (t tenantBoundCallable) RecoveryPolicy() RecoveryPolicy {
+	if descriptor, ok := t.inner.(RecoveryDescriptor); ok {
+		return descriptor.RecoveryPolicy()
+	}
+	return RecoveryManual
+}
+func (t tenantBoundCallable) RecoveryKey(ctx context.Context) (string, error) {
+	execution, ok := runtime.ExecutionContextFrom(ctx)
+	if !ok || execution.TenantID != t.tenantID {
+		return "", runtime.ErrTenantScope
+	}
+	if descriptor, ok := t.inner.(RecoveryDescriptor); ok {
+		return descriptor.RecoveryKey(ctx)
+	}
+	return "", nil
+}
+func (t tenantBoundCallable) QueryRecovery(ctx context.Context, key string) (any, bool, error) {
+	execution, ok := runtime.ExecutionContextFrom(ctx)
+	if !ok || execution.TenantID != t.tenantID {
+		return nil, false, runtime.ErrTenantScope
+	}
+	if querier, ok := t.inner.(RecoveryQuerier); ok {
+		return querier.QueryRecovery(ctx, key)
+	}
+	return nil, false, runtime.ErrCapabilityUnsupported
+}
+
 func (t tenantBoundCallable) Call(ctx context.Context, args []byte) (any, error) {
 	if t.inner == nil {
 		return nil, runtime.ErrCapabilityUnsupported

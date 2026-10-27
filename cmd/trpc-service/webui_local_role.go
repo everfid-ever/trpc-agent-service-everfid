@@ -87,6 +87,7 @@ import (
 	servicetool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	toolexecutionpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/tool/execution/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tool/localnote"
+	localnotepostgres "github.com/liuzengh/trpc-agent-service/trpcservice/tool/localnote/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/worker"
 	agentmemory "trpc.group/trpc-go/trpc-agent-go/memory"
 	agentmemorypg "trpc.group/trpc-go/trpc-agent-go/memory/postgres"
@@ -295,7 +296,8 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	if err != nil {
 		return errors.New("knowledge resolver configuration rejected")
 	}
-	toolCatalog, err := servicetool.NewCatalog(localnote.Registration(webUILocalTenantID))
+	noteWriter := localnotepostgres.Store{DB: db, Keys: bootstrap.PayloadKey}
+	toolCatalog, err := servicetool.NewCatalog(localnote.Registration(webUILocalTenantID, noteWriter), localnote.Registration(wecomSecondaryTenantID, noteWriter))
 	if err != nil {
 		return errors.New("tool catalog initialization failed")
 	}
@@ -325,7 +327,7 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 	agentFactory := serviceagent.Factory{Profiles: profiles, Models: models, Tools: tools, Skills: skills, Knowledge: knowledgeResolver,
 		Conditions:  agentcondition.DefaultRegistry(),
 		Checkpoints: graphCheckpoints,
-		Policies:    governanceStore, Confirmations: governanceStore, ToolResults: payloads, ToolExecutions: toolexecutionpostgres.New(db), Telemetry: telemetryProvider}
+		Policies:    governanceStore, Confirmations: governanceStore, ToolResults: payloads, ToolExecutions: toolexecutionpostgres.NewWithPayloadKeys(db, bootstrap.PayloadKey), Telemetry: telemetryProvider}
 	bundles := profilememory.NewBundleManager(func(ctx context.Context, key profile.ExecutionProfileKey) (profile.RuntimeBundle, func(context.Context) error, error) {
 		snapshot, resolveErr := profiles.Resolve(ctx, key)
 		if resolveErr != nil {
@@ -372,8 +374,9 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		Governance: governance.Service{Repository: governanceStore, Ledger: governanceStore, Decisions: governanceStore}, Confirmations: governanceStore,
 		ContinuationTools: agentFactory, Telemetry: telemetryProvider, Barrier: failoverBarrier}
 	workerConsumer := worker.Consumer{WorkerID: configValue.instanceName("worker"), Shards: []broker.Shard{0, 1, 2, 3}, Broker: streamBroker,
-		OnPoll: func(err error) { health.observe("worker", err) },
-		Leases: leases, Sessions: sessionpostgres.NewWithTelemetry(db, telemetryProvider), Parker: tasks, Statuses: tasks, Executor: executor,
+		Attempts: tasks,
+		OnPoll:   func(err error) { health.observe("worker", err) },
+		Leases:   leases, Sessions: sessionpostgres.NewWithTelemetry(db, telemetryProvider), Parker: tasks, Statuses: tasks, Executor: executor,
 		LeaseTTL: 30 * time.Second, RenewInterval: 10 * time.Second, RetryWait: 250 * time.Millisecond,
 		ReclaimInterval: 5 * time.Second, ReclaimLimit: 100, DrainTimeout: 30 * time.Second,
 		OnDeliveryError: func(_ context.Context, delivery broker.Delivery, deliveryErr error) {
@@ -705,7 +708,9 @@ func registerWebUILocalFailoverTestEndpoints(mux *http.ServeMux, token string, b
 		}
 		writeSnapshot(writer, action())
 	}
-	for name, point := range map[string]inflight.Point{"p1": inflight.PointP1BeforeExecution, "p2": inflight.PointP2BeforeTerminalCommit, "p3": inflight.PointP3BeforeReplyPublish, "p4": inflight.PointP4BeforeProviderDelivery} {
+	for name, point := range map[string]inflight.Point{"p1": inflight.PointP1BeforeExecution, "p2": inflight.PointP2DuringModelResponse, "p3": inflight.PointP3BeforeReplyPublish, "p4": inflight.PointP4AfterProviderAccepted,
+		"p2-commit": inflight.PointP2BeforeTerminalCommit, "p4-before-send": inflight.PointP4BeforeProviderDelivery, "tool-effect": inflight.PointToolEffectBeforeCommit,
+		"result-before-commit": inflight.PointResultPersistedBeforeCommit} {
 		point := point
 		prefix := "/test/failover/" + name
 		mux.HandleFunc(prefix+"/arm", func(w http.ResponseWriter, r *http.Request) {
@@ -713,7 +718,10 @@ func registerWebUILocalFailoverTestEndpoints(mux *http.ServeMux, token string, b
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			serve(w, r, func() inflight.Snapshot { barrier.Arm(point); return barrier.Snapshot(point) })
+			serve(w, r, func() inflight.Snapshot {
+				barrier.ArmFor(point, r.URL.Query().Get("tenant_id"), r.URL.Query().Get("request_id"))
+				return barrier.Snapshot(point)
+			})
 		})
 		mux.HandleFunc(prefix+"/status", func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {

@@ -34,3 +34,9 @@ Compose 文件 `docker-compose.local.yml` 提供两种演练拓扑：
 | `retry_not_delivered` | 有证据确认未送达并授权重试，将该分段置为 `retry_wait`，重新调度原回复；保留原 DeliveryKey、ClientRequestID、内容及累计尝试次数 |
 
 Ledger 变更、`delivery_resolution` 审计插入和原 Outbox 重新调度在同一事务内提交，任一步失败全部回滚；新表由增量迁移 `000003_delivery_resolution` 创建。重新调度覆盖旧 Redis 事件已 ACK 的情况，不重新运行模型/工具。自动核对无能力或重试耗尽时会保留异常记录并输出投递错误日志；没有下游去重/查询能力时，接口仍需外部证据，不能由超时推断“未送达”。文本超过渠道限制时仍按持久化 segment 分段，承诺按最终结果及分段统计。
+
+迁移 `000004_inflight_recovery` 增加 `execution_attempt`、加密的 `tool_execution_result`、真实业务表 `local_note` 和 `execution_record.model_request_count`。管理快照新增 `execution_attempts`、`model_calls`、`model_request_attempts`、`note_effects`；执行器正常返回与整个请求完成分别判断，HTTP 尝试次数也不代表上游接受次数。普通工具和确认工具均接入持久化恢复；未提供业务幂等/查询契约的工具在不确定恢复时拒绝盲目重放。
+
+启用故障钩子时，`/test/failover/p2/*` 表示模型成功响应头返回后、读取结果前；`p4/*` 表示渠道返回 ProviderMessageID 后、Ledger sent 落盘前。`p2-commit/*`、`p4-before-send/*` 保留原边界，`tool-effect/*` 覆盖真实业务写入完成但工具结果未提交的窗口。arm 可带 `tenant_id`、`request_id` 筛选，status 回显命中身份及接受证据。真实 WeCom 暂无请求键查询适配器，内容级有限时去重不等价于永久请求级去重；其 P4 不承诺自动 exactly-once，取消和 HTTP 5xx 也会保守记为不确定投递。
+
+`result-before-commit/*` 覆盖冻结答案已保存但 terminal/Outbox 尚未提交的窗口；接管读取并校验原答案后，直接续提交相同结果，不重新运行模型，也不重写官方 SDK 已保存的会话事件。

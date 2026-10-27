@@ -120,3 +120,21 @@ type TaskStore interface {
 type ModelCallCounter interface {
 	RecordModelCall(context.Context, ExecutionKey) error
 }
+
+type ModelRequestCounter interface {
+	RecordModelRequest(context.Context, ExecutionKey) error
+}
+
+type ExecutionAttempt struct {
+	ExecutionKey
+	Number   int64
+	WorkerID string
+	Fence    uint64
+}
+
+// ExecutionAttemptStore counts acquired execution attempts, independently of
+// model calls, parking, preprocessing and final delivery attempts.
+type ExecutionAttemptStore interface {
+	BeginExecutionAttempt(context.Context, ExecutionKey, string, uint64) (ExecutionAttempt, error)
+	FinishExecutionAttempt(context.Context, ExecutionAttempt, bool) error
+}

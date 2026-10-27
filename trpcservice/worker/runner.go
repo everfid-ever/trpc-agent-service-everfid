@@ -99,6 +99,10 @@ func (w RunnerExecutor) resolveSessionService(ctx context.Context, snapshot prof
 }
 
 func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.ExecutionEnvelope, fence uint64, beforeCommit func(context.Context) error) (resultErr error) {
+	ctx = inflight.WithScope(ctx, envelope.TenantID, envelope.RequestID, "")
+	if w.Barrier != nil {
+		ctx = inflight.WithBarrier(ctx, w.Barrier)
+	}
 	ctx, finish := telemetry.StartOperation(ctx, w.Telemetry, envelope.TraceParent, telemetry.OperationWorkerExecute,
 		telemetry.ComponentAttribute(telemetry.ComponentWorker))
 	defer func() { finish(resultErr) }()
@@ -240,6 +244,26 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	if payload.PayloadRef != envelope.PayloadRef {
 		return runtime.ErrVersionMismatch
 	}
+	// A process can die after freezing its output but before committing the
+	// terminal/outbox transaction. SDK history is already durable at this
+	// stage; reuse the output instead of generating a conflicting second one.
+	if results, ok := w.Payloads.(messaging.ResultStore); ok {
+		frozen, readErr := results.GetResult(ctx, envelope.TenantID, envelope.RequestID)
+		if readErr == nil {
+			sum := sha256.Sum256(frozen.Content)
+			if frozen.TenantID != envelope.TenantID || frozen.RequestID != envelope.RequestID || frozen.ResultRef == "" || frozen.KeyVersion != payload.KeyVersion || frozen.ContentDigest != hex.EncodeToString(sum[:]) {
+				return runtime.ErrVersionMismatch
+			}
+			err = w.commitFrozenSuccess(ctx, turn, envelope, head, fence, beforeCommit, frozen.ResultRef)
+			if err == nil {
+				committed = true
+			}
+			return err
+		}
+		if !errors.Is(readErr, runtime.ErrNotFound) {
+			return readErr
+		}
+	}
 	message, err := w.Inputs.DecodeInput(ctx, envelope, payload.Content)
 	if err != nil {
 		return fmt.Errorf("decode execution payload: %w", err)
@@ -281,6 +305,11 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	if counter, ok := w.Tasks.(gateway.ModelCallCounter); ok {
 		runCtx = runtime.WithLLMCallObserver(runCtx, func(callCtx context.Context) error {
 			return counter.RecordModelCall(callCtx, gateway.ExecutionKey{TenantID: envelope.TenantID, RequestID: envelope.RequestID})
+		})
+	}
+	if counter, ok := w.Tasks.(gateway.ModelRequestCounter); ok {
+		runCtx = runtime.WithLLMRequestObserver(runCtx, func(callCtx context.Context) error {
+			return counter.RecordModelRequest(callCtx, gateway.ExecutionKey{TenantID: envelope.TenantID, RequestID: envelope.RequestID})
 		})
 	}
 	var cancelBudget context.CancelFunc
@@ -651,6 +680,29 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	if err := resultStore.PutResult(ctx, messaging.ResultRecord{TenantID: envelope.TenantID, RequestID: envelope.RequestID, ResultRef: resultRef, ContentDigest: hex.EncodeToString(resultDigest[:]), Content: outbound.Content, ContentType: outbound.ContentType, KeyVersion: payload.KeyVersion}); err != nil {
 		return err
 	}
+	if w.Barrier != nil {
+		if err := w.Barrier.Wait(ctx, inflight.PointResultPersistedBeforeCommit); err != nil {
+			return err
+		}
+	}
+	err = w.commitFrozenSuccess(ctx, turn, envelope, head, fence, beforeCommit, resultRef)
+	if err == nil {
+		committed = true
+	}
+	return err
+}
+
+func (w RunnerExecutor) commitFrozenSuccess(ctx context.Context, turn *sessionstore.BufferedTurn, envelope runtime.ExecutionEnvelope, head sessionstore.SessionHead, fence uint64, beforeCommit func(context.Context) error, resultRef string) error {
+	latest, err := w.Tasks.GetExecution(ctx, gateway.ExecutionKey{TenantID: envelope.TenantID, RequestID: envelope.RequestID})
+	if err != nil {
+		return err
+	}
+	if err = verifyAuthoritativeEnvelope(latest.Envelope, envelope); err != nil {
+		return err
+	}
+	if latest.CancelRequested {
+		return runtime.ErrCancelRequested
+	}
 	if beforeCommit != nil {
 		if err := beforeCommit(ctx); err != nil {
 			return err
@@ -664,7 +716,7 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 		return err
 	}
 	_, err = turn.Commit(ctx, sessionstore.CommitTurnRequest{
-		SessionKey: sessionKey, RequestID: envelope.RequestID,
+		SessionKey: head.SessionKey, RequestID: envelope.RequestID,
 		CommitID: envelope.RequestID + ":terminal:0", Stage: "terminal",
 		InputSeq: envelope.InputSeq, Fence: fence, ExpectedVersion: head.Version,
 		Outcome: runtime.OutcomeSucceeded, ResultRef: resultRef, ReplyCursor: envelope.RequestID + ":1",
@@ -676,9 +728,6 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	})
 	if errors.Is(err, runtime.ErrAlreadyTerminal) {
 		return nil
-	}
-	if err == nil {
-		committed = true
 	}
 	return err
 }

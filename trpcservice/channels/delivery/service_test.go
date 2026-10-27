@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	channel "github.com/liuzengh/trpc-agent-service/trpcservice/channels/contract"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/inflight"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
 	memory "github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging/inmemory"
@@ -24,6 +25,49 @@ type adapterStub struct {
 	maxTextBytes     int
 	errorsByCall     map[int]error
 	result           *channel.DeliveryResult
+}
+
+func TestTrueP4CapturesAcceptedEvidenceAndSuccessorDoesNotResend(t *testing.T) {
+	store := memory.New()
+	result := messaging.ResultRecord{TenantID: "tenant", RequestID: "request", ResultRef: "result://request", ContentDigest: "digest", Content: []byte("done"), KeyVersion: 1}
+	if err := store.PutResult(context.Background(), result); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &reconcilingAdapter{result: channel.ReconciliationResult{Status: channel.ReconciliationDelivered, ProviderMessageID: "provider-message"}}
+	barrier := &inflight.Controller{}
+	hit := barrier.Arm(inflight.PointP4AfterProviderAccepted)
+	s := Service{Results: store, Ledger: store, Adapters: resolverStub{adapter: adapter}, Owner: "node-a", ClaimTTL: 20 * time.Millisecond, Barrier: barrier}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Deliver(ctx, testReplyEvent(result.ResultRef)) }()
+	select {
+	case <-hit:
+	case <-time.After(time.Second):
+		t.Fatal("accepted barrier not reached")
+	}
+	snapshot := barrier.Snapshot(inflight.PointP4AfterProviderAccepted)
+	if snapshot.Evidence != "provider-message" || snapshot.RequestID != "request" {
+		t.Fatal(snapshot)
+	}
+	key := messaging.DeliveryKey{TenantID: "tenant", DeliveryKey: "r1_reply", SegmentNo: 0}
+	record, err := store.GetDelivery(context.Background(), key)
+	if err != nil || record.State != messaging.DeliverySending {
+		t.Fatalf("%+v %v", record, err)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	s.Owner, s.Barrier = "node-b", nil
+	if err := s.Deliver(context.Background(), testReplyEvent(result.ResultRef)); err != nil {
+		t.Fatal(err)
+	}
+	record, err = store.GetDelivery(context.Background(), key)
+	if err != nil || record.State != messaging.DeliverySent || adapter.calls != 1 {
+		t.Fatalf("%+v sends=%d err=%v", record, adapter.calls, err)
+	}
 }
 
 func (*adapterStub) ID() string                { return "fake" }

@@ -25,7 +25,7 @@
   -> Inbox / Payload / ReplyRoute
   -> preprocess job / broker delivery
   -> session lease + fence
-  -> model / confirmed tool
+  -> model / durable tool execution (allow + ask)
   -> terminal session commit + Outbox
   -> reply relay
   -> Delivery Ledger
@@ -33,6 +33,8 @@
 ```
 
 每个箭头左侧的状态先 durable，再允许右侧的工作开始。旧 owner 即使恢复，也会因为较低的 fence、失效 lease 或 Ledger 条件更新而不能覆盖新 owner。
+
+最新在途恢复增量由 `000004_inflight_recovery` 提供：独立 Worker 尝试日志、逻辑模型调用与 HTTP 尝试分计数、普通/确认工具统一恢复、原子加密工具结果及真实幂等笔记写入。`p2`/`p4` 端点已调整为模型请求接受后/下游发送接受后，旧边界另名保留；当前精确定义见 [在途任务接管](inflight-task-takeover/README.md)。
 
 ## 故障承诺与边界
 

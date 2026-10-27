@@ -104,6 +104,7 @@ func (s Service) Deliver(ctx context.Context, event channel.ReplyEvent) error {
 }
 
 func (s Service) deliverSegment(ctx context.Context, event channel.ReplyEvent, adapter channel.Adapter, plan messaging.DeliveryPlan, segmentNo int, content []byte, contentType string) error {
+	ctx = inflight.WithScope(ctx, event.TenantID, event.RequestID, "")
 	key := messaging.DeliveryKey{TenantID: event.TenantID, DeliveryKey: event.DeliveryKey, SegmentNo: segmentNo}
 	claimTTL := s.ClaimTTL
 	if claimTTL <= 0 {
@@ -327,10 +328,21 @@ func (s Service) deliverWithClaimRenewal(ctx context.Context, adapter channel.Ad
 		}
 	}()
 	result, deliverErr := adapter.Deliver(callCtx, request)
+	if deliverErr == nil && result.Delivered && result.ProviderMessageID != "" && s.Barrier != nil {
+		// Keep renewing the sending claim while paused. The accepted-send
+		// window must not migrate to a peer merely because observation is slow.
+		if pauseErr := s.Barrier.Wait(inflight.WithScope(callCtx, request.Event.TenantID, request.Event.RequestID, result.ProviderMessageID), inflight.PointP4AfterProviderAccepted); pauseErr != nil {
+			deliverErr = AmbiguousError{Err: pauseErr}
+		}
+	}
 	close(stop)
 	renewal := <-done
 	if renewal.err != nil {
-		return renewal.record, result, errors.Join(deliverErr, renewal.err)
+		err := errors.Join(deliverErr, renewal.err)
+		if result.Delivered {
+			err = AmbiguousError{Err: err}
+		}
+		return renewal.record, result, err
 	}
 	return renewal.record, result, deliverErr
 }

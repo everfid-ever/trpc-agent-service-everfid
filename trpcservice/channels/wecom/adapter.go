@@ -258,7 +258,8 @@ func (s OfficialSender) uploadImage(ctx context.Context, token string, image []b
 	response, err := client.Do(request)
 	if err != nil {
 		if ctx.Err() != nil {
-			return "", false, ctx.Err()
+			// Cancellation cannot establish that an issued send was rejected.
+			return "", false, channel.AmbiguousDeliveryError{Err: ctx.Err()}
 		}
 		return "", false, channel.AmbiguousDeliveryError{Err: runtime.ErrBackendUnavailable}
 	}
@@ -341,7 +342,7 @@ func (s OfficialSender) send(ctx context.Context, token string, agentID int64, e
 		return "", false, channel.RetryableDeliveryError{Err: providerError(response.StatusCode, 0, "rate limited"), RetryAfter: retryAfter(response.Header)}
 	}
 	if response.StatusCode >= 500 {
-		return "", false, channel.RetryableDeliveryError{Err: providerError(response.StatusCode, 0, "server error")}
+		return "", false, channel.AmbiguousDeliveryError{Err: providerError(response.StatusCode, 0, "server error")}
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return "", false, channel.PermanentDeliveryError{Err: providerError(response.StatusCode, 0, "http request rejected"), Class: "provider_rejected"}

@@ -74,7 +74,7 @@ func (r ReplyRelay) publish(ctx context.Context, record messaging.OutboxRecord) 
 			ExternalMessageID: route.ExternalMessageID, ExternalChatID: route.ExternalChatID, ExternalUserID: route.ExternalUserID},
 		Final: true, TraceParent: telemetry.EffectiveTraceParent(ctx, record.TraceParent)}
 	if r.Barrier != nil {
-		if err := r.Barrier.Wait(ctx, inflight.PointP3BeforeReplyPublish); err != nil {
+		if err := r.Barrier.Wait(inflight.WithScope(ctx, event.TenantID, event.RequestID, ""), inflight.PointP3BeforeReplyPublish); err != nil {
 			return err
 		}
 	}

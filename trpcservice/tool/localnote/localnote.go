@@ -41,12 +41,26 @@ type Result struct {
 // Registration binds this exact implementation to one tenant. The production
 // worker does not register it; only the explicitly local WebUI composition
 // root does.
-func Registration(tenantID string) servicetool.Registration {
+func Registration(tenantID string, writers ...Writer) servicetool.Registration {
+	var writer Writer
+	if len(writers) > 0 {
+		writer = writers[0]
+	}
 	return servicetool.Registration{TenantID: tenantID, ID: ID, Version: Version, Status: servicetool.StatusActive,
-		Build: func(context.Context, servicetool.BuildRequest) (agenttool.CallableTool, error) { return Tool{}, nil }}
+		Build: func(context.Context, servicetool.BuildRequest) (agenttool.CallableTool, error) {
+			return Tool{Writer: writer}, nil
+		}}
 }
 
-type Tool struct{}
+type Note struct {
+	TenantID, RequestID, BusinessKey, ArgsDigest string
+	KeyVersion                                   int64
+	Result                                       Result
+}
+type Writer interface {
+	Create(context.Context, Note) (Result, error)
+}
+type Tool struct{ Writer Writer }
 
 func (Tool) RecoveryPolicy() servicetool.RecoveryPolicy { return servicetool.RecoveryIdempotentKey }
 
@@ -77,7 +91,7 @@ func (Tool) Declaration() *agenttool.Declaration {
 	}
 }
 
-func (Tool) Call(ctx context.Context, arguments []byte) (any, error) {
+func (t Tool) Call(ctx context.Context, arguments []byte) (any, error) {
 	if ctx == nil || len(arguments) == 0 || len(arguments) > maximumArguments {
 		return nil, runtime.ErrInvariantViolation
 	}
@@ -108,7 +122,11 @@ func (Tool) Call(ctx context.Context, arguments []byte) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Result{Status: "created", NoteID: "note_" + recoveryKey[:24], Title: value.Title, Content: value.Content}, nil
+	if t.Writer == nil {
+		return nil, runtime.ErrCapabilityUnsupported
+	}
+	return t.Writer.Create(ctx, Note{TenantID: execution.TenantID, RequestID: execution.RequestID, BusinessKey: recoveryKey, ArgsDigest: digest, KeyVersion: execution.PayloadKeyVersion,
+		Result: Result{Status: "created", NoteID: "note_" + recoveryKey[:24], Title: value.Title, Content: value.Content}})
 }
 
 var _ agenttool.CallableTool = Tool{}

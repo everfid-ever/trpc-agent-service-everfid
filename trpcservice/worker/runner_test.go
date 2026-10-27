@@ -183,7 +183,15 @@ func TestRunnerExecutorUsesUpstreamRunnerAndKeepsRedeliveryIdempotent(t *testing
 		Progress: ProgressPublisherFunc(func(value ProgressEvent) { progressEvents = append(progressEvents, value) }),
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		if err := executor.ExecuteWithLease(context.Background(), envelope, 1, nil); err != nil {
+		if attempt == 0 {
+			if err := executor.ExecuteWithLease(context.Background(), envelope, 1, func(context.Context) error { return runtime.ErrLeaseLost }); !errors.Is(err, runtime.ErrLeaseLost) {
+				t.Fatalf("precommit crash=%v", err)
+			}
+			if _, err := payloads.GetResult(context.Background(), envelope.TenantID, envelope.RequestID); err != nil {
+				t.Fatal("result was not durable before the crash")
+			}
+		}
+		if err := executor.ExecuteWithLease(context.Background(), envelope, 2, nil); err != nil {
 			t.Fatalf("attempt %d: %v", attempt, err)
 		}
 	}
