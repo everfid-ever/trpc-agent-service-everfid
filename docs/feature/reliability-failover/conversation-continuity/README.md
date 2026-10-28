@@ -21,6 +21,10 @@
 
 ## 本能力已落地的模块
 
+详细阅读时，先用 FULL-GUIDE 的“四个独立条件”和双 Bot 故事确认身份、历史、执行与回复分别受什么保护；再用 design 的键关系、OpenForRun 条件和 Redis lease 契约核对实现。implementation-walkthrough 按六个模块交接检查故障后的读取起点。
+
+排查具体问题时，testing-and-acceptance 给出身份关联、反例和采样误差口径；release-and-operations 按身份变化、历史读取、实际模型上下文和发送路由逐层处理，并列出配置/密钥/历史保留依赖。持久化历史可读与模型在本轮正确使用历史分别判断。
+
 可信Binding和租户HMAC身份、双Bot独立tenant/app/binding/secret scope、SDK持久历史、会话lease/fence、冻结ReplyRoute、终态/Outbox与Ledger；存活节点继续原会话，SIGTERM排空与SIGKILL回收分别实现。
 
 ## 保证与边界

@@ -4,6 +4,30 @@
 
 ## 当前实现状态
 
+### 按问题定位详细说明
+
+| 想弄清楚的问题 | 首选文档 | 接着核对 |
+|---|---|---|
+| 换节点为什么仍是原会话、两个 Bot 为什么不混？ | [会话机制](conversation-continuity/FULL-GUIDE.md) | [身份键、读取条件与字段设计](conversation-continuity/design.md) |
+| 历史保存了却回答不对，该查哪一层？ | [会话走读](conversation-continuity/implementation-walkthrough.md) | [历史与路由排障](conversation-continuity/release-and-operations.md) |
+| 原输入在任一阶段崩溃后，究竟由谁继续？ | [在途责任转移与故障推演](inflight-task-takeover/FULL-GUIDE.md) | [事务和不变量](inflight-task-takeover/design.md) |
+| 工具执行一半、外部已写成功、平台没记下怎么办？ | [工具六个检查点与恢复策略](inflight-task-takeover/FULL-GUIDE.md) | [实际执行顺序](inflight-task-takeover/implementation-walkthrough.md) |
+| 唯一终态、唯一 Ledger 行、只见一条答案分别是什么意思？ | [计数与分段交付边界](inflight-task-takeover/design.md) | [证据和反例](inflight-task-takeover/testing-and-acceptance.md) |
+| P4 无法判定、自动核对结束后怎么处理？ | [在途运维操作单](inflight-task-takeover/release-and-operations.md) | [真实处置接口与 SQL](inflight-task-takeover/CODE-APPENDIX.md) |
+| 两容器共存、重新加入和反向故障为什么安全？ | [多容器故障域与生命周期](single-host-multicontainer/FULL-GUIDE.md) | [状态归属与准入竞态](single-host-multicontainer/design.md) |
+| ready、入口健康、执行资格为何不等价？ | [多容器运行时走读](single-host-multicontainer/implementation-walkthrough.md) | [故障当班与容量处置](single-host-multicontainer/release-and-operations.md) |
+| 如何证明没有通过重启、重发或换会话绕过问题？ | [会话验收](conversation-continuity/testing-and-acceptance.md)、[在途验收](inflight-task-takeover/testing-and-acceptance.md) | [实例职责与轮次矩阵](single-host-multicontainer/testing-and-acceptance.md) |
+
+各能力继续沿用 README、L1–L4 文件结构。L2 用业务故事、责任转移和反例解释原因；L3 给真实字段、算法条件与运行顺序；L4 区分实现证据、环境证据与外部事实。REFERENCE-IMPLEMENTATION 保留精确 DDL/代码契约，字段理解优先读 design 中的表格。
+
+### 贯穿三项能力的阅读约定
+
+- “自动接管”指在共享依赖和恢复契约满足时，由存活角色依据持久事实推进；不是转移旧 goroutine、任意工具函数栈或模型内部生成状态。
+- “持久化”指保存了可恢复事实，不表示所有表、Redis 操作和外部效果在一个事务内；每一处跨边界窗口都要单独解释。
+- “安全”与“自动完成”分别判断：保留 tool_effect_unknown 或 ambiguous 可避免盲重放，但不等于该任务已经成功或答案已经送达。
+- “历史可读取”与“模型正确回忆”分别取证：存储存在不证明所有历史已进入本次模型上下文。
+- “支持验收路径”表示有步骤、观测和判据，不把未实际执行的持续负载、真实渠道和容量指标写成通过结果。
+
 三项能力均已落入同一套共享运行时：PostgreSQL 保存权威业务状态，Redis 提供会话与任务协调，Worker/Relay/Delivery 以独立节点身份竞争可回收的工作。节点失效不会把内存状态当作恢复依据；接管者只依据持久化记录、租约和 Fencing Token 行动。
 
 | 文档包 | 内容 |

@@ -1,5 +1,61 @@
 # 故障恢复后继续对话 — 设计文档
 
+## 数据模型先按用途阅读
+
+字段表适合查精确类型，下表用于先理解数据为什么拆开。表之间用业务身份关联，不通过进程本地对象指针关联。
+
+| 数据组 | 创建/使用者 | 生命周期 | 恢复时回答的问题 |
+|---|---|---|---|
+| Binding 与配置版本 | bootstrap/渠道路由、执行与发送侧。 | 必须覆盖仍引用它的在途输入和回复。 | 当时以哪个租户、应用、账号受理？ |
+| Inbox 与 inbound payload | 渠道接收、预处理。 | 至少覆盖去重和输入恢复需要。 | 原消息是谁、原文在哪里、是否已经受理？ |
+| execution_record | 派发、Worker、Runner。 | 原请求的执行主记录。 | 固定哪份输入与配置、排到哪个 input_seq？ |
+| session_head/commit | 会话协调事务。 | 会话推进与终态证明。 | 当前准许哪条输入执行、已提交什么？ |
+| SDK session_events | 官方 SDK 会话服务。 | 上下文历史保留期。 | 当前 app/user/session 曾发生什么？ |
+| result_payload | Runner、Reply Relay。 | 至少保留到提交、发送及必要处置完成。 | 已冻结的答案是哪一份？ |
+| Outbox 与 Ledger | Relay、Delivery、运维处置。 | 调度、发送与异常追溯窗口。 | 该结果该不该发送、哪段已确认？ |
+
+以上生命周期是正确性要求，不表示当前已经有自动 TTL、统一归档或级联清理作业。删除策略必须逐项确认引用、外键及恢复窗口，不能按日志保留期套用业务状态。
+
+## 三组键看起来相似但不能互换
+
+| 键 | 唯一的对象 | 改变后的语义 |
+|---|---|---|
+| tenant + channel + external account + external message | 渠道原输入去重身份。 | 使用新的外部消息 ID 可能被视为新输入，即使文本相同。 |
+| tenant + agent app + session | 会话协调和 lease 范围。 | 改成新 session 就不再是原会话恢复。 |
+| SDK app_name + user + session | 官方历史存储作用域。 | 只匹配 session 字符串而忽略 app/user，不能证明读取同一历史。 |
+
+ReplyRoute 由持久事实联结得到，具体算法见后文；它不是另一张独立路由表。日志中的 traceparent 用于观测，不代替任何一个业务键，也不授予租户访问权限。
+
+## OpenForRun 的决策顺序
+
+当前落点为 `trpcservice/storage/session/postgres/store.go`。它先验证作用域与必要值，再以 head 和 execution_record 联结校验 request/input_seq 归属，随后按下列条件判断：
+
+| 条件 | 返回 | 调用方应理解为 |
+|---|---|---|
+| 找不到对应 head/execution 联结 | 查询错误经 translate 转换。 | 输入身份或初始化事实不完整，不能创建任意空会话补过。 |
+| 输入序号小于 next_input_seq | ErrAlreadyTerminal。 | 此输入已被闸门越过，应走既有终态路径。 |
+| 输入序号大于 next_input_seq | ErrInputNotReady。 | 前序尚未放行，不能直接执行。 |
+| fence 小于 last_fence | ErrStaleFence。 | 已落后于已提交的资格，拒绝。 |
+| 序号匹配且 fence 不落后 | 返回当前 head/version。 | 仅准许进入本轮，最终提交仍要检查。 |
+
+这次读取不持有整个模型执行期间的数据库行锁。模型执行很长时，版本可能变化，提交还必须通过 `commit_turn` 裁决。不要把“开始时读过版本”当作后来写入无需条件更新的理由。
+
+## Redis lease 的值为何不只保存 owner
+
+当前 lease 值为 `workerID|leaseID|fence`，leaseID 每次获取随机生成。Renew/Release Lua 脚本比较整个值；旧进程或旧领取只知道 owner 名称，不足以续租或删除新资格。lease 与 fence 的键带环境前缀和同一会话摘要 hash tag，脚本涉及的相关键可落入同一 Redis slot。
+
+`Inspect` 用一次 Lua 读取值、PTTL 与计数，避免把不同瞬间的结果拼成一份观察。运维接口隐藏 LeaseID，观察者不能把诊断输出当作可直接续租的完整凭据。fence 校准只提高、不降低当前计数，并为 Redis 下一次有符号 64 位 INCR 保留空间。
+
+## 应用于故障的隔离检查顺序
+
+1. 入口根据固定路由取得渠道配置，协议校验建立 VerifiedBinding。
+2. identity mapper 检查事件 channel/account 与 Binding 一致，并按租户、用途和版本读取密钥。
+3. Inbox、execution、payload 查询维持 tenant 维度；请求不能改写原 envelope 的身份。
+4. SDK 每轮 facade 检查 app/user/session 完整作用域；共享 SDK 实例不使用一个静态租户替所有请求做判断。
+5. result、ReplyRoute 和 reply event 再核对同一 tenant/request；发送凭据按固定配置解析。
+
+这是调用路径上的防线，不等于数据库管理员天然受业务租户限制，也不表示 SDK 原表具有原生 tenant 列。数据库访问权、管理令牌及运维导出权限仍应按部署策略管理。
+
 ## 模块与数据流
 
 ```mermaid

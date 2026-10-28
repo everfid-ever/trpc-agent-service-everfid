@@ -1,5 +1,33 @@
 # 故障恢复后继续对话 — 实现走读
 
+## 带着一条输入检查六个接口交接
+
+本节按运行顺序解释需要在模块交界保留下来的信息；下文表格再定位具体函数。交接成功后，下一个模块应能独立继续，不依赖前一个进程内的请求对象。
+
+| 交接 | 接收方必须拿到的事实 | 此刻故障后的读取方式 |
+|---|---|---|
+| 渠道 → 身份映射 | 验证过的 Binding、原 channel/account/user/chat 与消息身份。 | durable 接收前没有跨节点恢复该内存请求的保证；渠道重传仍要重新验签。 |
+| 身份映射 → 接收存储 | 固定 tenant/app/user/session、原消息、密钥/配置版本与正文。 | 持久输入和预处理 job 继续，不能改用最新默认租户。 |
+| 预处理 → Worker | 原 envelope、prepared 引用、input_seq 和 dispatch 责任。 | 原 request 重新调度，以 head 判定可执行性。 |
+| Worker → SDK | 与原 envelope 一致的 app/user/session、受控会话 facade。 | 新实例重新创建运行对象并读共享历史。 |
+| Runner → 提交 | result_ref、摘要、输入序号、expectedVersion、fence 与提交前检查。 | 冻结结果分支校验，terminal 已存在时读取既有结果。 |
+| 提交 → 回复发送 | 原 result、固定路由、稳定 reply/delivery key。 | Relay/Delivery 从共享记录推进，不依赖旧 Worker。 |
+
+## 代码走读时的检查问题
+
+1. `identity.Mapper.Map` 中事件与 Binding 的账号校验在派生前，secret scope 包含 tenant/purpose/version。检查新增渠道是否仍提供足够稳定的外部身份。
+2. `TenantKey` 将 tenant/app 放进 app_name；每轮 facade 限制 app/user/session。检查是否有新代码直接绕过 facade 调共享 SDK 服务。
+3. `Consumer.handle` 先读持久 last_fence、校准、领取，再启动续租与取消观察。检查模型调用是否发生在领取之后。
+4. `OpenForRun` 先确认 request 和 input_seq 属于该 session。检查捕获 ErrInputNotReady 后是否移交持久停放，还是错误地改序号。
+5. `commitFrozenSuccess` 使用原输入与结果，仍经过取消/权限等适用检查和 beforeCommit。检查“复用”是否被误改为跳过所有校验。
+6. `ResolveReplyRoute` 从原 execution/Inbox/Binding 联结。检查是否有新发送路径只看模型正文或当前全局 Bot 配置。
+
+## 分层失败不互相兜底
+
+读取历史失败时，应返回可定位错误；不能把空历史当作故障恢复成功。解密结果失败时，应修复密钥/版本；不能重新调用模型掩盖冻结结果问题。解析原回复路由失败时，应修复原配置；不能随意选择一个当前可用 Bot 发出。
+
+这些失败都可能导致业务暂时不能完成，但保留了原输入及状态。错误地“兜底成功”会让 tenant、会话或答案发生变化，破坏用户要求的连续性。
+
 ## 按运行时顺序走读
 
 | 顺序 | 模块 / 函数 | 本步权威状态 | 此刻被杀会怎样 |

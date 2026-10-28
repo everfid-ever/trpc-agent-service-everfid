@@ -21,6 +21,10 @@
 
 ## 本能力已落地的模块
 
+详细阅读时，FULL-GUIDE 先划分应用、入口、共享依赖与宿主机/外部服务故障域，再解释 HTTP 候选、会话执行者与发送者各自的迁移。design 列出内存与持久状态的归属、启动等价性、准入竞态及参数间约束。
+
+implementation-walkthrough 沿依赖准备、bootstrap、进程身份、组件 poll、入口 probe 和后台工作走读；testing-and-acceptance 提供职责矩阵、生命周期轮次、负载记录与部署反例；release-and-operations 列当班顺序、容量不足和发布回滚材料。所有容量与时延结论限定到实际环境和证据。
+
 同机双应用共享PG/Redis、独立槽位/启动身份和端口、稳定callback入口并行probe/epoch/健康过期/重加入窗口、只读root/skills和私有tmpfs、有界drain、强杀重加入/反向故障脚本。
 
 ## 保证与边界

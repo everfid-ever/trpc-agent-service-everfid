@@ -1,5 +1,39 @@
 # 单主机多容器实例可用性 — 实现走读
 
+## 从部署对象到运行角色的启动顺序
+
+| 阶段 | 运行时行为 | 尚不能得出的结论 |
+|---|---|---|
+| 共享依赖及 schema 准备 | PG/Redis 与本地配置所需依赖可访问，迁移到兼容版本。 | 应用消费者已经能工作。 |
+| bootstrap | 发布固定配置、双 Bot 路由和技能内容。 | 任一读节点可修改技能或自动修复发布目录。 |
+| 应用初始化 | 生成本次 process_start_id，按角色构造 owner，读取只读资源。 | 启动 goroutine 即 ready。 |
+| 组件实际 poll | Worker/Relay/Delivery 等记录真实成功/失败观察。 | 所有业务请求或上游模型都保证成功。 |
+| 节点 ready 与入口 probe | 节点依赖与组件满足 readiness，入口取得健康证据。 | 旧任务 lease 已全部到期或原答案已送达。 |
+| 正常请求/后台恢复 | 接收、竞争工作、提交、发送分别由相应角色完成。 | 一个节点的所有角色始终绑定同一任务。 |
+
+## 对照两个停止入口读代码
+
+SIGTERM 从主运行时进入 beginDrain/Begin：撤销 ready、阻止后续准入、关闭读取/领取、等待已进入角色，再在全局期限内结束。顺着 `runtime_drain.go` 检查 HTTP、批次角色和长驻消费者三个分支，避免只读 HTTP Shutdown 就以为后台也停止领取。
+
+SIGKILL 没有 Go 清理调用。请从遗留 Redis pending、PG claim、会话 lease 与工具/投递记录反向走读：每个残留都要有过期、扫描或消费协议，并保留原业务身份。不存在“进程退出时一定释放所有锁”的前提。
+
+## 入口与应用状态不要混读
+
+`wecom_ha_entry_role.go` 中的 probe/forward 只决定后端选择；`runtime_health.go` 中的 observe/snapshot 决定应用组件观察；`runtime_drain.go` 和 drain gate 决定生命周期准入。它们有独立同步和时间窗口。
+
+排查重新加入时，按“进程新身份 → 组件 poll → 节点 ready → 入口恢复连续成功 → 业务请求”逐层查。若跳过中间层直接重启入口，可能暂时丢掉故障记忆，却没有修复节点本身。
+
+## 改动代码后的连带审查
+
+| 改动位置 | 必须一起看 |
+|---|---|
+| 新增角色/后台循环 | owner 唯一、健康真实观察、drain 接入、重启循环结束条件。 |
+| 新增账号 Delivery consumer | Supervisor 动态生命周期、真实 poll、停止新建与现有消费者等待。 |
+| 修改入口重试 | 请求体重放、签名材料、完整响应缓冲与 Inbox 原消息去重。 |
+| 新增本地文件写入 | RO root、私有 tmp、是否丢失后可重建；业务真相另行持久。 |
+| 修改 role 装配参数 | 与包级默认值的差异、局部/全局 drain、Compose 宽限。 |
+| 修改身份命名 | 业务身份稳定、同槽位新进程可区分、历史 owner 可追溯。 |
+
 ## 1. Bootstrap 与文件隔离
 
 Compose 等待共享依赖可用、技能卷初始化和一次性 bootstrap 成功，再启动节点。bootstrap 使用可写技能卷；四个多实例应用 root read_only、技能卷 ro、独立 /tmp tmpfs。ensureSkillDirectory 的读模式只 Stat/isDir；ensureSkillFile 校验内容，缺失即报错。写模式在 stagingRoot/.publishing 创建临时文件，写入 Sync/Close 后 link 到目标，EEXIST 只接受完全相同内容。

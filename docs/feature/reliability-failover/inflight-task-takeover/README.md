@@ -21,6 +21,10 @@
 
 ## 本能力已落地的模块
 
+详细阅读时，FULL-GUIDE 先定义输入、结果和交付三种“没有丢”，再列责任转移、工具六个检查点、恢复策略证明义务与分段发送边界；design 把每条不变量对应到写入条件，区分事务、版本、fence 和尝试号。
+
+implementation-walkthrough 给出按 durable truth 选择恢复入口的实际顺序，并解释本次尝试在各类错误后由谁继续。testing-and-acceptance 为 P1–P4、工具效果、冻结答案和人工处置列前后证据；release-and-operations 提供从原 request 定位积压及 resolve 的完整操作单。
+
 持久输入/dispatch、pending reclaim、执行尝试和模型HTTP独立计数、冻结答案续提交、allow/ask统一工具恢复与加密结果、幂等笔记写入、reply Outbox/Ledger和有证据的异常投递处置。
 
 ## 保证与边界

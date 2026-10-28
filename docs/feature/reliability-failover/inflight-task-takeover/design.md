@@ -1,5 +1,57 @@
 # 在途任务接管与幂等投递 — 设计文档
 
+## 不变量、写入点与违反后的后果
+
+| 不变量 | 写入/校验点 | 若被破坏 |
+|---|---|---|
+| 同一原输入不因回调重试变成新业务任务 | Inbox 唯一身份、原 request 与派发准备。 | 两个 request 分别合法提交，后面的 Ledger 无法合并不同逻辑答案。 |
+| 同一会话按输入闸门推进 | OpenForRun、commit_turn、持久停放。 | 后一问题可能读取前一问题未完成的状态。 |
+| 重复执行不能任意重写终态 | commit 身份/摘要、fence、expectedVersion、序号。 | 旧模型结果覆盖新结果，或同输入生成多份权威答案。 |
+| 工具成功状态与可复用结果同时成立 | DurableResults.Complete 事务。 | succeeded 却无结果，只能再次产生外部效果才能继续。 |
+| 成功提交必有后续发送责任 | terminal 与 reply Outbox 同事务。 | 用户永久收不到已成功的答案。 |
+| 发布重复不创造新投递身份 | 原 reply/delivery key、分段计划校验。 | 一次 Relay 重试变成两次独立发送。 |
+| 未知发送不自动等于未发送 | expired sending/ambiguous/reconcile。 | P4 中下游收到两次。 |
+| 人工处置不能覆盖并发的新结论 | expected_version + 异常状态检查。 | 旧判断重开已发送分段或抹掉审计。 |
+
+这些不变量有不同粒度。工具账本成功不代表会话成功，Outbox published 不代表 Ledger sent，sent 也不独立证明客户端只显示一次。
+
+## 事务边界的输入与输出
+
+| 边界 | 事务前已经有什么 | 事务负责保存什么 | 明确没有包含什么 |
+|---|---|---|---|
+| 持久接收 | 可信 Binding、已解析渠道消息。 | 原输入去重事实、输入引用和预处理责任。 | 后续模型调用与最终交付。 |
+| prepare_dispatch | 可执行的预处理结果与固定版本。 | 原执行记录、序号及 dispatch Outbox。 | Redis Publish 的远端确认。 |
+| 工具 Complete | 外部操作返回成功内容。 | fenced succeeded + 加密工具结果。 | 先前的外部业务写入与 SDK 事件。 |
+| 最终结果冻结 | 模型/工具链返回最终内容。 | 原 request 可重用的加密 result。 | terminal、Outbox 与下游发送。 |
+| commit_turn | 原 envelope、结果引用、当前执行资格。 | 会话协调推进、有效提交和 Outbox。 | 独立写入的 SDK 历史与渠道远端操作。 |
+| ResolveUncertainDelivery | 已核实外部证据、当前异常版本。 | Ledger 处置、审计、适用时原 Outbox 重调度。 | 现场再次调用渠道发送与外部证据真实性验证。 |
+
+表是事务职责说明，精确 SQL 和完整参数以 CODE-APPENDIX、REFERENCE-IMPLEMENTATION 为准。不得把原 request 下多张表的存在误解为它们同时提交。
+
+## 版本号、fence 与尝试号的不同单调性
+
+| 值 | 增长理由 | 不能用它证明什么 |
+|---|---|---|
+| execution_attempt.attempt_no | 再次进入执行器。 | 不证明发生了一次新的模型 HTTP 请求。 |
+| 会话 fence | 再次取得会话 lease。 | 不证明外部工具或渠道认识这个 token。 |
+| session_head.version | 有效会话状态提交推进。 | 不代表 SDK 原始事件恰好写了一次。 |
+| tool_execution.attempt/fence | 工具操作再次领取。 | 不代表重复业务效果已经被阻止，仍需策略。 |
+| delivery_ledger.version | 条件更新、续租或状态变化。 | 不等于发送次数。 |
+| delivery_ledger.attempt | 发送领取尝试。 | 不等于下游接受数或最终可见数。 |
+| reconcile_attempt 等核对计数 | 对不确定状态继续核对。 | 核对没有直接重新发送内容。 |
+
+从数字大小推断因果关系前，先检查它属于哪张记录及何种状态转移。尤其不能用 Ledger version 的增加量当作重复回复数量。
+
+## Ledger 状态的读取顺序
+
+1. 先校验同一 delivery key 对应的 renderer、format、内容摘要与分段数。计划不兼容时拒绝，不能重新渲染成另一个答案继续发送。
+2. 对当前分段尝试 Claim。已 sent/failed 跳过；有效 sending/pending/retry_wait 可能返回延后；ambiguous 走核对。
+3. 只有成功取得发送资格的分支调用 adapter。结果成功却缺少 provider ID 也不能直接写 sent。
+4. 根据明确永久错误、可重试错误或不确定错误分别保存状态；写入失败时保留原身份供下一次读取裁决。
+5. 后续事件从原计划重新遍历各段，而非重新执行模型。人工确认送达也沿用原键，已 sent 的段不会重发。
+
+`FinishDelivery` 当前条件与 `RenewDeliveryClaim` 不完全相同：前者使用 version/state/owner/client request ID，后者还检查未过期。设计评审必须同时阅读续租流程和 CAS；不能仅凭“有租约”四字省略差异。
+
 ## 数据层权威与事务边界
 
 下表逐字段来自当前迁移，包含默认值、空值和表内约束；唯一键、外键和索引随表列出。DDL 原文位于 REFERENCE-IMPLEMENTATION，直观阅读优先使用这些表格。
