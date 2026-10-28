@@ -1,118 +1,16 @@
-# 在途任务接管与幂等投递 — 自足复现参考实现
+# 在途任务接管与幂等投递 — 参考实现
 
-> **本文是复现本能力的权威材料。** 一个从未见过本仓库源码的工程师，凭本文即可从零实现等价系统并通过同等验收。
-> **事实来源约束：** 本文所有表名、字段名、SQL 函数名、环境变量名、Go 标识符、错误码，均与参考实现逐字一致。本文是这些事实的「抄录 + 组织」，不虚构、不改名、不臆造不存在的 API。
+## 复刻前提、迁移与实现范围
 
----
+本文给出本能力的实际表结构、SQL/Go 算法和配置契约。字段表优先见 design；本篇保留逐字 DDL。SQL 按依赖创建，以下是可靠性子系统摘录，不能作为一段无依赖 SQL 直接执行：tenant、agent_app、版本化配置/策略、授权等被引用的控制面表必须先存在。仓库部署使用完整迁移 000001，再依次 000002、000003、000004；不要把本文摘录再次应用到已迁移库。
 
-## 0. 事实来源说明
+完整服务还需要渠道协议验签、SDK PostgreSQL backend、租户密钥解析器、Redis broker、版本化配置加载和真实模型/provider 适配。SDK 表由迁移创建，SDK WithSkipDBInit(true)、WithEnableAsyncPersist(false)，禁止启动时另造 schema。本文是当前能力的复刻契约；不会把省略的基础设施宣称为“复制一段示例即可启动全部系统”。
 
-| 类别 | 来源（真实路径，仅作索引） |
-|---|---|
-| 表 / 索引 / 函数 DDL | `migrations/000001_service_schema.up.sql` |
-| barrier 接口与 Controller | `trpcservice/reliability/inflight/barrier.go` |
-| P1 挂点 | `trpcservice/preprocess/worker.go` |
-| P2 挂点 / 提交 | `trpcservice/worker/runner.go` |
-| 消费 / 续租 / ACK | `trpcservice/worker/consumer.go` |
-| P3 挂点 / reply publish | `trpcservice/relay/reply.go` |
-| P4 挂点 / reconcile | `trpcservice/channels/delivery/service.go` |
-| Ledger CAS SQL | `trpcservice/storage/messaging/postgres/store.go` |
-| 会话原子契约 | `trpcservice/storage/session/atomic.go` |
-| 租约 Redis Lua | `trpcservice/coordination/redis/lease.go` |
-| 演练脚本 | `scripts/e2e/inflight-takeover.sh` |
+## 数据结构原文
 
-以上路径**仅作可选核对**，不是实现说明的依赖。本文已把必要内容抄录完整。
+本篇含在途新增表；Inbox、session_head/commit、SDK事件和输入/结果 DDL 见同级 [会话参考实现](../conversation-continuity/REFERENCE-IMPLEMENTATION.md#数据结构原文)。下方execution_record已包括000004新增列。
 
----
-
-## 0.5 先看数据：四个故障窗口各留下什么
-
-将下图当作“恢复地图”阅读：每一站先 durable，再允许下一站工作；新节点只从最后一个已落库的方块继续。字段名按职责分组，下一章才给逐字 DDL。
-
-```mermaid
-flowchart LR
-  P1["P1 · inbox / preprocess_job\n身份：tenant_id + request_id\n状态：state, payload_ref, dispatched_at"]
-  P2["P2 · execution_record + session_head\n执行：outcome, input_seq, park_attempt\n并发：lease(Redis) + last_fence(PostgreSQL)"]
-  P3["P3 · session_commit + outbox\n提交：outcome, result_ref, fence\n发布：reply idempotency_key, state, claim_owner/until"]
-  P4["P4 · delivery_ledger\n投递：segment_no, client_request_id\n状态：sending/sent/ambiguous + claim_owner/until"]
-  T["工具执行 · tool_execution\n身份：tenant + request + tool_call\n恢复：policy, fence, lease, result_ref, effect state"]
-  P1 --> P2 --> P3 --> P4
-  P2 --- T
-```
-
-| 故障瞬间 | 先读的记录 | 接管动作 | 绝不做的事 |
-|---|---|---|---|
-| P1 | `inbox`、`preprocess_job` | 重新领取并 dispatch 同一输入 | 让用户重发或另建 request。 |
-| P2 | Redis lease/fence、`execution_record`、`tool_execution` | reclaim，取得更高 fence；按工具恢复策略续办 | 旧 fence 提交，或未知副作用盲重放。 |
-| P3 | `session_commit`、reply `outbox` | 重新发布同一 `ReplyEvent` | 重跑模型。 |
-| P4 | `delivery_ledger` | claim 到期后接管并以同一 client request id 投递 | 绕过 Ledger 直接发送。 |
-
----
-
-## 0.6 DDL 的表格版：接管记录一览
-
-先按这张表理解每个字段组，再在下一章查看逐字 SQL。`created_at`、`updated_at`、CHECK、默认值、外键和索引并未删掉，保留在 SQL 中作为精确契约。
-
-| 表 | 主键 / 唯一键 | 谁标识“同一个东西” | 谁控制领取 / 并发 | 谁记录结果 / 重试 | 故障窗口 |
-|---|---|---|---|---|---|
-| `inbox` | PK `(tenant_id, channel, external_account_id, external_message_id)`；UQ `(tenant_id, request_id)` | provider 消息四元组、`request_id`、`session_id`、`agent_app_id` | `state`, `input_seq`, `version` | `payload_ref`, `payload_digest`, `result_ref`, `terminal_reason` | P1 的输入事实。 |
-| `preprocess_job` | PK `(tenant_id, job_id)` | `tenant_id`, `request_id`, `session_id`, `channel_binding_id` | `state`, `attempt`, `lease_owner`, `lease_until`, `not_before`, `dispatched_at`, `version` | `payload_ref`, `prepared_payload_ref`, `reject_reason` | P1 的可重领工作。 |
-| `execution_record` | PK `(tenant_id, request_id)` | `request_id`, `input_seq`, 版本化 app/policy/config | `outcome`, `park_attempt`, `not_before`, `cancel_*`, `version` | `result_ref`, `blocked_reason` | P2 的任务尝试与停放。 |
-| `session_head` | PK `(tenant_id, agent_app_id, session_id)` | 会话三元组 | `last_fence`, `version`, `next_input_seq`, `last_allocated_input_seq` | `state_json`, `summary_id` | P2：对端取更高 fence 后才能提交。 |
-| `session_commit` | PK `(tenant, app, session, commit_id)`；终态唯一索引 `(tenant, app, session, input_seq)` | `request_id`, `input_seq`, `commit_id` | `fence`, `session_version`, `outcome` | `result_ref`, `reply_cursor`, `request_digest` | P2/P3 的唯一 terminal fact。 |
-| `outbox` | PK `(tenant_id, outbox_id)`；UQ `(tenant_id, kind, idempotency_key)` | `kind`, `aggregate_id`, `event_seq`, `idempotency_key` | `state`, `version`, `attempt`, `next_attempt_at`, `claim_owner`, `claim_until` | `payload_ref`, `published_at` | P3：Relay 重领后发布同一事件。 |
-| `delivery_ledger` | PK `(tenant_id, delivery_key, segment_no)` | `delivery_key`, `segment_no`, 稳定 `client_request_id` | `state`, `version`, `claim_owner`, `claim_until`, `attempt`, `not_before`, `reconcile_attempt` | `provider_message_id`, `last_error_class`, 内容/渲染版本 | P4：每个片段只允许一个有效 sender。 |
-| `confirmation_grant` / `tool_attempt` / `tool_result_payload` | grant / tool call 的 tenant-scoped 键 | `grant_id`, `request_id`, `tool_call_id` | grant `state=consumed`，attempt `state` | `result_ref`、加密工具结果 | 已确认工具的授权与结果闭环。 |
-| `tool_execution` | PK `(tenant_id, request_id, tool_call_id)`；UQ `(tenant_id, tool_id, tool_version, idempotency_key)` | 同一 tool call、固定工具版本和参数摘要 | `state`, `attempt`, `fence`, `lease_owner`, `lease_until` | `recovery_policy`, `external_handle`, `result_ref`, `last_error` | P2 工具执行中断后的查询/幂等重试/终止依据。 |
-
-### `tool_execution` 字段逐列解读
-
-| 字段 | 直观含义 | 接管时的判定 |
-|---|---|---|
-| `tenant_id`, `request_id`, `tool_call_id` | “哪位租户的哪条输入中的哪次工具调用” | 三者是不可改变的主键，防止串租户接管。 |
-| `tool_id`, `tool_version`, `args_digest` | “要继续的究竟是哪一个版本、哪一组参数” | 接管者只能恢复同一版本、同一参数摘要的调用。 |
-| `recovery_policy`, `idempotency_key`, `external_handle` | 外部副作用的恢复契约和查询把手 | 决定 query、同键重试、重放或 `effect_unknown`。 |
-| `state`, `attempt`, `fence`, `lease_owner`, `lease_until` | 当前是否在跑、谁拥有执行权、旧 owner 是否已过期 | 仅 lease 过期且新 fence 更高的节点可以接管。 |
-| `result_ref`, `last_error` | 已知结果或最后失败原因 | 有 `result_ref` 直接续办；无结果且策略不安全则不重放。 |
-
----
-
-## 1. 完整 DDL（全部约束与索引）
-
-### 1.1 `inbox`（原始输入收件箱）
-
-```sql
-CREATE TABLE public.inbox (
-    tenant_id text NOT NULL,
-    channel text NOT NULL,
-    external_account_id text NOT NULL,
-    external_message_id text NOT NULL,
-    request_id text NOT NULL,
-    agent_app_id text NOT NULL,
-    session_id text,
-    input_seq bigint,
-    state text NOT NULL,
-    payload_ref text NOT NULL,
-    payload_digest text NOT NULL,
-    terminal_reason text,
-    result_ref text,
-    key_version bigint NOT NULL,
-    version bigint DEFAULT 0 NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    external_chat_id text DEFAULT ''::text NOT NULL,
-    external_user_id text DEFAULT ''::text NOT NULL,
-    CONSTRAINT inbox_input_seq_check CHECK (((input_seq IS NULL) OR (input_seq >= 1))),
-    CONSTRAINT inbox_key_version_check CHECK ((key_version >= 1)),
-    CONSTRAINT inbox_payload_digest_check CHECK ((payload_digest ~ '^[0-9a-f]{64}$'::text)),
-    CONSTRAINT inbox_state_check CHECK ((state = ANY (ARRAY['preprocess_pending'::text, 'dispatch_pending'::text, 'dispatch_ready'::text, 'terminal'::text]))),
-    CONSTRAINT inbox_version_check CHECK ((version >= 0))
-);
-```
-
-唯一键（ALTER，语义等价）：`(tenant_id, channel, external_account_id, external_message_id)`。这是 Provider 层去重边界（I2）。
-
-### 1.2 `preprocess_job`（预处理任务）
+### preprocess_job
 
 ```sql
 CREATE TABLE public.preprocess_job (
@@ -148,11 +46,19 @@ CREATE TABLE public.preprocess_job (
     CONSTRAINT preprocess_job_tenant_version_check CHECK ((tenant_version >= 1)),
     CONSTRAINT preprocess_job_version_check CHECK ((version >= 0))
 );
+ALTER TABLE ONLY public.preprocess_job
+    ADD CONSTRAINT preprocess_job_pkey PRIMARY KEY (tenant_id, job_id);
+ALTER TABLE ONLY public.preprocess_job
+    ADD CONSTRAINT preprocess_job_tenant_id_request_id_key UNIQUE (tenant_id, request_id);
+ALTER TABLE ONLY public.preprocess_job
+    ADD CONSTRAINT preprocess_job_channel_binding_fk FOREIGN KEY (tenant_id, config_version, channel_binding_id) REFERENCES public.channel_binding(tenant_id, config_version, binding_id);
+ALTER TABLE ONLY public.preprocess_job
+    ADD CONSTRAINT preprocess_job_tenant_id_request_id_fkey FOREIGN KEY (tenant_id, request_id) REFERENCES public.inbox(tenant_id, request_id);
+CREATE INDEX preprocess_job_claim_idx ON public.preprocess_job USING btree (state, not_before, lease_until, created_at);
+CREATE INDEX preprocess_job_ready_idx ON public.preprocess_job USING btree (created_at) WHERE ((state = 'ready'::text) AND (dispatched_at IS NULL));
 ```
 
-索引：`preprocess_job_claim_idx (state, not_before, lease_until, created_at)`；`preprocess_job_ready_idx (created_at) WHERE state='ready' AND dispatched_at IS NULL`。
-
-### 1.3 `execution_record`（执行任务）
+### execution_record
 
 ```sql
 CREATE TABLE public.execution_record (
@@ -174,6 +80,7 @@ CREATE TABLE public.execution_record (
     outcome text DEFAULT 'queued'::text NOT NULL,
     result_ref text,
     park_attempt integer DEFAULT 0 NOT NULL,
+	model_call_count integer DEFAULT 0 NOT NULL,
     not_before timestamp with time zone,
     version bigint DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -187,14 +94,39 @@ CREATE TABLE public.execution_record (
     CONSTRAINT execution_record_input_seq_check CHECK ((input_seq >= 1)),
     CONSTRAINT execution_record_outcome_check CHECK ((outcome = ANY (ARRAY['queued'::text, 'running'::text, 'pending'::text, 'blocked'::text, 'waiting_confirmation'::text, 'succeeded'::text, 'denied'::text, 'failed'::text, 'cancelled'::text, 'confirmation_denied'::text, 'confirmation_timeout'::text]))),
     CONSTRAINT execution_record_park_attempt_check CHECK ((park_attempt >= 0)),
+	CONSTRAINT execution_record_model_call_count_check CHECK ((model_call_count >= 0)),
     CONSTRAINT execution_record_park_state_check CHECK (((park_attempt >= 0) AND ((park_deadline IS NULL) OR (not_before IS NULL) OR (not_before <= park_deadline)) AND ((outcome <> 'blocked'::text) OR ((blocked_at IS NOT NULL) AND (blocked_reason = ANY (ARRAY['park_attempts_exhausted'::text, 'park_deadline_exceeded'::text])))))),
     CONSTRAINT execution_record_version_check CHECK ((version >= 0))
 );
+ALTER TABLE public.execution_record ADD COLUMN model_request_count bigint NOT NULL DEFAULT 0 CHECK(model_request_count>=0);
+ALTER TABLE ONLY public.execution_record
+    ADD CONSTRAINT execution_record_pkey PRIMARY KEY (tenant_id, request_id);
+ALTER TABLE ONLY public.execution_record
+    ADD CONSTRAINT execution_record_tenant_id_agent_app_id_session_id_input_se_key UNIQUE (tenant_id, agent_app_id, session_id, input_seq);
+ALTER TABLE ONLY public.execution_record
+    ADD CONSTRAINT execution_record_tenant_id_agent_app_id_agent_app_revision_fkey FOREIGN KEY (tenant_id, agent_app_id, agent_app_revision) REFERENCES public.agent_app_revision(tenant_id, agent_app_id, revision);
+ALTER TABLE ONLY public.execution_record
+    ADD CONSTRAINT execution_record_tenant_id_config_version_fkey FOREIGN KEY (tenant_id, config_version) REFERENCES public.config_snapshot(tenant_id, config_version);
+ALTER TABLE ONLY public.execution_record
+    ADD CONSTRAINT execution_record_tenant_id_request_id_fkey FOREIGN KEY (tenant_id, request_id) REFERENCES public.inbox(tenant_id, request_id);
+CREATE INDEX execution_park_ready_idx ON public.execution_record USING btree (tenant_id, agent_app_id, session_id, input_seq, not_before) WHERE (outcome = 'pending'::text);
 ```
 
-索引：`execution_park_ready_idx (tenant_id, agent_app_id, session_id, input_seq, not_before) WHERE outcome='pending'`。`park_attempt` 即「任务尝试次数」。
+### execution_attempt
 
-### 1.4 `outbox`（Transactional Outbox）
+```sql
+CREATE TABLE public.execution_attempt (
+ tenant_id text NOT NULL, request_id text NOT NULL, attempt_no bigint NOT NULL CHECK(attempt_no>0),
+ worker_id text NOT NULL CHECK(length(btrim(worker_id))>0), fence bigint NOT NULL CHECK(fence>0),
+ state text NOT NULL CHECK(state IN ('running','completed','retryable','superseded')),
+ started_at timestamptz NOT NULL DEFAULT now(), finished_at timestamptz,
+ CHECK((state='running' AND finished_at IS NULL) OR (state<>'running' AND finished_at IS NOT NULL)),
+ PRIMARY KEY(tenant_id,request_id,attempt_no),
+ FOREIGN KEY(tenant_id,request_id) REFERENCES public.execution_record(tenant_id,request_id)
+);
+```
+
+### outbox
 
 ```sql
 CREATE TABLE public.outbox (
@@ -220,93 +152,14 @@ CREATE TABLE public.outbox (
     CONSTRAINT outbox_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'claimed'::text, 'retry_wait'::text, 'published'::text, 'dead_letter'::text]))),
     CONSTRAINT outbox_version_check CHECK ((version >= 0))
 );
+ALTER TABLE ONLY public.outbox
+    ADD CONSTRAINT outbox_pkey PRIMARY KEY (tenant_id, outbox_id);
+ALTER TABLE ONLY public.outbox
+    ADD CONSTRAINT outbox_tenant_id_kind_idempotency_key_key UNIQUE (tenant_id, kind, idempotency_key);
+CREATE INDEX outbox_claim_idx ON public.outbox USING btree (kind, state, next_attempt_at, created_at);
 ```
 
-唯一约束名 `outbox_tenant_id_kind_idempotency_key_key` → `(tenant_id, kind, idempotency_key)`。`outbox_id` 格式 `format('%s:%s', kind, idempotency_key)`。索引 `outbox_claim_idx (kind, state, next_attempt_at, created_at)`。函数 `guard_outbox_idempotency()`（触发器）保护幂等键。
-
-### 1.5 `session_head`（会话头 / fence 权威）
-
-```sql
-CREATE TABLE public.session_head (
-    tenant_id text NOT NULL,
-    agent_app_id text NOT NULL,
-    session_id text NOT NULL,
-    version bigint DEFAULT 0 NOT NULL,
-    last_fence bigint DEFAULT 0 NOT NULL,
-    last_session_seq bigint DEFAULT 0 NOT NULL,
-    next_input_seq bigint DEFAULT 1 NOT NULL,
-    last_allocated_input_seq bigint DEFAULT 0 NOT NULL,
-    state_json jsonb DEFAULT '{}'::jsonb NOT NULL,
-    summary_id text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT session_head_last_allocated_input_seq_check CHECK ((last_allocated_input_seq >= 0)),
-    CONSTRAINT session_head_last_fence_check CHECK ((last_fence >= 0)),
-    CONSTRAINT session_head_last_session_seq_check CHECK ((last_session_seq >= 0)),
-    CONSTRAINT session_head_next_input_seq_check CHECK ((next_input_seq >= 1)),
-    CONSTRAINT session_head_version_check CHECK ((version >= 0))
-);
-```
-
-### 1.6 `session_commit`（终态提交）
-
-```sql
-CREATE TABLE public.session_commit (
-    tenant_id text NOT NULL,
-    agent_app_id text NOT NULL,
-    session_id text NOT NULL,
-    commit_id text NOT NULL,
-    request_id text NOT NULL,
-    request_digest text NOT NULL,
-    input_seq bigint NOT NULL,
-    stage text NOT NULL,
-    outcome text NOT NULL,
-    fence bigint NOT NULL,
-    session_version bigint NOT NULL,
-    reply_cursor text,
-    result_ref text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT session_commit_fence_check CHECK ((fence >= 1)),
-    CONSTRAINT session_commit_input_seq_check CHECK ((input_seq >= 1)),
-    CONSTRAINT session_commit_outcome_check CHECK ((outcome = ANY (ARRAY['pending'::text, 'queued'::text, 'running'::text, 'waiting_confirmation'::text, 'succeeded'::text, 'denied'::text, 'failed'::text, 'cancelled'::text, 'confirmation_denied'::text, 'confirmation_timeout'::text]))),
-    CONSTRAINT session_commit_request_digest_check CHECK ((request_digest ~ '^[0-9a-f]{64}$'::text)),
-    CONSTRAINT session_commit_session_version_check CHECK ((session_version >= 1))
-);
-```
-
-终态唯一索引：
-
-```sql
-CREATE UNIQUE INDEX session_commit_terminal_input_idx ON public.session_commit
-  (tenant_id, agent_app_id, session_id, input_seq)
-  WHERE outcome IN ('succeeded','denied','failed','cancelled','confirmation_denied','confirmation_timeout');
-```
-
-终态集合（逐字）：`('succeeded','denied','failed','cancelled','confirmation_denied','confirmation_timeout')`。
-
-### 1.7 `session_event`
-
-```sql
-CREATE TABLE public.session_event (
-    tenant_id text NOT NULL,
-    agent_app_id text NOT NULL,
-    session_id text NOT NULL,
-    session_seq bigint NOT NULL,
-    request_id text NOT NULL,
-    input_seq bigint NOT NULL,
-    event_seq bigint NOT NULL,
-    event_id text NOT NULL,
-    event_type text NOT NULL,
-    payload_ref text NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    event_payload jsonb,
-    CONSTRAINT session_event_event_seq_check CHECK ((event_seq >= 1)),
-    CONSTRAINT session_event_input_seq_check CHECK ((input_seq >= 1)),
-    CONSTRAINT session_event_session_seq_check CHECK ((session_seq >= 1))
-);
-```
-
-### 1.8 `delivery_ledger`（投递账本 / 防双发）
+### delivery_ledger
 
 ```sql
 CREATE TABLE public.delivery_ledger (
@@ -340,51 +193,109 @@ CREATE TABLE public.delivery_ledger (
     CONSTRAINT delivery_ledger_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'sending'::text, 'sent'::text, 'ambiguous'::text, 'retry_wait'::text, 'failed'::text]))),
     CONSTRAINT delivery_ledger_version_check CHECK ((version >= 1))
 );
+ALTER TABLE ONLY public.delivery_ledger
+    ADD CONSTRAINT delivery_ledger_pkey PRIMARY KEY (tenant_id, delivery_key, segment_no);
+CREATE INDEX delivery_ledger_claim_expiry_idx ON public.delivery_ledger USING btree (claim_until) WHERE (state = 'sending'::text);
+CREATE INDEX delivery_ledger_retry_idx ON public.delivery_ledger USING btree (state, not_before, updated_at) WHERE (state = ANY (ARRAY['pending'::text, 'retry_wait'::text, 'ambiguous'::text]));
 ```
 
-索引：
+### delivery_resolution
 
 ```sql
-CREATE INDEX delivery_ledger_claim_expiry_idx ON public.delivery_ledger (claim_until)
-  WHERE (state = 'sending'::text);
-CREATE INDEX delivery_ledger_retry_idx ON public.delivery_ledger (state, not_before, updated_at)
-  WHERE (state = ANY (ARRAY['pending'::text, 'retry_wait'::text, 'ambiguous'::text]));
+CREATE TABLE public.delivery_resolution (
+    tenant_id text NOT NULL,
+    delivery_key text NOT NULL,
+    segment_no integer NOT NULL CHECK (segment_no >= 0),
+    expected_version bigint NOT NULL CHECK (expected_version >= 1),
+    actor text NOT NULL CHECK (length(btrim(actor)) BETWEEN 1 AND 256),
+    evidence_ref text NOT NULL CHECK (length(btrim(evidence_ref)) BETWEEN 1 AND 1024),
+    decision text NOT NULL CHECK (decision IN ('delivered', 'not_delivered', 'retry_not_delivered')),
+    provider_message_id text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id,delivery_key,segment_no,expected_version),
+    FOREIGN KEY (tenant_id,delivery_key,segment_no)
+        REFERENCES public.delivery_ledger(tenant_id,delivery_key,segment_no),
+    CHECK ((decision='delivered' AND provider_message_id IS NOT NULL AND length(btrim(provider_message_id)) > 0)
+        OR (decision IN ('not_delivered', 'retry_not_delivered') AND provider_message_id IS NULL))
+);
 ```
 
-`attempt` 即「回复片段的任务尝试次数」；每 `(tenant_id, delivery_key, segment_no)` 一行，`sent` 后只允许 ACK，不许重发（I6）。
-
-### 1.9 `result_payload` / `prepared_payload` / `inbound_payload`
+### prepared_payload
 
 ```sql
-CREATE TABLE public.result_payload (
-    tenant_id text NOT NULL, request_id text NOT NULL, result_ref text NOT NULL,
-    result_ciphertext bytea NOT NULL, result_nonce bytea NOT NULL,
-    content_digest text NOT NULL, key_version bigint NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT result_payload_content_digest_check CHECK ((content_digest ~ '^[0-9a-f]{64}$'::text)),
-    CONSTRAINT result_payload_key_version_check CHECK ((key_version >= 1)));
-
 CREATE TABLE public.prepared_payload (
-    tenant_id text NOT NULL, request_id text NOT NULL, payload_ref text NOT NULL,
-    source_payload_ref text NOT NULL, payload_ciphertext bytea NOT NULL, payload_nonce bytea NOT NULL,
-    content_digest text NOT NULL, key_version bigint NOT NULL,
+    tenant_id text NOT NULL,
+    request_id text NOT NULL,
+    payload_ref text NOT NULL,
+    source_payload_ref text NOT NULL,
+    payload_ciphertext bytea NOT NULL,
+    payload_nonce bytea NOT NULL,
+    content_digest text NOT NULL,
+    key_version bigint NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     artifact_retention_seconds bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT prepared_payload_artifact_retention_seconds_check CHECK ((artifact_retention_seconds >= 0)),
     CONSTRAINT prepared_payload_content_digest_check CHECK ((content_digest ~ '^[0-9a-f]{64}$'::text)),
-    CONSTRAINT prepared_payload_key_version_check CHECK ((key_version > 0)));
-
-CREATE TABLE public.inbound_payload (
-    tenant_id text NOT NULL, request_id text NOT NULL, payload_ref text NOT NULL,
-    payload_ciphertext bytea NOT NULL, payload_nonce bytea NOT NULL,
-    content_digest text NOT NULL, key_version bigint NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT inbound_payload_content_digest_check CHECK ((content_digest ~ '^[0-9a-f]{64}$'::text)),
-    CONSTRAINT inbound_payload_key_version_check CHECK ((key_version > 0)));
+    CONSTRAINT prepared_payload_key_version_check CHECK ((key_version > 0))
+);
+ALTER TABLE ONLY public.prepared_payload
+    ADD CONSTRAINT prepared_payload_pkey PRIMARY KEY (tenant_id, request_id);
+ALTER TABLE ONLY public.prepared_payload
+    ADD CONSTRAINT prepared_payload_tenant_id_payload_ref_key UNIQUE (tenant_id, payload_ref);
+ALTER TABLE ONLY public.prepared_payload
+    ADD CONSTRAINT prepared_payload_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(tenant_id);
+ALTER TABLE ONLY public.prepared_payload
+    ADD CONSTRAINT prepared_payload_tenant_id_request_id_fkey FOREIGN KEY (tenant_id, request_id) REFERENCES public.inbox(tenant_id, request_id);
 ```
 
-### 1.10 `tool_attempt` / `tool_result_payload`（**仅 `ask` 工具**的工具级账本）
+### tool_execution
 
-`allow` 工具没有这两张表的记录；只有经人工确认的危险工具会写入（见 §10）。
+```sql
+CREATE TABLE public.tool_execution (
+    tenant_id text NOT NULL,
+    request_id text NOT NULL,
+    tool_call_id text NOT NULL,
+    tool_id text NOT NULL,
+    tool_version bigint NOT NULL,
+    args_digest text NOT NULL,
+    recovery_policy text NOT NULL,
+    idempotency_key text NOT NULL,
+    state text NOT NULL,
+    attempt integer NOT NULL DEFAULT 0,
+    fence bigint NOT NULL DEFAULT 0,
+    lease_owner text,
+    lease_until timestamp with time zone,
+    external_handle text,
+    result_ref text,
+    last_error text,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    updated_at timestamp with time zone NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, request_id, tool_call_id),
+    CONSTRAINT tool_execution_policy_check CHECK (recovery_policy IN ('replay_safe','idempotent_key','queryable','manual')),
+    CONSTRAINT tool_execution_state_check CHECK (state IN ('pending','running','succeeded','failed','effect_unknown')),
+    CONSTRAINT tool_execution_attempt_check CHECK (attempt >= 0),
+    CONSTRAINT tool_execution_fence_check CHECK (fence >= 0),
+    CONSTRAINT tool_execution_lease_check CHECK ((state = 'running' AND lease_owner IS NOT NULL AND lease_until IS NOT NULL) OR (state <> 'running')),
+    CONSTRAINT tool_execution_idempotency_key_check CHECK (length(btrim(idempotency_key)) > 0)
+);
+CREATE INDEX tool_execution_reclaim_idx ON public.tool_execution (lease_until) WHERE state = 'running';
+CREATE UNIQUE INDEX tool_execution_idempotency_idx ON public.tool_execution (tenant_id, tool_id, tool_version, idempotency_key);
+```
+
+### tool_execution_result
+
+```sql
+CREATE TABLE public.tool_execution_result (
+ tenant_id text NOT NULL, request_id text NOT NULL, tool_call_id text NOT NULL,
+ result_ref text NOT NULL, content_digest text NOT NULL CHECK(content_digest ~ '^[0-9a-f]{64}$'),
+ ciphertext bytea NOT NULL, nonce bytea NOT NULL CHECK(octet_length(nonce)=12), key_version bigint NOT NULL CHECK(key_version>0),
+ created_at timestamptz NOT NULL DEFAULT now(),
+ PRIMARY KEY(tenant_id,request_id,tool_call_id),
+ FOREIGN KEY(tenant_id,request_id,tool_call_id) REFERENCES public.tool_execution(tenant_id,request_id,tool_call_id)
+);
+```
+
+### tool_attempt
 
 ```sql
 CREATE TABLE public.tool_attempt (
@@ -398,7 +309,17 @@ CREATE TABLE public.tool_attempt (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT tool_attempt_state_check CHECK ((state = ANY (ARRAY['effect_unknown'::text, 'succeeded'::text, 'failed'::text])))
 );
+ALTER TABLE ONLY public.tool_attempt
+    ADD CONSTRAINT tool_attempt_pkey PRIMARY KEY (tenant_id, grant_id);
+ALTER TABLE ONLY public.tool_attempt
+    ADD CONSTRAINT tool_attempt_tenant_id_request_id_tool_call_id_key UNIQUE (tenant_id, request_id, tool_call_id);
+ALTER TABLE ONLY public.tool_attempt
+    ADD CONSTRAINT tool_attempt_tenant_id_grant_id_fkey FOREIGN KEY (tenant_id, grant_id) REFERENCES public.confirmation_grant(tenant_id, grant_id);
+```
 
+### tool_result_payload
+
+```sql
 CREATE TABLE public.tool_result_payload (
     tenant_id text NOT NULL,
     grant_id text NOT NULL,
@@ -412,545 +333,1267 @@ CREATE TABLE public.tool_result_payload (
     CONSTRAINT tool_result_payload_content_digest_check CHECK ((content_digest ~ '^[0-9a-f]{64}$'::text)),
     CONSTRAINT tool_result_payload_key_version_check CHECK ((key_version >= 1))
 );
+ALTER TABLE ONLY public.tool_result_payload
+    ADD CONSTRAINT tool_result_payload_pkey PRIMARY KEY (tenant_id, grant_id);
+ALTER TABLE ONLY public.tool_result_payload
+    ADD CONSTRAINT tool_result_payload_tenant_id_result_ref_key UNIQUE (tenant_id, result_ref);
+ALTER TABLE ONLY public.tool_result_payload
+    ADD CONSTRAINT tool_result_payload_tenant_id_grant_id_fkey FOREIGN KEY (tenant_id, grant_id) REFERENCES public.tool_attempt(tenant_id, grant_id);
+ALTER TABLE ONLY public.tool_result_payload
+    ADD CONSTRAINT tool_result_payload_tenant_id_request_id_fkey FOREIGN KEY (tenant_id, request_id) REFERENCES public.execution_record(tenant_id, request_id);
 ```
 
-状态机（唯一合法路径）：
-
-```text
-（创建授权 grant 时不写 tool_attempt）
-ConsumeGrant 事务内 ──▶ tool_attempt(state='effect_unknown')
-                          │
-        工具返回成功 ──────┼──▶ PutToolResult(...) ──▶ FinishToolAttempt(succeeded, resultRef)
-        工具返回错误 ──────┴──▶ FinishToolAttempt(failed)
-```
-
----
-
-## 2. 关键 SQL 函数（逐字语义，可直接照抄实现）
-
-### 2.1 `claim_inbox`（Provider 层去重边界）
+### local_note
 
 ```sql
-CREATE FUNCTION public.claim_inbox(
-  p_tenant_id text, p_channel text, p_external_account_id text, p_external_message_id text,
-  p_request_id text, p_agent_app_id text, p_session_id text, p_payload_ref text,
-  p_payload_digest text, p_key_version bigint, p_initial_state text)
-RETURNS SETOF public.inbox LANGUAGE plpgsql SECURITY DEFINER SET search_path TO 'pg_catalog' AS $_$
-DECLARE v_row public.inbox%ROWTYPE;
-BEGIN
-  IF p_initial_state NOT IN ('preprocess_pending', 'dispatch_pending')
-     OR p_payload_digest !~ '^[0-9a-f]{64}$' THEN
-    RAISE EXCEPTION 'invalid inbox claim' USING ERRCODE = '22023';
-  END IF;
-  INSERT INTO public.inbox(tenant_id, channel, external_account_id, external_message_id, request_id,
-    agent_app_id, session_id, state, payload_ref, payload_digest, key_version)
-  VALUES (p_tenant_id, p_channel, p_external_account_id, p_external_message_id, p_request_id,
-    p_agent_app_id, p_session_id, p_initial_state, p_payload_ref, p_payload_digest, p_key_version)
-  ON CONFLICT (tenant_id, channel, external_account_id, external_message_id) DO NOTHING;
-  SELECT * INTO v_row FROM public.inbox
-    WHERE tenant_id = p_tenant_id AND channel = p_channel
-      AND external_account_id = p_external_account_id
-      AND external_message_id = p_external_message_id FOR UPDATE;
-  IF v_row.payload_digest <> p_payload_digest OR v_row.payload_ref <> p_payload_ref
-     OR v_row.agent_app_id <> p_agent_app_id
-     OR v_row.session_id IS DISTINCT FROM p_session_id THEN
-    RAISE EXCEPTION 'inbox idempotency collision' USING ERRCODE = '23505';
-  END IF;
-  RETURN NEXT v_row;
-END;
-$_$;
+CREATE TABLE public.local_note (
+ tenant_id text NOT NULL, business_key text NOT NULL, request_id text NOT NULL,
+ note_id text NOT NULL, args_digest text NOT NULL CHECK(args_digest ~ '^[0-9a-f]{64}$'),
+ ciphertext bytea NOT NULL, nonce bytea NOT NULL CHECK(octet_length(nonce)=12), key_version bigint NOT NULL CHECK(key_version>0),
+ created_at timestamptz NOT NULL DEFAULT now(),
+ PRIMARY KEY(tenant_id,business_key), UNIQUE(tenant_id,note_id)
+);
 ```
 
-语义：平台重传 → 命中唯一键 → 读回既有行；仅当属主/摘要一致才认作同一输入；不一致视为冲突（23505）。`claim_channel_inbox` 多带 `external_chat_id`/`external_user_id` 比对，同名约束。
 
-### 2.2 `prepare_dispatch`（input_seq 分配 + dispatch outbox，单事务）
+## 三个增量迁移的发布顺序
 
-关键顺序（逐字语义）：
-1. `SELECT ... FROM tenant WHERE tenant_id=... FOR UPDATE`，不存在 → P0002。
-2. `SELECT * INTO v_inbox FROM inbox WHERE tenant_id=... AND request_id=... FOR UPDATE`，不存在 → P0002。
-3. 若 `inbox.state='dispatch_ready'`：反查 `execution_record`（按 agent_app_id/session_id/payload_ref/agent_app_version/agent_app_revision/agent_content_digest/config_version/policy_version），找不到 → 23505（幂等冲突）；找到则直接返回既有 `input_seq` + `accepted=true`。
-4. 若 `inbox.state='terminal'`：返回 `accepted=false` + `terminal_reason`。
-5. 状态/作用域不匹配 → 42501。
-6. tenant 非 active → inbox 置 terminal + 写 `dispatch-denied` 的 reply/audit outbox（`ON CONFLICT DO NOTHING`）→ `accepted=false`。
-7. tenant_version / active_config_version 不匹配 → 40001。
-8. agent_app 必须 active 且 version/revision 匹配、revision 必须 published 且 content_digest 匹配，config_snapshot 的 policy_version 必须匹配，否则 40001。
-9. `INSERT INTO session_head(...) ON CONFLICT DO NOTHING`；`SELECT last_allocated_input_seq+1 ... FOR UPDATE`；更新 `last_allocated_input_seq`。
-10. 插入 `execution_record`（`outcome` 默认 `'queued'`）。
-11. 更新 `inbox` → `dispatch_ready` + `input_seq`。
-12. 写 dispatch outbox（`idempotency_key = dispatch:<request_id>`）。
+000002 建立工具执行租约；000003 建立投递异常处置审计；000004 增加执行尝试、模型 HTTP 计数、加密工具结果和笔记业务效果。当前写入方依赖全部四个迁移，不可在回滚代码前删除已被数据引用的列/表/密钥版本。
 
-语义：input_seq 分配与 dispatch outbox 在同一事务；重复调用收敛到同一 input_seq。
+## 核心接口与工具算法（当前原文）
 
-### 2.3 `commit_turn`（terminal commit 单事务）
-
-关键顺序（逐字语义）：
-1. `SELECT * FROM session_head ... FOR UPDATE`；不存在 → P0002。
-2. `SELECT * FROM execution_record WHERE tenant_id=? AND request_id=? FOR UPDATE`；不存在或 `agent_app_id/session_id/input_seq` 与入参不一致 → 42501。
-3. 按 `commit_id` 查 `session_commit`；已存在且 `request_digest` 不同 → 23505；相同 → 返回既有结果 + `already_terminal=false`。
-4. `input_seq < next_input_seq`：必须能查到终态 `session_commit`，否则 XX001；返回该终态 + `already_terminal=true`。
-5. `input_seq > next_input_seq` → 55000（input not ready）。
-6. `expected_version <> head.version` → 40001。
-7. `fence < head.last_fence` → `RAISE 'stale fence' USING ERRCODE='40001'`。
-8. `v_new_version := version+1`；`v_new_last_seq := last_session_seq + jsonb_array_length(events)`；逐条插入 `session_event`（`session_seq = last_session_seq + ordinality`）。**注意：生产 durable turn 传 `p_events = null`**（`BufferedTurn.Commit` 把 `Events` 置 nil，会话转写由官方会话后端持有），因此该分支实际只在测试/迁移路径产生行，见 §10.1；`last_session_seq` 亦不会因此推进。
-9. UPDATE `session_head`：`version`、`last_fence=GREATEST(last_fence, fence)`、`last_session_seq`、`next_input_seq += (outcome 终态 ? 1 : 0)`、`state_json = state_json || state_delta`。
-10. （可选）summary 写入。
-11. INSERT `session_commit`（含 fence、session_version、reply_cursor、result_ref）。
-12. UPDATE `execution_record` SET outcome/result_ref/version。
-13. 逐条 INSERT `outbox`，`ON CONFLICT ON CONSTRAINT outbox_tenant_id_kind_idempotency_key_key DO NOTHING`；`outbox_id` = `format('%s:%s', kind, idempotency_key)`。
-
-终态集合：`('succeeded','denied','failed','cancelled','confirmation_denied','confirmation_timeout')`。
-
-### 2.4 `park_execution`（尚未轮到的输入停放）
-
-入参：`(p_tenant_id, p_request_id, p_input_seq, p_base_delay_seconds, p_max_delay_seconds, p_deadline_seconds, p_max_attempts)`。
-- 校验 `base>=1`、`max>=base`、`deadline>=max`、`1<=max_attempts<=64`，否则 22023。
-- 取 `execution_record`，找不到 → P0002；`input_seq` 不匹配 → 42501。
-- 锁 `session_head` 取 `next_input_seq`。
-- 重新锁 `execution_record`；若已终态或 `p_input_seq < next`：必须存在对应终态 `session_commit`，否则 XX001；返回 `disposition='terminal'`。
-- 若 `p_input_seq = next`：返回 `disposition='ready'`。
-- 若 `outcome='pending'`：`v_now >= deadline` → 置 blocked/`park_deadline_exceeded` 并写 `park-blocked:<request_id>` audit outbox，返回 `'blocked'`；否则返回 `'parked'`。
-- 否则 `attempt = park_attempt+1`；`attempt > max_attempts` 或 `now >= deadline` → blocked（`park_attempts_exhausted` / `park_deadline_exceeded`），写 audit outbox，返回 `'blocked'`。
-- 否则指数退避 `not_before = LEAST(deadline, now + base * 2^(attempt-1))`，置 `outcome='pending'`，返回 `'parked'`。
-
-语义：输入序号尚未轮到时把执行「停放」，直到前序终态提交；这正是 `ErrInputNotReady` 的处理路径。
-
-### 2.5 `guard_outbox_idempotency`（触发器，语义幂等）
-
-```sql
-CREATE FUNCTION public.guard_outbox_idempotency() RETURNS trigger LANGUAGE plpgsql
-SECURITY DEFINER SET search_path TO 'pg_catalog' AS $$
-BEGIN
-  PERFORM pg_advisory_xact_lock(hashtextextended(NEW.tenant_id || chr(31) || NEW.kind || chr(31) || NEW.idempotency_key, 0));
-  PERFORM 1 FROM public.outbox WHERE tenant_id = NEW.tenant_id AND kind = NEW.kind AND idempotency_key = NEW.idempotency_key;
-  IF FOUND THEN RETURN NULL; END IF;
-  RETURN NEW;
-END; $$;
-```
-
----
-
-## 3. Redis 租约契约（Lua，逐字）
-
-键格式：`prefix = trpc:{env}:{tag}`，其中 `tag = sha256(tenantID + "\x00" + agentAppID + "\x00" + sessionID)` 的 hex（hash tag，保证 lease/fence 同槽）。
-- `lease` key = `prefix + ":lease"`，`fence` key = `prefix + ":fence"`
-- lease value = `workerID + "|" + leaseID + "|" + fence`（十进制）
-
-```lua
--- acquire（KEYS[1]=lease, KEYS[2]=fence; ARGV={workerID, leaseID, ttlMillis}）
-if redis.call('EXISTS', KEYS[1]) == 1 then return {0, '0'} end
-redis.call('INCR', KEYS[2])
-local fence = redis.call('GET', KEYS[2])
-local value = ARGV[1] .. '|' .. ARGV[2] .. '|' .. fence
-redis.call('PSETEX', KEYS[1], ARGV[3], value)
-return {1, fence}
-```
-
-```lua
--- renew（KEYS={lease}; ARGV={expectedValue, ttlMillis}）
-if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-redis.call('PEXPIRE', KEYS[1], ARGV[2]); return 1
-```
-
-```lua
--- release（KEYS={lease}; ARGV={expectedValue}）
-if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-return redis.call('DEL', KEYS[1])
-```
-
-```lua
--- ensureFence（KEYS={fence}; ARGV={minimum}）：十进制字符串比较，current < minimum 时 SET minimum
-local function normalize(value) local n = string.gsub(value, '^0+', ''); if n == '' then return '0' end; return n end
-local function decimal_less(left, right)
-  left = normalize(left); right = normalize(right)
-  if string.len(left) ~= string.len(right) then return string.len(left) < string.len(right) end
-  return left < right
-end
-local current = redis.call('GET', KEYS[1]) or '0'
-local minimum = ARGV[1]
-if decimal_less(current, minimum) then redis.call('SET', KEYS[1], minimum) end
-return 1
-```
-
-错误映射：`Acquire` 冲突 → `runtime.ErrVersionConflict`；fence 解析失败/为 0 → `ErrInvariantViolation`；`EnsureFenceAtLeast` 拒绝 `minimum >= math.MaxInt64`（Redis INCR 是 signed 64-bit，要留一个可用值）→ `ErrInvariantViolation`。`workerID` 不得为空、不得含 `|`；`ttl` 必须 > 0 且 ≥1ms。
-
----
-
-## 4. Go 接口（逐字）
-
-### 4.1 barrier
 
 ```go
-type Point string
-const (
-    PointP1BeforeExecution        Point = "p1_persisted_before_execution"
-    PointP2BeforeTerminalCommit   Point = "p2_executed_before_commit"
-    PointP3BeforeReplyPublish     Point = "p3_result_committed_before_reply_publish"
-    PointP4BeforeProviderDelivery Point = "p4_delivery_claimed_before_provider_send"
+package tool
+
+import (
+	"context"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 )
-type Barrier interface{ Wait(context.Context, Point) error }
-type Snapshot struct{ Point Point; Armed, Hit, Released bool }
-type Controller struct{ /* map[Point]*gate guarded by mutex */ }
-func (c *Controller) Arm(point Point) <-chan struct{}
-func (c *Controller) Wait(ctx context.Context, point Point) error
-func (c *Controller) Release(point Point) bool
-func (c *Controller) Snapshot(point Point) Snapshot
-```
 
-### 4.2 会话原子契约（`trpcservice/storage/session/atomic.go`）
+// RecoveryPolicy declares what a new owner may safely do after a tool lease
+// expires while the previous owner was executing an external operation.
+type RecoveryPolicy string
 
-```go
-type SessionKey struct{ TenantID, AgentAppID, SessionID string }
-type TerminalKey struct{ SessionKey; InputSeq uint64 }
-type OpenForRunRequest struct{ SessionKey; RequestID string; InputSeq, Fence uint64 }
-type SessionHead struct{ SessionKey; Version int64; LastFence, LastSessionSeq, NextInputSeq uint64; State map[string]any }
-type BufferedEvent struct{ EventID, EventType, PayloadRef string; EventSeq uint64; Payload json.RawMessage }
-type SessionSnapshot struct{ Head SessionHead; Events []json.RawMessage }
-type StateDelta map[string]any
-type SummaryCandidate struct{ SummaryID string; BaseSessionSeq uint64; LastEventID string; CutoffAt time.Time; ContentRef string }
-type OutboxEvent struct{ Kind, IdempotencyKey, PayloadRef, TraceParent string; EventSeq uint64 }
-type CommitTurnRequest struct{ SessionKey; RequestID, CommitID, Stage string; InputSeq, Fence uint64;
-    ExpectedVersion int64; Outcome runtime.Outcome; Events []BufferedEvent; StateDelta StateDelta;
-    SummaryCandidate *SummaryCandidate; ResultRef, ReplyCursor string; Outbox []OutboxEvent }
-type CommitTurnResult struct{ CommitID string; Outcome runtime.Outcome; InputSeq uint64; SessionVersion int64; ResultRef, ReplyCursor string }
+const (
+	RecoveryReplaySafe    RecoveryPolicy = "replay_safe"
+	RecoveryIdempotentKey RecoveryPolicy = "idempotent_key"
+	RecoveryQueryable     RecoveryPolicy = "queryable"
+	RecoveryManual        RecoveryPolicy = "manual"
+)
 
-type AtomicSessionStore interface {
-    OpenForRun(context.Context, OpenForRunRequest) (SessionHead, error)
-    CommitTurn(context.Context, CommitTurnRequest) (CommitTurnResult, error)
-    GetTerminalByInputSeq(context.Context, TerminalKey) (CommitTurnResult, error)
-    ReadLastFence(context.Context, SessionKey) (uint64, error)
-    LoadSession(context.Context, SessionKey) (SessionSnapshot, error)
+// RecoveryDescriptor is implemented by tools with an explicit takeover
+// contract. The key is stable for one tenant/request/tool-call/arguments
+// tuple and is safe to pass to an external provider as its idempotency key.
+type RecoveryDescriptor interface {
+	RecoveryPolicy() RecoveryPolicy
+	RecoveryKey(context.Context) (string, error)
+}
+
+// RecoveryQuerier lets a queryable tool resolve a previously accepted
+// external operation by its stable idempotency key without replaying it.
+// completed=false must establish that the operation was NOT accepted and may
+// safely be started. Pending/unknown operations must return an error, not false.
+type RecoveryQuerier interface {
+	RecoveryDescriptor
+	QueryRecovery(context.Context, string) (result any, completed bool, err error)
+}
+
+// RecoveryContext exposes only the durable execution identity to a tool.
+func RecoveryContext(ctx context.Context) (runtime.ExecutionContext, bool) {
+	return runtime.ExecutionContextFrom(ctx)
 }
 ```
 
-### 4.3 delivery Service 关键字段（`channels/delivery/service.go`）
 
 ```go
+package execution
+
+import (
+	"context"
+	"time"
+)
+
+type State string
+
+const (
+	Pending       State = "pending"
+	Running       State = "running"
+	Succeeded     State = "succeeded"
+	Failed        State = "failed"
+	EffectUnknown State = "effect_unknown"
+)
+
+type Key struct{ TenantID, RequestID, ToolCallID string }
+type Record struct {
+	Key
+	ToolID                               string
+	ToolVersion                          int64
+	ArgsDigest                           string
+	Policy                               string
+	IdempotencyKey                       string
+	State                                State
+	Attempt                              int
+	Fence                                uint64
+	LeaseOwner                           string
+	LeaseUntil                           time.Time
+	ExternalHandle, ResultRef, LastError string
+}
+type Claim struct {
+	Owner string
+	TTL   time.Duration
+}
+type Store interface {
+	Claim(context.Context, Record, Claim) (Record, bool, error)
+	Renew(context.Context, Record, time.Duration) (Record, error)
+	Finish(context.Context, Record, State, string, string) (Record, error)
+	Get(context.Context, Key) (Record, error)
+}
+
+// DurableResults atomically fences completion and persists encrypted output.
+type DurableResults interface {
+	Complete(context.Context, Record, []byte, int64) (Record, error)
+	LoadResult(context.Context, Key) ([]byte, error)
+}
+```
+
+
+```go
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"time"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tool/execution"
+)
+
+type Store struct {
+	db   *sql.DB
+	keys messaging.PayloadKeyResolver
+}
+
+func New(db *sql.DB) *Store { return &Store{db: db} }
+func NewWithPayloadKeys(db *sql.DB, keys messaging.PayloadKeyResolver) *Store {
+	return &Store{db: db, keys: keys}
+}
+func (s *Store) Get(ctx context.Context, k execution.Key) (r execution.Record, e error) {
+	if s == nil || s.db == nil {
+		return r, runtime.ErrCapabilityUnsupported
+	}
+	var fence int64
+	e = s.db.QueryRowContext(ctx, `SELECT tool_id,tool_version,args_digest,recovery_policy,idempotency_key,state,attempt,fence,COALESCE(lease_owner,''),COALESCE(lease_until,'epoch'),COALESCE(external_handle,''),COALESCE(result_ref,''),COALESCE(last_error,'') FROM tool_execution WHERE tenant_id=$1 AND request_id=$2 AND tool_call_id=$3`, k.TenantID, k.RequestID, k.ToolCallID).Scan(&r.ToolID, &r.ToolVersion, &r.ArgsDigest, &r.Policy, &r.IdempotencyKey, &r.State, &r.Attempt, &fence, &r.LeaseOwner, &r.LeaseUntil, &r.ExternalHandle, &r.ResultRef, &r.LastError)
+	r.Key = k
+	r.Fence = uint64(fence)
+	if e == sql.ErrNoRows {
+		e = runtime.ErrNotFound
+	}
+	return
+}
+
+func (s *Store) Claim(ctx context.Context, in execution.Record, claim execution.Claim) (execution.Record, bool, error) {
+	if s == nil || s.db == nil || in.TenantID == "" || in.RequestID == "" || in.ToolCallID == "" || in.ToolID == "" || in.ToolVersion < 1 || in.ArgsDigest == "" || in.IdempotencyKey == "" || claim.Owner == "" || claim.TTL <= 0 {
+		return execution.Record{}, false, runtime.ErrInvariantViolation
+	}
+	var r execution.Record
+	var fence int64
+	var lease sql.NullTime
+	err := s.db.QueryRowContext(ctx, `INSERT INTO tool_execution(tenant_id,request_id,tool_call_id,tool_id,tool_version,args_digest,recovery_policy,idempotency_key,state,attempt,fence,lease_owner,lease_until)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,'running',1,1,$9,now()+$10::interval)
+ON CONFLICT (tenant_id,request_id,tool_call_id) DO UPDATE SET state='running',attempt=tool_execution.attempt+1,fence=tool_execution.fence+1,lease_owner=EXCLUDED.lease_owner,lease_until=EXCLUDED.lease_until,updated_at=now()
+WHERE (tool_execution.state IN ('pending','effect_unknown') OR (tool_execution.state='running' AND tool_execution.lease_until<now()))
+AND tool_execution.tool_id=EXCLUDED.tool_id AND tool_execution.tool_version=EXCLUDED.tool_version
+AND tool_execution.args_digest=EXCLUDED.args_digest AND tool_execution.recovery_policy=EXCLUDED.recovery_policy
+AND tool_execution.idempotency_key=EXCLUDED.idempotency_key
+RETURNING tenant_id,request_id,tool_call_id,tool_id,tool_version,args_digest,recovery_policy,idempotency_key,state,attempt,fence,lease_owner,lease_until,COALESCE(external_handle,''),COALESCE(result_ref,''),COALESCE(last_error,'')`,
+		in.TenantID, in.RequestID, in.ToolCallID, in.ToolID, in.ToolVersion, in.ArgsDigest, in.Policy, in.IdempotencyKey, claim.Owner, claim.TTL.String()).Scan(&r.TenantID, &r.RequestID, &r.ToolCallID, &r.ToolID, &r.ToolVersion, &r.ArgsDigest, &r.Policy, &r.IdempotencyKey, &r.State, &r.Attempt, &fence, &r.LeaseOwner, &lease, &r.ExternalHandle, &r.ResultRef, &r.LastError)
+	if err == sql.ErrNoRows {
+		return in, false, nil
+	}
+	if err != nil {
+		return execution.Record{}, false, err
+	}
+	r.Fence = uint64(fence)
+	if lease.Valid {
+		r.LeaseUntil = lease.Time
+	}
+	return r, true, nil
+}
+
+func (s *Store) Renew(ctx context.Context, in execution.Record, ttl time.Duration) (execution.Record, error) {
+	if s == nil || s.db == nil || in.LeaseOwner == "" || in.Fence == 0 || ttl <= 0 {
+		return execution.Record{}, runtime.ErrInvariantViolation
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tool_execution SET lease_until=now()+$1::interval,updated_at=now() WHERE tenant_id=$2 AND request_id=$3 AND tool_call_id=$4 AND state='running' AND lease_owner=$5 AND fence=$6 AND lease_until>now()`, ttl.String(), in.TenantID, in.RequestID, in.ToolCallID, in.LeaseOwner, int64(in.Fence))
+	if err != nil {
+		return execution.Record{}, err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return execution.Record{}, runtime.ErrVersionConflict
+	}
+	return s.Get(ctx, in.Key)
+}
+
+func (s *Store) Finish(ctx context.Context, in execution.Record, state execution.State, resultRef, lastError string) (execution.Record, error) {
+	if state != execution.Succeeded && state != execution.Failed && state != execution.EffectUnknown {
+		return execution.Record{}, runtime.ErrInvariantViolation
+	}
+	if in.LeaseOwner == "" || in.Fence == 0 {
+		return execution.Record{}, runtime.ErrInvariantViolation
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tool_execution SET state=$1,result_ref=NULLIF($2,''),last_error=NULLIF($3,''),lease_owner=NULL,lease_until=NULL,updated_at=now() WHERE tenant_id=$4 AND request_id=$5 AND tool_call_id=$6 AND state='running' AND lease_owner=$7 AND fence=$8 AND lease_until>now()`, state, resultRef, lastError, in.TenantID, in.RequestID, in.ToolCallID, in.LeaseOwner, int64(in.Fence))
+	if err != nil {
+		return execution.Record{}, err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return execution.Record{}, runtime.ErrVersionConflict
+	}
+	return s.Get(ctx, in.Key)
+}
+```
+
+
+```go
+package postgres
+
+import (
+	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/tool/execution"
+)
+
+func resultAAD(key execution.Key, digest string, version int64) []byte {
+	data, _ := json.Marshal([]any{"tool-execution-result-v1", key.TenantID, key.RequestID, key.ToolCallID, digest, version})
+	return data
+}
+func (s *Store) aead(ctx context.Context, tenant string, version int64) (cipher.AEAD, error) {
+	if s.keys == nil {
+		return nil, runtime.ErrCapabilityUnsupported
+	}
+	key, err := s.keys.ResolvePayloadKey(ctx, tenant, version)
+	if err != nil {
+		return nil, err
+	}
+	defer clear(key.Bytes)
+	if key.Version != version || len(key.Bytes) != 32 {
+		return nil, runtime.ErrVersionMismatch
+	}
+	block, err := aes.NewCipher(key.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+func (s *Store) Complete(ctx context.Context, in execution.Record, content []byte, version int64) (execution.Record, error) {
+	if len(content) == 0 || version < 1 || in.Fence == 0 || in.LeaseOwner == "" {
+		return in, runtime.ErrInvalidEnvelope
+	}
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+	ref := "tool-result://sha256/" + digest
+	aead, err := s.aead(ctx, in.TenantID, version)
+	if err != nil {
+		return in, err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		return in, err
+	}
+	encrypted := aead.Seal(nil, nonce, content, resultAAD(in.Key, digest, version))
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return in, err
+	}
+	defer tx.Rollback()
+	var fence int64
+	err = tx.QueryRowContext(ctx, `UPDATE tool_execution SET state='succeeded',result_ref=$6,last_error=NULL,lease_owner=NULL,lease_until=NULL,updated_at=now()
+WHERE tenant_id=$1 AND request_id=$2 AND tool_call_id=$3 AND state='running' AND lease_owner=$4 AND fence=$5 AND lease_until>now() RETURNING fence`, in.TenantID, in.RequestID, in.ToolCallID, in.LeaseOwner, int64(in.Fence), ref).Scan(&fence)
+	if errors.Is(err, sql.ErrNoRows) {
+		return in, runtime.ErrLeaseLost
+	}
+	if err != nil {
+		return in, err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO tool_execution_result(tenant_id,request_id,tool_call_id,result_ref,content_digest,ciphertext,nonce,key_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, in.TenantID, in.RequestID, in.ToolCallID, ref, digest, encrypted, nonce, version)
+	if err != nil {
+		return in, err
+	}
+	if err = tx.Commit(); err != nil {
+		return in, err
+	}
+	in.State, in.ResultRef, in.LeaseOwner = execution.Succeeded, ref, ""
+	return in, nil
+}
+func (s *Store) LoadResult(ctx context.Context, key execution.Key) ([]byte, error) {
+	var digest string
+	var encrypted, nonce []byte
+	var version int64
+	err := s.db.QueryRowContext(ctx, `SELECT r.content_digest,r.ciphertext,r.nonce,r.key_version FROM tool_execution_result r JOIN tool_execution e USING(tenant_id,request_id,tool_call_id) WHERE r.tenant_id=$1 AND r.request_id=$2 AND r.tool_call_id=$3 AND e.state='succeeded' AND e.result_ref=r.result_ref`, key.TenantID, key.RequestID, key.ToolCallID).Scan(&digest, &encrypted, &nonce, &version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, runtime.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	aead, err := s.aead(ctx, key.TenantID, version)
+	if err != nil {
+		return nil, err
+	}
+	if len(nonce) != aead.NonceSize() {
+		return nil, runtime.ErrInvariantViolation
+	}
+	content, err := aead.Open(nil, nonce, encrypted, resultAAD(key, digest, version))
+	if err != nil {
+		return nil, runtime.ErrInvariantViolation
+	}
+	sum := sha256.Sum256(content)
+	if hex.EncodeToString(sum[:]) != digest {
+		clear(content)
+		return nil, runtime.ErrVersionMismatch
+	}
+	return content, nil
+}
+```
+
+
+## Worker 尝试与模型 HTTP 计数（当前原文）
+
+
+```go
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"math"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/gateway"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+)
+
+func (s *TaskStore) BeginExecutionAttempt(ctx context.Context, key gateway.ExecutionKey, worker string, fence uint64) (gateway.ExecutionAttempt, error) {
+	a := gateway.ExecutionAttempt{ExecutionKey: key, WorkerID: worker, Fence: fence}
+	if key.TenantID == "" || key.RequestID == "" || worker == "" || fence == 0 || fence > math.MaxInt64 {
+		return a, runtime.ErrInvalidEnvelope
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return a, err
+	}
+	defer tx.Rollback()
+	var request string
+	if err = tx.QueryRowContext(ctx, `SELECT request_id FROM execution_record WHERE tenant_id=$1 AND request_id=$2 FOR UPDATE`, key.TenantID, key.RequestID).Scan(&request); err != nil {
+		return a, err
+	}
+	var maximum int64
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(max(fence),0) FROM execution_attempt WHERE tenant_id=$1 AND request_id=$2`, key.TenantID, key.RequestID).Scan(&maximum); err != nil {
+		return a, err
+	}
+	if uint64(maximum) > fence {
+		return a, runtime.ErrStaleFence
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE execution_attempt SET state='superseded',finished_at=now() WHERE tenant_id=$1 AND request_id=$2 AND state='running'`, key.TenantID, key.RequestID); err != nil {
+		return a, err
+	}
+	err = tx.QueryRowContext(ctx, `INSERT INTO execution_attempt(tenant_id,request_id,attempt_no,worker_id,fence,state)
+SELECT $1,$2,COALESCE(max(attempt_no),0)+1,$3,$4,'running' FROM execution_attempt WHERE tenant_id=$1 AND request_id=$2 RETURNING attempt_no`, key.TenantID, key.RequestID, worker, int64(fence)).Scan(&a.Number)
+	if err != nil {
+		return a, err
+	}
+	return a, tx.Commit()
+}
+func (s *TaskStore) FinishExecutionAttempt(ctx context.Context, a gateway.ExecutionAttempt, completed bool) error {
+	state := "retryable"
+	if completed {
+		state = "completed"
+	}
+	var version int64
+	err := s.db.QueryRowContext(ctx, `UPDATE execution_attempt SET state=$6,finished_at=now() WHERE tenant_id=$1 AND request_id=$2 AND attempt_no=$3 AND worker_id=$4 AND fence=$5 AND state='running' RETURNING attempt_no`, a.TenantID, a.RequestID, a.Number, a.WorkerID, int64(a.Fence), state).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return runtime.ErrVersionConflict
+	}
+	return err
+}
+
+func (s *TaskStore) RecordModelRequest(ctx context.Context, key gateway.ExecutionKey) error {
+	if key.TenantID == "" || key.RequestID == "" {
+		return runtime.ErrTenantScope
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE execution_record SET model_request_count=model_request_count+1 WHERE tenant_id=$1 AND request_id=$2`, key.TenantID, key.RequestID)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return runtime.ErrNotFound
+	}
+	return nil
+}
+```
+
+
+## 提交、队列与 Ledger 契约
+
+commit_turn 和 Redis完整实现见 [会话参考实现](../conversation-continuity/REFERENCE-IMPLEMENTATION.md)。Worker ACK 的语义是本 delivery 已有 durable disposition：terminal、停放或阻塞等后续责任已持久化；不能只用 ACK 推断用户已收到回复。Relay 先 Publish 再 MarkPublished，故可重复 event。Delivery 服务固定计划、claim、续期、发送、确认或核对；其完整生产算法如下。
+
+
+```go
+// Package delivery owns provider-neutral reliable reply delivery after the
+// account queue. Provider adapters are called only after a Delivery Ledger
+// segment claim succeeds.
+package delivery
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	channel "github.com/liuzengh/trpc-agent-service/trpcservice/channels/contract"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/inflight"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
+)
+
+type AdapterResolver interface {
+	ResolveAdapter(context.Context, string, string) (channel.Adapter, error)
+}
+
+type VersionedAdapterResolver interface {
+	ResolveVersionedAdapter(context.Context, string, string, int64) (channel.Adapter, error)
+}
+
+// Compatibility aliases keep delivery callers source-compatible while the
+// error taxonomy itself lives in the provider-neutral Adapter contract.
+type AmbiguousError = channel.AmbiguousDeliveryError
+type RetryAfterError = channel.RetryableDeliveryError
+type PermanentError = channel.PermanentDeliveryError
+
+// DeferredError keeps the account-queue entry pending while another delivery
+// attempt is active or its durable retry deadline has not arrived.
+type DeferredError struct{ NotBefore time.Time }
+
+func (e DeferredError) Error() string { return "reply delivery is deferred" }
+
+// TerminalError means the failure was durably recorded as DeliveryFailed and
+// the account-queue entry can be ACKed after the error is reported.
+type TerminalError struct{ Err error }
+
+func (e TerminalError) Error() string {
+	if e.Err == nil {
+		return "reply delivery permanently failed"
+	}
+	return e.Err.Error()
+}
+func (e TerminalError) Unwrap() error { return e.Err }
+
 type Service struct {
-    Results messaging.ResultStore
-    Ledger messaging.DeliveryLedger
-    Adapters AdapterResolver
-    Owner string
-    ClaimTTL time.Duration
-    ClaimRenewInterval time.Duration
-    RendererVersion, FormatVersion string
-    DefaultRetryDelay, MaxRetryDelay time.Duration
-    MaxAttempts, MaxReconcileAttempts int
-    Barrier inflight.Barrier
+	Results              messaging.ResultStore
+	Ledger               messaging.DeliveryLedger
+	Adapters             AdapterResolver
+	Owner                string
+	ClaimTTL             time.Duration
+	ClaimRenewInterval   time.Duration
+	RendererVersion      string
+	FormatVersion        string
+	DefaultRetryDelay    time.Duration
+	MaxRetryDelay        time.Duration
+	MaxAttempts          int
+	MaxReconcileAttempts int
+	Barrier              inflight.Barrier
+}
+
+func (s Service) Deliver(ctx context.Context, event channel.ReplyEvent) error {
+	if s.Results == nil || s.Ledger == nil || s.Adapters == nil || event.SchemaVersion != 1 ||
+		s.Owner == "" || event.TenantID == "" || event.RequestID == "" || event.ChannelBindingID == "" || event.ConfigVersion < 1 || event.DeliveryKey == "" || event.ContentRef == "" ||
+		event.Target.Channel == "" || event.Target.ExternalAccountID == "" {
+		return runtime.ErrInvariantViolation
+	}
+	result, err := messaging.ResolveReplyContent(ctx, s.Results, event.TenantID, event.RequestID, event.ContentRef)
+	if err != nil {
+		return err
+	}
+	if result.ResultRef != event.ContentRef {
+		return runtime.ErrVersionMismatch
+	}
+	adapter, err := s.resolveAdapter(ctx, event)
+	if err != nil {
+		return err
+	}
+	if adapter == nil || adapter.ID() != event.Target.Channel {
+		return runtime.ErrTenantScope
+	}
+	contentType, err := messaging.NormalizeContentType(result.ContentType)
+	if err != nil {
+		return err
+	}
+	segments := [][]byte{append([]byte(nil), result.Content...)}
+	if contentType == messaging.ContentTypeText {
+		segments = splitText(result.Content, maxTextBytes(adapter))
+	}
+	plan := messaging.DeliveryPlan{RendererVersion: s.rendererVersion(), FormatVersion: s.formatVersion(contentType, len(segments)), ContentDigest: result.ContentDigest, SegmentCount: len(segments)}
+	for segmentNo, content := range segments {
+		if err := s.deliverSegment(ctx, event, adapter, plan, segmentNo, content, contentType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s Service) deliverSegment(ctx context.Context, event channel.ReplyEvent, adapter channel.Adapter, plan messaging.DeliveryPlan, segmentNo int, content []byte, contentType string) error {
+	ctx = inflight.WithScope(ctx, event.TenantID, event.RequestID, "")
+	key := messaging.DeliveryKey{TenantID: event.TenantID, DeliveryKey: event.DeliveryKey, SegmentNo: segmentNo}
+	claimTTL := s.ClaimTTL
+	if claimTTL <= 0 {
+		claimTTL = 30 * time.Second
+	}
+	record, acquired, err := s.Ledger.ClaimDelivery(ctx, key, plan, messaging.DeliveryClaim{Owner: s.Owner, TTL: claimTTL})
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		switch record.State {
+		case messaging.DeliverySent, messaging.DeliveryFailed:
+			return nil
+		case messaging.DeliveryAmbiguous:
+			return s.reconcile(ctx, event, record)
+		case messaging.DeliveryPending, messaging.DeliverySending, messaging.DeliveryRetryWait:
+			return DeferredError{NotBefore: record.NotBefore}
+		default:
+			return runtime.ErrInvariantViolation
+		}
+	}
+	if s.Barrier != nil {
+		if err := s.Barrier.Wait(ctx, inflight.PointP4BeforeProviderDelivery); err != nil {
+			return err
+		}
+	}
+	contentDigest := plan.ContentDigest
+	if plan.SegmentCount > 1 {
+		sum := sha256.Sum256(content)
+		contentDigest = hex.EncodeToString(sum[:])
+	}
+	record, resultDelivery, deliverErr := s.deliverWithClaimRenewal(ctx, adapter, channel.DeliveryRequest{
+		Event: event, ClientRequestID: record.ClientRequestID, Target: event.Target,
+		Content: append([]byte(nil), content...), ContentDigest: contentDigest, ContentType: contentType,
+	}, record, claimTTL)
+	if deliverErr != nil {
+		var ambiguous AmbiguousError
+		if errors.As(deliverErr, &ambiguous) {
+			record.State, record.LastErrorClass = messaging.DeliveryAmbiguous, "response_lost"
+			_, finishErr := s.Ledger.FinishDelivery(ctx, record, record.Version)
+			return errors.Join(deliverErr, finishErr)
+		}
+		var permanent PermanentError
+		if errors.As(deliverErr, &permanent) {
+			return s.finishFailed(ctx, record, deliverErr, permanent.Class, false)
+		}
+		var retryAfter RetryAfterError
+		if errors.As(deliverErr, &retryAfter) {
+			return s.finishRetry(ctx, record, deliverErr, retryAfter.RetryAfter)
+		}
+		return s.finishRetry(ctx, record, deliverErr, 0)
+	}
+	if !resultDelivery.Delivered {
+		return s.finishRetry(ctx, record, runtime.ErrBackendUnavailable, 0)
+	}
+	if resultDelivery.ProviderMessageID == "" {
+		record.State, record.LastErrorClass = messaging.DeliveryAmbiguous, "missing_provider_message_id"
+		_, finishErr := s.Ledger.FinishDelivery(ctx, record, record.Version)
+		return errors.Join(AmbiguousError{Err: runtime.ErrInvariantViolation}, finishErr)
+	}
+	record.State = messaging.DeliverySent
+	record.ProviderMessageID = resultDelivery.ProviderMessageID
+	record.LastErrorClass = ""
+	_, err = s.Ledger.FinishDelivery(ctx, record, record.Version)
+	return err
+}
+
+func (s Service) rendererVersion() string {
+	if s.RendererVersion != "" {
+		return s.RendererVersion
+	}
+	return "terminal-text-v1"
+}
+
+func (s Service) formatVersion(contentType string, segmentCount int) string {
+	if s.FormatVersion != "" {
+		return s.FormatVersion
+	}
+	if contentType == messaging.ContentTypeCard {
+		return "card-v1"
+	}
+	if strings.HasPrefix(contentType, "image/") {
+		return "image-v1"
+	}
+	if segmentCount > 1 {
+		return "text-segment-v1"
+	}
+	return "text-v1"
+}
+
+func maxTextBytes(adapter channel.Adapter) int {
+	if limit, ok := adapter.(channel.TextSegmentLimit); ok && limit.MaxTextBytes() > 0 {
+		return limit.MaxTextBytes()
+	}
+	return 0
+}
+
+// splitText preserves every input byte while ensuring that a segment never
+// ends in the middle of a UTF-8 rune. Invalid UTF-8 is passed through as one
+// segment so the provider adapter can retain its existing permanent-error
+// classification instead of silently changing the response content.
+func splitText(content []byte, maxBytes int) [][]byte {
+	if maxBytes <= 0 || len(content) <= maxBytes || !utf8.Valid(content) {
+		return [][]byte{append([]byte(nil), content...)}
+	}
+	segments := make([][]byte, 0, (len(content)+maxBytes-1)/maxBytes)
+	for start := 0; start < len(content); {
+		end := start + maxBytes
+		if end >= len(content) {
+			segments = append(segments, append([]byte(nil), content[start:]...))
+			break
+		}
+		for end > start && !utf8.Valid(content[start:end]) {
+			end--
+		}
+		// maxBytes can be smaller than the first rune only for a malformed
+		// adapter declaration. Preserve the original response in that case.
+		if end == start {
+			return [][]byte{append([]byte(nil), content...)}
+		}
+		segments = append(segments, append([]byte(nil), content[start:end]...))
+		start = end
+	}
+	return segments
+}
+
+func (s Service) reconcile(ctx context.Context, event channel.ReplyEvent, record messaging.DeliveryRecord) error {
+	if record.NotBefore.After(time.Now()) {
+		return DeferredError{NotBefore: record.NotBefore}
+	}
+	adapter, err := s.resolveAdapter(ctx, event)
+	if err != nil {
+		return s.deferReconciliation(ctx, record, err)
+	}
+	reconciler, ok := adapter.(channel.DeliveryReconciler)
+	if !ok {
+		return s.deferReconciliation(ctx, record, runtime.ErrCapabilityUnsupported)
+	}
+	result, err := reconciler.ReconcileDelivery(ctx, channel.ReconciliationRequest{Event: event, ClientRequestID: record.ClientRequestID})
+	if err != nil {
+		return s.deferReconciliation(ctx, record, err)
+	}
+	switch result.Status {
+	case channel.ReconciliationDelivered:
+		if result.ProviderMessageID == "" {
+			return s.deferReconciliation(ctx, record, runtime.ErrInvariantViolation)
+		}
+		record.State, record.ProviderMessageID, record.LastErrorClass = messaging.DeliverySent, result.ProviderMessageID, ""
+		_, err = s.Ledger.ReconcileDelivery(ctx, record, record.Version)
+		return err
+	case channel.ReconciliationNotDelivered:
+		record.State, record.NotBefore, record.LastErrorClass = messaging.DeliveryRetryWait, time.Now().UTC(), "reconciled_not_delivered"
+		if _, err = s.Ledger.ReconcileDelivery(ctx, record, record.Version); err != nil {
+			return err
+		}
+		return DeferredError{NotBefore: record.NotBefore}
+	case channel.ReconciliationUnknown:
+		return s.deferReconciliation(ctx, record, runtime.ErrCommitConflict)
+	default:
+		return s.deferReconciliation(ctx, record, runtime.ErrInvariantViolation)
+	}
+}
+
+func (s Service) resolveAdapter(ctx context.Context, event channel.ReplyEvent) (channel.Adapter, error) {
+	if resolver, ok := s.Adapters.(VersionedAdapterResolver); ok {
+		return resolver.ResolveVersionedAdapter(ctx, event.TenantID, event.ChannelBindingID, event.ConfigVersion)
+	}
+	return s.Adapters.ResolveAdapter(ctx, event.TenantID, event.ChannelBindingID)
+}
+
+func (s Service) finishRetry(ctx context.Context, record messaging.DeliveryRecord, cause error, delay time.Duration) error {
+	if record.Attempt >= s.maxAttempts() {
+		return s.finishFailed(ctx, record, cause, "retry_exhausted", false)
+	}
+	delay = s.backoff(record.Attempt, delay)
+	record.State = messaging.DeliveryRetryWait
+	record.NotBefore = time.Now().Add(delay)
+	record.LastErrorClass = "retryable"
+	_, finishErr := s.Ledger.FinishDelivery(ctx, record, record.Version)
+	return errors.Join(cause, finishErr)
+}
+
+type renewalResult struct {
+	record messaging.DeliveryRecord
+	err    error
+}
+
+func (s Service) deliverWithClaimRenewal(ctx context.Context, adapter channel.Adapter, request channel.DeliveryRequest, record messaging.DeliveryRecord, claimTTL time.Duration) (messaging.DeliveryRecord, channel.DeliveryResult, error) {
+	callCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	interval := s.ClaimRenewInterval
+	if interval <= 0 || interval >= claimTTL {
+		interval = claimTTL / 3
+	}
+	if interval <= 0 {
+		interval = time.Nanosecond
+	}
+	stop := make(chan struct{})
+	done := make(chan renewalResult, 1)
+	go func() {
+		latest := record
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				done <- renewalResult{record: latest}
+				return
+			case <-callCtx.Done():
+				done <- renewalResult{record: latest, err: callCtx.Err()}
+				return
+			case <-ticker.C:
+				renewed, err := s.Ledger.RenewDeliveryClaim(callCtx, latest, claimTTL)
+				if err != nil {
+					cancel()
+					done <- renewalResult{record: latest, err: err}
+					return
+				}
+				latest = renewed
+			}
+		}
+	}()
+	result, deliverErr := adapter.Deliver(callCtx, request)
+	if deliverErr == nil && result.Delivered && result.ProviderMessageID != "" && s.Barrier != nil {
+		// Keep renewing the sending claim while paused. The accepted-send
+		// window must not migrate to a peer merely because observation is slow.
+		if pauseErr := s.Barrier.Wait(inflight.WithScope(callCtx, request.Event.TenantID, request.Event.RequestID, result.ProviderMessageID), inflight.PointP4AfterProviderAccepted); pauseErr != nil {
+			deliverErr = AmbiguousError{Err: pauseErr}
+		}
+	}
+	close(stop)
+	renewal := <-done
+	if renewal.err != nil {
+		err := errors.Join(deliverErr, renewal.err)
+		if result.Delivered {
+			err = AmbiguousError{Err: err}
+		}
+		return renewal.record, result, err
+	}
+	return renewal.record, result, deliverErr
+}
+
+func (s Service) deferReconciliation(ctx context.Context, record messaging.DeliveryRecord, cause error) error {
+	nextAttempt := record.ReconcileAttempt + 1
+	if nextAttempt >= s.maxReconcileAttempts() {
+		return s.finishFailed(ctx, record, cause, "reconcile_exhausted", true)
+	}
+	record.ReconcileAttempt = nextAttempt
+	record.NotBefore = time.Now().Add(s.backoff(nextAttempt, 0))
+	record.LastErrorClass = "reconcile_retryable"
+	updated, err := s.Ledger.DeferDeliveryReconciliation(ctx, record, record.Version)
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	return DeferredError{NotBefore: updated.NotBefore}
+}
+
+func (s Service) finishFailed(ctx context.Context, record messaging.DeliveryRecord, cause error, class string, reconcile bool) error {
+	record.State = messaging.DeliveryFailed
+	record.LastErrorClass = normalizeErrorClass(class)
+	var err error
+	if reconcile {
+		_, err = s.Ledger.ReconcileDelivery(ctx, record, record.Version)
+	} else {
+		_, err = s.Ledger.FinishDelivery(ctx, record, record.Version)
+	}
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	return TerminalError{Err: cause}
+}
+
+func (s Service) backoff(attempt int, requested time.Duration) time.Duration {
+	base := s.DefaultRetryDelay
+	if base <= 0 {
+		base = time.Second
+	}
+	if requested > 0 {
+		base = requested
+	} else if attempt > 1 {
+		shift := attempt - 1
+		if shift > 20 {
+			shift = 20
+		}
+		factor := time.Duration(1 << shift)
+		maximum := s.MaxRetryDelay
+		if maximum <= 0 {
+			maximum = time.Minute
+		}
+		if base > maximum/factor {
+			return maximum
+		}
+		base *= factor
+	}
+	maximum := s.MaxRetryDelay
+	if maximum <= 0 {
+		maximum = time.Minute
+	}
+	if base > maximum {
+		return maximum
+	}
+	return base
+}
+
+func (s Service) maxAttempts() int {
+	if s.MaxAttempts > 0 {
+		return s.MaxAttempts
+	}
+	return 8
+}
+
+func (s Service) maxReconcileAttempts() int {
+	if s.MaxReconcileAttempts > 0 {
+		return s.MaxReconcileAttempts
+	}
+	return 8
+}
+
+func normalizeErrorClass(class string) string {
+	class = strings.TrimSpace(class)
+	if class == "" {
+		return "permanent"
+	}
+	for _, char := range class {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '_' || char == '-' || char == '.' {
+			continue
+		}
+		return "permanent"
+	}
+	return class
 }
 ```
 
----
 
-## 5. 四个挂点算法（可照抄）
+## 配置契约
 
-| Point | 文件 / 函数 | 位置 | 暂停条件 |
-|---|---|---|---|
-| P1 | `preprocess/worker.go` `dispatch()` | `Dispatcher.Dispatch` **之前** | durable job 已存在、尚未成为 execution |
-| P2 | `worker/runner.go` `ExecuteWithLease` | 模型/工具与 `renderOutbound` 之后、`encodeResultRef`/`PutResult`/`beforeCommit`/`CommitTurn` 之前 | 已生成终态内容但未提交 |
-| P3 | `relay/reply.go` `ReplyRelay.handle()` | 构造 `ReplyEvent` 后、`PublishReply` 之前 | terminal result/outbox/route 已持久化，reply event 未发布 |
-| P4 | `channels/delivery/service.go` `deliverSegment()` | `ClaimDelivery` 成功后、`deliverWithClaimRenewal` 之前 | delivery 已领取，provider 尚未调用 |
+| 参数 | 当前值/要求 |
+|---|---|
+| TRPC_POSTGRES_DSN / TRPC_REDIS_ADDRESS | 共享数据库与 Redis，两个实例须相同。 |
+| TRPC_REDIS_ENVIRONMENT | 默认 local-runtime；同一部署协调命名空间相同，各环境不得误共用。 |
+| TRPC_WEBUI_LOCAL_INSTANCE_ID | standalone 默认；Compose 每节点不同。 |
+| TRPC_WEBUI_LOCAL_STATUS_ENABLED | true 才注册 status；owner 启动身份始终生成。 |
+| TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT | 默认 /tmp/trpc-webui-skills；多实例 /var/lib/trpc-webui-local/skills。 |
+| TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY | 节点 true；bootstrap false。 |
+| TRPC_WEBUI_LOCAL_SECRET_ROOT | 默认 /tmp/trpc-webui-secrets，每容器私有。 |
+| TRPC_RUNTIME_DRAIN_TIMEOUT | 默认30s，允许1s–5m。 |
+| TRPC_RUNTIME_OPERATIONS_TOKEN | 独立管理 token，至少32字符，不复用 WebUI token；为空不注册 ops。 |
+| TRPC_WECOM_LOCAL_ENABLED | 主 Bot 渠道开关。 |
+| TRPC_WECOM_SECONDARY_LOCAL_ENABLED | 次 Bot 渠道开关；需要独立 Corp/Agent 组合与全套凭据。 |
+| TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED | 仅隔离演练环境 true；默认不开故障控制面。 |
 
-每个挂点统一调用：
+Bot 凭据通过 Compose secrets/wecom.env 注入，模型 key 通过 secrets/deepseek-api-key。配置名和鉴权严格以组合根为准；不要把脚本的 assumed 当成运行时配置或业务成功状态。
+
+## 算法与启动顺序
+
+1. 先完成迁移和共享依赖，再发布 tenant/app/Binding/config/policy 与密钥版本；一次性 bootstrap 发布不可变技能内容。
+2. 两节点使用相同业务后端/协调环境，独立 instance_id、本地 /tmp 和启动身份；共享技能卷按只读加载。
+3. 装配 SDK session service、工具 durable store+payload keys、preprocess/dispatch/Worker/Relay/Wakeup/Delivery；启动实际轮询，ready 之前不导入业务流量。
+4. 稳定入口探测 ready 节点；两 Bot 对应不同 route key，始终使用相同公开 origin。
+5. 接受输入先 durable，再异步调度；有效 owner 执行并提交；最后依据 Ledger 与下游接受结果处理发送。
+6. SIGTERM 执行有界 drain；SIGKILL 依靠 lease/claim 过期和 reclaim。不要通过手工改数据让恢复看似成立。
+
+| 参数 | 当前本地组合根装配 | 意义 |
+|---|---|---|
+| Worker lease / renew | 30s / 10s | 失权取消执行；lease 到期才可换 owner。 |
+| Worker reclaim / limit | 5s / 100 | 扫描 pending；不代表 5 秒内必完成恢复。 |
+| Relay claim / renew / poll | 30s / 10s / 100ms | 先发布，再标记 published；发布后崩溃可重发同一事件。 |
+| Delivery claim / renew | 30s / 10s | 每分段发送权。 |
+| Delivery reclaim / limit | 5s / 100 | 回收账号回复队列 pending。 |
+| Delivery retry | 初始 1s，最大 1m，最多 8 次 | 明确可重试错误的有界退避。 |
+| Delivery reconcile | 最多 8 次 | 无查询能力或核对失败最终保留 failed/reconcile_exhausted 事件。 |
+| 工具 lease / renew | 默认 30s / TTL÷3 | PostgreSQL 工具 lease，与会话 lease 是两套执行权。 |
+| 应用排空 | 默认 30s，可配置 1s–5m | 停止新领取，保留已接纳工作，超时再取消。 |
+| Compose 停止宽限 | 默认 45s | 必须比应用排空更长并留退出余量。 |
+
+这些值是当前 `webui-local`/`wecom-local` 装配值，不能与 Consumer 未配置时的包级兜底值混用。恢复耗时还包含排队、上游延迟、退避和采样误差，不能把 TTL 相加写成已验证的 RTO。
+
+| 测试路径名 | 实际边界 | 证据 / 使用限制 |
+|---|---|---|
+| p1 | 预处理持久领取后、执行前 | 原输入/job 已持久化；不能代替所有 P1 子窗口。 |
+| p2 | 模型成功响应头返回后、SDK 消费结果前 | 请求尝试与成功头状态；不证明 provider 内部仍在生成。 |
+| p2-commit | 模型/工具完成、terminal 结果提交前 | 旧边界，不能代替执行中的 P2。 |
+| result-before-commit | 冻结结果保存后、terminal/Outbox 提交前 | 原 result_ref/digest 不变，接管不再调用模型。 |
+| p3 | terminal 已提交、reply PublishReply 前 | session_commit、result_payload、已领取 reply Outbox。 |
+| p4-before-send | Ledger claim 后、provider 调用前 | 旧发送前边界，不能证明 P4 已接受。 |
+| p4 | provider 成功接受且返回消息 ID 后、Ledger sent 前 | barrier 快照 Evidence；进程内快照需在 kill 前采集，非 durable receipt。 |
+| tool-effect | 工具业务效果完成后、工具结果提交前 | 按业务键查外部效果，恢复不能增加效果数。 |
+
+仅 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true` 注册 `/test/failover/<point>/arm|status|release`，用本地 WebUI token 鉴权。arm 可带 tenant_id/request_id 过滤；status 回显命中身份/evidence。暂停控制面是进程内测试设施，不续 lease、不修改业务状态、不替系统重投。标准接管在命中后杀 owner，不对 survivor release。
+
+## 管理接口与不确定投递处置
+
+设置独立的 `TRPC_RUNTIME_OPERATIONS_TOKEN`（至少 32 字符、不得复用 WebUI token）才注册管理接口。使用请求头 `X-TRPC-Local-Token`，直接访问节点；稳定 WeCom 入口不转发 `/ops/*`。响应 `Cache-Control: no-store`，查询显式带 tenant，不返回正文或密钥。
+
+| 接口 | 参数 / 作用 |
+|---|---|
+| GET /ops/reliability | tenant_id；单条 SQL 一致快照，含 Inbox/执行/Outbox/Ledger/工具计数、最近执行尝试和异常/处置；明细各最多 100 条。 |
+| GET /ops/session/lease | tenant_id、agent_app_id、session_id；原子读 owner/fence/剩余租期，不返回 LeaseID。 |
+| POST /ops/delivery/resolve | 外部证据核实后的版本化处置；冲突 409、输入错误 400、未授权 401、成功 204。 |
+
+处置输入为 `tenant_id, delivery_key, segment_no, expected_version, actor, evidence_ref, decision`。decision=delivered 必须带 provider_message_id；另外两种 decision 必须不带。actor 是管理调用方声明的操作人。
+
+| decision | 状态与调度 |
+|---|---|
+| delivered | 分段置 sent；重调度原 reply Outbox 以继续剩余段，当前段只跳过发送。 |
+| not_delivered | 分段置 failed，关闭事件，不补发。 |
+| retry_not_delivered | 有未送达证据后置 retry_wait，重调度原 reply，沿用 DeliveryKey/ClientRequestID/内容与累计尝试数。 |
+
+只能处置 ambiguous 或 failed/reconcile_exhausted。Ledger CAS、delivery_resolution 审计和必要的原 Outbox 重调度同事务提交；Outbox 正被领取时返回冲突，不能手改状态绕过。超时不能证明未送达。
+
+
+## 最小复刻检查
+
+工具结果与成功状态须原子；重试键不能随模型调用ID漂移；queryable 的 false 须证明未接受；grant 不得二次消费；冻结结果后模型调用不增加；P3不重算；P4确认前崩溃不盲补发；reconcile耗尽仍可按证据处置。外部业务效果按业务键核对，不能仅检查平台记录行数。
+
+## 组合根完整配置校验原文
+
+以下为当前 loadWebUILocalConfig；它给出全部本地运行时环境变量、默认值、开关、密钥路径及合法组合，不包含运行环境注入的实际密钥值。
 
 ```go
-if barrier != nil {
-    if err := barrier.Wait(ctx, inflight.PointP4BeforeProviderDelivery); err != nil {
-        return err
-    }
+func loadWebUILocalConfig(getenv func(string) string) (webUILocalConfig, error) {
+	if strings.EqualFold(strings.TrimSpace(getenv("TRPC_FEISHU_LOCAL_ENABLED")), "true") {
+		return webUILocalConfig{}, errors.New("Feishu local runtime is no longer supported")
+	}
+	value := webUILocalConfig{PostgresDSN: strings.TrimSpace(getenv("TRPC_POSTGRES_DSN")),
+		DrainTimeout:    30 * time.Second,
+		ReadOnlySkills:  strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY")), "true"),
+		OperationsToken: getenv("TRPC_RUNTIME_OPERATIONS_TOKEN"),
+		RedisAddress:    strings.TrimSpace(getenv("TRPC_REDIS_ADDRESS")), ListenAddress: valueOr(getenv("TRPC_LISTEN_ADDRESS"), ":8080"),
+		RedisEnvironment:             valueOr(getenv("TRPC_REDIS_ENVIRONMENT"), "local-runtime"),
+		SecretRoot:                   valueOr(getenv("TRPC_WEBUI_LOCAL_SECRET_ROOT"), "/tmp/trpc-webui-secrets"),
+		SkillStagingRoot:             valueOr(getenv("TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT"), "/tmp/trpc-webui-skills"),
+		QdrantEndpoint:               valueOr(getenv("TRPC_WEBUI_LOCAL_QDRANT_ENDPOINT"), "http://qdrant:6333"),
+		APIKeyFile:                   valueOr(getenv("TRPC_WEBUI_DEEPSEEK_KEY_FILE"), "/run/secrets/deepseek_api_key"),
+		RouteKey:                     valueOr(getenv("TRPC_WEBUI_LOCAL_ROUTE_KEY"), webUILocalRouteKey),
+		Token:                        valueOr(getenv("TRPC_WEBUI_LOCAL_TOKEN"), webUILocalToken),
+		InstanceID:                   valueOr(getenv("TRPC_WEBUI_LOCAL_INSTANCE_ID"), "standalone"),
+		ClamAVAddress:                valueOr(getenv("TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS"), "clamav:3310"),
+		ExclusiveRuntime:             strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_EXCLUSIVE_RUNTIME")), "true"),
+		FailoverTestEnabled:          strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED")), "true"),
+		StatusEnabled:                strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_STATUS_ENABLED")), "true"),
+		FeishuEnabled:                strings.EqualFold(strings.TrimSpace(getenv("TRPC_FEISHU_LOCAL_ENABLED")), "true"),
+		FeishuAppID:                  strings.TrimSpace(getenv("FEISHU_APP_ID")),
+		FeishuAppSecret:              strings.TrimSpace(getenv("FEISHU_APP_SECRET")),
+		FeishuVerificationToken:      strings.TrimSpace(getenv("FEISHU_VERIFICATION_TOKEN")),
+		FeishuEncryptKey:             strings.TrimSpace(getenv("FEISHU_ENCRYPT_KEY")),
+		FeishuBotOpenID:              strings.TrimSpace(getenv("FEISHU_BOT_OPEN_ID")),
+		WeComEnabled:                 strings.EqualFold(strings.TrimSpace(getenv("TRPC_WECOM_LOCAL_ENABLED")), "true"),
+		WeComSecondaryEnabled:        strings.EqualFold(strings.TrimSpace(getenv("TRPC_WECOM_SECONDARY_LOCAL_ENABLED")), "true"),
+		WeComCorpID:                  strings.TrimSpace(getenv("WECOM_CORP_ID")),
+		WeComAppSecret:               strings.TrimSpace(getenv("WECOM_APP_SECRET")),
+		WeComCallbackToken:           strings.TrimSpace(getenv("WECOM_CALLBACK_TOKEN")),
+		WeComEncodingAESKey:          strings.TrimSpace(getenv("WECOM_ENCODING_AES_KEY")),
+		WeComSecondaryCorpID:         strings.TrimSpace(getenv("WECOM_SECONDARY_CORP_ID")),
+		WeComSecondaryAppSecret:      strings.TrimSpace(getenv("WECOM_SECONDARY_APP_SECRET")),
+		WeComSecondaryCallbackToken:  strings.TrimSpace(getenv("WECOM_SECONDARY_CALLBACK_TOKEN")),
+		WeComSecondaryEncodingAESKey: strings.TrimSpace(getenv("WECOM_SECONDARY_ENCODING_AES_KEY")),
+	}
+	if raw := strings.TrimSpace(getenv("TRPC_RUNTIME_DRAIN_TIMEOUT")); raw != "" {
+		duration, err := time.ParseDuration(raw)
+		if err != nil || duration < time.Second || duration > 5*time.Minute {
+			return webUILocalConfig{}, errors.New("invalid runtime drain timeout")
+		}
+		value.DrainTimeout = duration
+	}
+	if value.OperationsToken != "" && (len(value.OperationsToken) < 32 || strings.TrimSpace(value.OperationsToken) != value.OperationsToken || value.OperationsToken == value.Token) {
+		return webUILocalConfig{}, errors.New("operations token must be independent and contain at least 32 characters")
+	}
+	if value.PostgresDSN == "" || value.RedisAddress == "" || strings.TrimSpace(value.Token) != value.Token || len(value.Token) < 16 ||
+		strings.TrimSpace(value.RouteKey) != value.RouteKey || value.RouteKey == "" || strings.TrimSpace(value.ClamAVAddress) != value.ClamAVAddress || value.ClamAVAddress == "" || !filepath.IsAbs(value.APIKeyFile) || !filepath.IsAbs(value.SecretRoot) ||
+		!filepath.IsAbs(value.SkillStagingRoot) || filepath.Clean(value.SkillStagingRoot) != value.SkillStagingRoot || value.SkillStagingRoot == value.SecretRoot || value.QdrantEndpoint != "http://qdrant:6333" {
+		return webUILocalConfig{}, errors.New("required WebUI local configuration is missing or invalid")
+	}
+	if !validWebUILocalInstanceID(value.InstanceID) {
+		return webUILocalConfig{}, errors.New("WebUI local instance ID is invalid")
+	}
+	if value.FeishuEnabled && (value.FeishuAppID == "" || value.FeishuAppSecret == "" || value.FeishuVerificationToken == "" || value.FeishuEncryptKey == "") {
+		return webUILocalConfig{}, errors.New("Feishu local configuration is incomplete")
+	}
+	if value.WeComEnabled {
+		agentID, agentIDErr := strconv.ParseInt(strings.TrimSpace(getenv("WECOM_AGENT_ID")), 10, 64)
+		if agentIDErr != nil || agentID <= 0 || value.WeComCorpID == "" || value.WeComAppSecret == "" || value.WeComCallbackToken == "" ||
+			value.WeComEncodingAESKey == "" {
+			return webUILocalConfig{}, errors.New("WeCom local configuration is incomplete")
+		}
+		value.WeComAgentID = agentID
+	}
+	secondaryConfigured := value.WeComSecondaryCorpID != "" || strings.TrimSpace(getenv("WECOM_SECONDARY_AGENT_ID")) != "" || value.WeComSecondaryAppSecret != "" ||
+		value.WeComSecondaryCallbackToken != "" || value.WeComSecondaryEncodingAESKey != ""
+	if !value.WeComSecondaryEnabled && secondaryConfigured {
+		return webUILocalConfig{}, errors.New("secondary WeCom credentials require explicit enablement")
+	}
+	if value.WeComSecondaryEnabled {
+		if !value.WeComEnabled {
+			return webUILocalConfig{}, errors.New("secondary WeCom requires the primary WeCom local configuration")
+		}
+		agentID, agentIDErr := strconv.ParseInt(strings.TrimSpace(getenv("WECOM_SECONDARY_AGENT_ID")), 10, 64)
+		if agentIDErr != nil || agentID <= 0 || value.WeComSecondaryCorpID == "" || value.WeComSecondaryAppSecret == "" ||
+			value.WeComSecondaryCallbackToken == "" || value.WeComSecondaryEncodingAESKey == "" ||
+			(value.WeComSecondaryCorpID == value.WeComCorpID && agentID == value.WeComAgentID) {
+			return webUILocalConfig{}, errors.New("secondary WeCom local configuration is incomplete or incompatible")
+		}
+		value.WeComSecondaryAgentID = agentID
+	}
+	return value, nil
 }
 ```
 
-point-scoped `Snapshot` 只暴露 `point/armed/hit/released`，不暴露 tenant/request。
+## Ledger 条件更新原文
 
----
+expired sending 先改为 ambiguous/owner_lost；重新发送仅能领取pending/retry_wait。FinishDelivery校验version/state/owner/client_request_id，Renew还校验租期；Finish语句本身没有lease_until谓词，不能把它描述成包含该检查。工具Complete另有有效租期条件，两者不可混淆。
 
-## 6. Delivery Ledger 的 CAS SQL（逐字语义）
-
-### 6.1 `ClaimDelivery`
-
-```sql
--- 1) 回收超时的 sending claim
-UPDATE delivery_ledger SET state='ambiguous', last_error_class='owner_lost',
-  claim_owner=NULL, claim_until=NULL, version=version+1, updated_at=now()
-WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND state='sending' AND claim_until<=now();
-
--- 2) 插入或续 claim（仅当版本/计划一致）
-INSERT INTO delivery_ledger(tenant_id, delivery_key, segment_no, state, renderer_version, format_version,
-  content_digest, segment_count, attempt, client_request_id, claim_owner, claim_until)
-VALUES($1,$2,$3,'sending',$4,$5,$6,$7,1,$8,$9, now()+($10 * interval '1 microsecond'))
-ON CONFLICT (tenant_id, delivery_key, segment_no) DO UPDATE SET
-  state='sending', attempt=delivery_ledger.attempt+1, claim_owner=EXCLUDED.claim_owner,
-  claim_until=EXCLUDED.claim_until, version=delivery_ledger.version+1, updated_at=now()
+```go
+func (s *Store) ClaimDelivery(ctx context.Context, key messaging.DeliveryKey, plan messaging.DeliveryPlan, claim messaging.DeliveryClaim) (messaging.DeliveryRecord, bool, error) {
+	if err := validateDeliveryPlan(key, plan); err != nil {
+		return messaging.DeliveryRecord{}, false, err
+	}
+	if claim.Owner == "" || claim.TTL <= 0 {
+		return messaging.DeliveryRecord{}, false, runtime.ErrCommitConflict
+	}
+	clientRequestID, err := messaging.StableDeliveryRequestID(key)
+	if err != nil {
+		return messaging.DeliveryRecord{}, false, err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE delivery_ledger SET state='ambiguous',last_error_class='owner_lost',
+claim_owner=NULL,claim_until=NULL,version=version+1,updated_at=now()
+WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND state='sending' AND claim_until<=now()`, key.TenantID, key.DeliveryKey, key.SegmentNo); err != nil {
+		return messaging.DeliveryRecord{}, false, err
+	}
+	record := messaging.DeliveryRecord{DeliveryKey: key, Plan: plan, ClientRequestID: clientRequestID}
+	err = s.db.QueryRowContext(ctx, `INSERT INTO delivery_ledger(
+tenant_id,delivery_key,segment_no,state,renderer_version,format_version,content_digest,segment_count,attempt,client_request_id,claim_owner,claim_until)
+VALUES($1,$2,$3,'sending',$4,$5,$6,$7,1,$8,$9,now()+($10 * interval '1 microsecond'))
+ON CONFLICT (tenant_id,delivery_key,segment_no) DO UPDATE SET
+  state='sending',attempt=delivery_ledger.attempt+1,claim_owner=EXCLUDED.claim_owner,claim_until=EXCLUDED.claim_until,
+  version=delivery_ledger.version+1,updated_at=now()
 WHERE delivery_ledger.state IN ('pending','retry_wait') AND delivery_ledger.not_before<=now()
   AND delivery_ledger.renderer_version=EXCLUDED.renderer_version
   AND delivery_ledger.format_version=EXCLUDED.format_version
   AND delivery_ledger.content_digest=EXCLUDED.content_digest
   AND delivery_ledger.segment_count=EXCLUDED.segment_count
   AND delivery_ledger.client_request_id=EXCLUDED.client_request_id
-RETURNING ...;
--- 无行返回 → GetDelivery；若 existing.Plan != plan → ErrIdempotencyCollision
+RETURNING COALESCE(provider_message_id,''),state,attempt,reconcile_attempt,not_before,COALESCE(last_error_class,''),client_request_id,
+COALESCE(claim_owner,''),COALESCE(claim_until,'epoch'::timestamptz),version,updated_at`,
+		key.TenantID, key.DeliveryKey, key.SegmentNo, plan.RendererVersion, plan.FormatVersion, plan.ContentDigest, plan.SegmentCount,
+		clientRequestID, claim.Owner, claim.TTL.Microseconds()).
+		Scan(&record.ProviderMessageID, &record.State, &record.Attempt, &record.ReconcileAttempt, &record.NotBefore, &record.LastErrorClass,
+			&record.ClientRequestID, &record.ClaimOwner, &record.ClaimUntil, &record.Version, &record.UpdatedAt)
+	if err == nil {
+		return record, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return messaging.DeliveryRecord{}, false, err
+	}
+	existing, getErr := s.GetDelivery(ctx, key)
+	if getErr != nil {
+		return messaging.DeliveryRecord{}, false, getErr
+	}
+	if existing.Plan != plan {
+		return messaging.DeliveryRecord{}, false, runtime.ErrIdempotencyCollision
+	}
+	return existing, false, nil
+}
+
+func (s *Store) RenewDeliveryClaim(ctx context.Context, in messaging.DeliveryRecord, ttl time.Duration) (messaging.DeliveryRecord, error) {
+	if ttl <= 0 || in.ClaimOwner == "" || in.ClientRequestID == "" {
+		return messaging.DeliveryRecord{}, runtime.ErrCommitConflict
+	}
+	err := s.db.QueryRowContext(ctx, `UPDATE delivery_ledger SET claim_until=now()+($7 * interval '1 microsecond'),version=version+1,updated_at=now()
+WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND version=$4 AND state='sending' AND claim_owner=$5
+  AND client_request_id=$6 AND claim_until>now()
+RETURNING claim_until,version,updated_at`, in.TenantID, in.DeliveryKey.DeliveryKey, in.SegmentNo, in.Version,
+		in.ClaimOwner, in.ClientRequestID, ttl.Microseconds()).Scan(&in.ClaimUntil, &in.Version, &in.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return messaging.DeliveryRecord{}, runtime.ErrVersionConflict
+	}
+	return in, err
+}
+
+func (s *Store) FinishDelivery(ctx context.Context, in messaging.DeliveryRecord, expectedVersion int64) (messaging.DeliveryRecord, error) {
+	if in.State != messaging.DeliverySent && in.State != messaging.DeliveryRetryWait && in.State != messaging.DeliveryAmbiguous && in.State != messaging.DeliveryFailed {
+		return messaging.DeliveryRecord{}, runtime.ErrCommitConflict
+	}
+	if in.NotBefore.IsZero() {
+		in.NotBefore = time.Now().UTC()
+	}
+	err := s.db.QueryRowContext(ctx, `UPDATE delivery_ledger SET provider_message_id=$4,state=$5,not_before=$6,last_error_class=$7,
+claim_owner=NULL,claim_until=NULL,version=version+1,updated_at=now()
+WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND version=$8 AND state='sending' AND claim_owner=$9 AND client_request_id=$10
+RETURNING attempt,version,updated_at`, in.TenantID, in.DeliveryKey.DeliveryKey, in.SegmentNo, nullable(in.ProviderMessageID),
+		in.State, in.NotBefore, nullable(in.LastErrorClass), expectedVersion, in.ClaimOwner, in.ClientRequestID).
+		Scan(&in.Attempt, &in.Version, &in.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return messaging.DeliveryRecord{}, runtime.ErrVersionConflict
+	}
+	in.ClaimOwner, in.ClaimUntil = "", time.Time{}
+	return in, err
+}
+
+func (s *Store) ReconcileDelivery(ctx context.Context, in messaging.DeliveryRecord, expectedVersion int64) (messaging.DeliveryRecord, error) {
+	if in.State != messaging.DeliverySent && in.State != messaging.DeliveryRetryWait && in.State != messaging.DeliveryFailed {
+		return messaging.DeliveryRecord{}, runtime.ErrCommitConflict
+	}
+	if in.NotBefore.IsZero() {
+		in.NotBefore = time.Now().UTC()
+	}
+	err := s.db.QueryRowContext(ctx, `UPDATE delivery_ledger SET provider_message_id=$4,state=$5,not_before=$6,last_error_class=$7,
+version=version+1,updated_at=now()
+WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND version=$8 AND state='ambiguous' AND client_request_id=$9
+RETURNING attempt,version,updated_at`, in.TenantID, in.DeliveryKey.DeliveryKey, in.SegmentNo, nullable(in.ProviderMessageID),
+		in.State, in.NotBefore, nullable(in.LastErrorClass), expectedVersion, in.ClientRequestID).
+		Scan(&in.Attempt, &in.Version, &in.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return messaging.DeliveryRecord{}, runtime.ErrVersionConflict
+	}
+	in.ClaimOwner, in.ClaimUntil = "", time.Time{}
+	return in, err
+}
+
+func (s *Store) DeferDeliveryReconciliation(ctx context.Context, in messaging.DeliveryRecord, expectedVersion int64) (messaging.DeliveryRecord, error) {
+	if in.State != messaging.DeliveryAmbiguous || in.ReconcileAttempt < 1 || in.NotBefore.IsZero() {
+		return messaging.DeliveryRecord{}, runtime.ErrCommitConflict
+	}
+	err := s.db.QueryRowContext(ctx, `UPDATE delivery_ledger SET reconcile_attempt=$4,not_before=$5,last_error_class=$6,
+version=version+1,updated_at=now()
+WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND version=$7 AND state='ambiguous'
+  AND client_request_id=$8 AND reconcile_attempt=$4-1
+RETURNING attempt,version,updated_at`, in.TenantID, in.DeliveryKey.DeliveryKey, in.SegmentNo, in.ReconcileAttempt,
+		in.NotBefore, nullable(in.LastErrorClass), expectedVersion, in.ClientRequestID).
+		Scan(&in.Attempt, &in.Version, &in.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return messaging.DeliveryRecord{}, runtime.ErrVersionConflict
+	}
+	return in, err
+}
 ```
 
-`client_request_id` 由 `messaging.StableDeliveryRequestID(key)` 从 `(tenant_id, delivery_key, segment_no)` 稳定推导（sha256 + base64：`"d1_" + base64.RawURLEncoding(...)`）。这就是交给下游的去重键；owner/version/state 三重条件保证不会双发（I6）。
+## 外部证据处置事务原文
 
-### 6.2 `RenewDeliveryClaim`
+```go
+package postgres
 
-```sql
-UPDATE delivery_ledger SET claim_until=now()+($7 * interval '1 microsecond'), version=version+1, updated_at=now()
-WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND version=$4 AND state='sending'
-  AND claim_owner=$5 AND client_request_id=$6 AND claim_until>now()
-RETURNING claim_until, version, updated_at;
--- 无行 → ErrVersionConflict
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"strings"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+)
+
+// DeliveryResolution requires external evidence, not a guess based on a timeout.
+// NotDelivered closes the incident; retry_not_delivered explicitly authorizes
+// retry only after the operator has established the provider did not deliver.
+type DeliveryResolution struct {
+	TenantID          string `json:"tenant_id"`
+	DeliveryKey       string `json:"delivery_key"`
+	SegmentNo         int    `json:"segment_no"`
+	ExpectedVersion   int64  `json:"expected_version"`
+	Actor             string `json:"actor"`
+	EvidenceRef       string `json:"evidence_ref"`
+	Decision          string `json:"decision"`
+	ProviderMessageID string `json:"provider_message_id"`
+}
+
+func (in DeliveryResolution) Validate() error {
+	if strings.TrimSpace(in.TenantID) == "" || strings.TrimSpace(in.DeliveryKey) == "" || in.SegmentNo < 0 || in.ExpectedVersion < 1 ||
+		strings.TrimSpace(in.Actor) == "" || len(in.Actor) > 256 || strings.TrimSpace(in.EvidenceRef) == "" || len(in.EvidenceRef) > 1024 {
+		return runtime.ErrInvalidEnvelope
+	}
+	if (in.Decision == "delivered" && strings.TrimSpace(in.ProviderMessageID) != "" && len(in.ProviderMessageID) <= 1024) ||
+		((in.Decision == "not_delivered" || in.Decision == "retry_not_delivered") && in.ProviderMessageID == "") {
+		return nil
+	}
+	return runtime.ErrInvalidEnvelope
+}
+
+// ResolveUncertainDelivery atomically closes an uncertain delivery and persists
+// the operator's evidence. A version check fences both concurrent operators and
+// the automatic reconciler. Sent deliveries can never be reopened or resent.
+func (s *Store) ResolveUncertainDelivery(ctx context.Context, in DeliveryResolution) error {
+	if err := in.Validate(); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	state, class := "sent", "operator_confirmed_delivered"
+	if in.Decision == "not_delivered" {
+		state, class = "failed", "operator_confirmed_not_delivered"
+	}
+	if in.Decision == "retry_not_delivered" {
+		state, class = "retry_wait", "operator_confirmed_not_delivered"
+	}
+	var version int64
+	err = tx.QueryRowContext(ctx, `UPDATE delivery_ledger
+SET state=$5,provider_message_id=NULLIF($6,''),last_error_class=$7,not_before=now(),version=version+1,updated_at=now()
+WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND version=$4
+AND (state='ambiguous' OR (state='failed' AND last_error_class='reconcile_exhausted'))
+RETURNING version`, in.TenantID, in.DeliveryKey, in.SegmentNo, in.ExpectedVersion, state, in.ProviderMessageID, class).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return runtime.ErrVersionConflict
+	}
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO delivery_resolution
+(tenant_id,delivery_key,segment_no,expected_version,actor,evidence_ref,decision,provider_message_id)
+VALUES($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''))`, in.TenantID, in.DeliveryKey, in.SegmentNo, in.ExpectedVersion, in.Actor, in.EvidenceRef, in.Decision, in.ProviderMessageID)
+	if err != nil {
+		return err
+	}
+	if in.Decision != "not_delivered" {
+		// The Redis entry may already have been ACKed on reconcile exhaustion.
+		// Republish the original frozen reply with its original delivery key;
+		// sent segments remain ACK-only, including the externally confirmed one.
+		var outboxID string
+		err = tx.QueryRowContext(ctx, `UPDATE outbox SET state='pending',claim_owner=NULL,claim_until=NULL,
+published_at=NULL,next_attempt_at=now(),version=version+1
+WHERE tenant_id=$1 AND kind='reply' AND idempotency_key=$2 AND state<>'claimed'
+RETURNING outbox_id`, in.TenantID, in.DeliveryKey).Scan(&outboxID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return runtime.ErrVersionConflict
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
 ```
-
-### 6.3 `FinishDelivery`
-
-允许目标 state ∈ {sent, retry_wait, ambiguous, failed}；`WHERE ... AND version=$8 AND state='sending' AND claim_owner=$9 AND client_request_id=$10`；成功即清空 owner/claim_until。
-
-### 6.4 `ReconcileDelivery` / `DeferDeliveryReconciliation`
-
-```sql
--- ReconcileDelivery: WHERE version=$8 AND state='ambiguous' AND client_request_id=$9
--- DeferDeliveryReconciliation: WHERE version=$7 AND state='ambiguous' AND client_request_id=$8 AND reconcile_attempt=$4-1
-```
-
-### 6.5 Outbox 发布的条件更新（与 Ledger 同构，五种情形）
-
-需求点名了 `Outbox` 这一机制，它同样靠**条件更新 + 超期可重领**实现可替换执行者。四条语句逐字如下：
-
-```sql
--- ① 领取：待发/到期的 pending、retry_wait，或「超期未确认的 claimed」都可被领取
-SELECT ... FROM outbox o
-WHERE kind = $1
-  AND ((state IN ('pending','retry_wait') AND next_attempt_at <= now())
-       OR (state = 'claimed' AND claim_until < now()))
-ORDER BY next_attempt_at, created_at
-FOR UPDATE SKIP LOCKED LIMIT $2;
--- 领取成功即 UPDATE: state='claimed', claim_owner=$3, claim_until=$4,
---                     version=version+1, attempt=attempt+1
-
--- ② 发布成功：乐观锁 + 状态双约束，不清空他人 claim
-UPDATE outbox SET state='published', published_at=now(),
-       claim_owner=NULL, claim_until=NULL, version=version+1
-WHERE tenant_id=$1 AND outbox_id=$2 AND version=$3 AND state='claimed';
-
--- ③ 续租：仅本人、且仍处 claimed 时可延长
-UPDATE outbox SET claim_until=$5, version=version+1
-WHERE tenant_id=$1 AND outbox_id=$2 AND version=$3 AND state='claimed' AND claim_owner=$4;
-
--- ④ 失败重试：交还 claim，安排下次尝试
-UPDATE outbox SET state='retry_wait', next_attempt_at=$4,
-       claim_owner=NULL, claim_until=NULL, version=version+1
-WHERE tenant_id=$1 AND outbox_id=$2 AND version=$3 AND state='claimed';
-
--- ⑤ 对账用：找出超期未确认的 claim
-SELECT ... FROM outbox o WHERE o.state='claimed' AND o.claim_until < $1;
-```
-
-**可达状态与不可达状态（实现事实，勿误设告警）：**
-
-| 状态 | dispatch / reply / wakeup 事件是否可达 | 说明 |
-|---|---|---|
-| `pending` | ✅ | 刚由 `commit_turn` 事务写入的初始态 |
-| `claimed` | ✅ | 被某个 relay 领取；`claim_until` 超期后可被重新领取（这就是 relay 崩溃的接管路径） |
-| `retry_wait` | ✅ | 发布失败，等 `next_attempt_at` 到期再领；**重试耗尽表现为长期停留在此态**（`attempt` 持续增长） |
-| `published` | ✅ | 终态，不再重发 |
-| `dead_letter` | ❌ **通用 relay 不会写入** | 该值存在于 `outbox.state` 的 CHECK 约束、并被指标与审计保留策略使用，但通用发布循环只写 `published` 或 `retry_wait`。运维**不应**在 dispatch/reply 上等待它出现 |
-
-**为什么不加锁：** relay 是**可替换执行者**——崩溃后无需任何解锁动作，`claim_until` 到期即可被别人领取。若改为"先加锁再发布"，就必须额外处理"锁持有者死亡后谁释放"，反而引入新的故障模式。
-
-> 相关实现（可选核对）：`trpcservice/storage/messaging/postgres/store.go`（claim / `MarkPublished` / 续租 / `MarkRetryWait` / 超期 claim 查询）、`trpcservice/relay/base.go`（主循环调用顺序）、`trpcservice/storage/messaging/messaging.go`（`OutboxState` 常量与 `OutboxStore` 接口）。
-> 逐句走读版见 `conversation-continuity/implementation-walkthrough.md` §8.1（含状态机图与"为什么顺序即策略"）。
-
----
-
-## 7. 配置全表（本子系统实际使用的环境变量）
-
-| 变量 | 作用 | 默认 / 约束 |
-|---|---|---|
-| `TRPC_WEBUI_LOCAL_INSTANCE_ID` | 部署槽位身份 | N1/N2 必须不同 |
-| （进程内）`ProcessStartID` | 每次启动随机 8 字节 hex | 不可配置，自动生成 |
-| `TRPC_POSTGRES_DSN` | 业务权威库 | 两节点必须相同 |
-| `TRPC_REDIS_ADDRESS` | 队列与协调 | 两节点必须相同 |
-| `TRPC_LISTEN_ADDRESS` | 监听地址 | 默认 `:8080` |
-| `TRPC_WECOM_LOCAL_ENABLED` | 主 Bot | `true` |
-| `TRPC_WECOM_SECONDARY_LOCAL_ENABLED` | 第二 Bot | `true` 且 `(Corp ID, Agent ID)` 必须不同 |
-| 主 Bot：`WECOM_CORP_ID`、`WECOM_AGENT_ID`、`WECOM_APP_SECRET`、`WECOM_CALLBACK_TOKEN`、`WECOM_ENCODING_AES_KEY` | 主 Bot 凭据 | 缺失即启动失败 |
-| 次 Bot：`WECOM_SECONDARY_CORP_ID`、`WECOM_SECONDARY_AGENT_ID`、`WECOM_SECONDARY_APP_SECRET`、`WECOM_SECONDARY_CALLBACK_TOKEN`、`WECOM_SECONDARY_ENCODING_AES_KEY` | 第二 Bot 凭据 | 任一缺失 → `incomplete`；(Corp ID, Agent ID) 与主 Bot 相同 → `incompatible` |
-| `TRPC_WECOM_HA_ENTRY_BACKENDS` | 入口后端 | ≥2，http，去重 |
-| `TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL` | 探测周期 | 默认 1s，[100ms, 1m] |
-| `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED` | 注册 P1–P4 测试控制面 | `true` 仅用于 `webui-multinode` 演练 |
-| `TRPC_WEBUI_LOCAL_TOKEN` / `X-TRPC-Local-Token` | 控制面鉴权 | 仅本地演练 |
-| `TRPC_WECOM_REAL_ACCEPTANCE` | 真实 WeCom 验收状态 | `assumed`（默认）/ `recorded` |
-
-worker consumer **代码级兜底默认**（仅当调用方未设置时生效）：`LeaseTTL` 5s（≤0 时）、`RetryWait` 10ms、`RenewInterval = LeaseTTL/3`、`ReclaimInterval` 1s、`ReclaimLimit` 100、`DrainTimeout` 30s。
-**`webui-local` 的实际装配值**（部署生效值，文档与告警阈值一律引用这一列）：`LeaseTTL` 30s、`RenewInterval` 10s、`RetryWait` 250ms、`ReclaimInterval` 5s、`ReclaimLimit` 100、`DrainTimeout` 30s。
-delivery 重试装配值：`MaxAttempts` 8、`MaxReconcileAttempts` 8、`DefaultRetryDelay` 1s、`MaxRetryDelay` 1min、`ClaimTTL` 30s、`ClaimRenewInterval` 10s；指数退避 `1<<(attempt-1)`，上限 `MaxRetryDelay`。
-
----
-
-## 8. 端到端复现步骤（可照抄）
-
-前置：docker / docker compose v2 / curl；密钥文件 `deploy/compose/secrets/deepseek-api-key`、`deploy/compose/secrets/wecom.env` 存在且非空。
-
-```bash
-# 1) 拉起隔离 compose 项目（profile wecom-ha-local），注入 barrier
-TRPC_INFLIGHT_TENANT_ID=<tenant-a-id> \
-  bash scripts/e2e/inflight-takeover.sh p2
-
-# 脚本以 webui-multinode profile 隔离启动；该 profile 已启用
-# TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true。脚本经受保护 endpoint arm node-a 的 point：
-# POST /test/failover/<p1|p2|p3|p4>/arm
-# docker compose --project-name <random> -f deploy/compose/docker-compose.local.yml --profile webui-multinode up --detach --build
-```
-
-2. 脚本 `wait_http` 等两节点 `/readyz`（`node-a` 端口 `${TRPC_LOCAL_WECOM_HA_NODE_A_PORT:-58088}`，`node-b` 端口 `${TRPC_LOCAL_WECOM_HA_NODE_B_PORT:-58089}`）。
-3. 提示「现在通过选定的 Bot 发送一条新的、带唯一标记的消息」。
-4. `wait_barrier_hit` 轮询两节点 `/statusz`，匹配 `"enabled":true` + `"point":"<point>_"` + `"hit":true` → 确定 victim/survivor。
-5. `docker kill --signal=KILL <victim_container>` 强杀。
-6. 断言 survivor `/readyz` 仍可用；`docker inspect` 断言 victim `State.Running == false`。
-7. 等待 survivor 对同一 WebUI 用户/会话返回包含原 `external_message_id` 的结果；不调用 release，也不修改任何任务或投递状态。
-
-脚本参数只有 point（`p1|p2|p3|p4`）；`TRPC_WEBUI_LOCAL_TOKEN` 和 `TRPC_WEBUI_LOCAL_ROUTE_KEY` 可覆盖本地鉴权/路由，`TRPC_LOCAL_MULTINODE_NODE_A_PORT`、`...NODE_B_PORT` 可覆盖随机观测端口。cleanup 仅销毁自创 Compose 项目和 volumes。
-
----
-
-## 9. 验证清单（脚本逐条解释对应）
-
-| 步骤 | 检查项 | 通过证据 |
-|---|---|---|
-| 基线 | 两节点 `/readyz` 200 | curl 成功 |
-| 命中 | `/statusz` 报 `enabled/hit` | `wait_barrier_hit` 输出 JSON |
-| 强杀 | victim `State.Running==false` | `docker inspect` |
-| 存活 | survivor `/readyz` 200 | curl 成功 |
-| 接管 | node-b 对同一原 message id 产生回复 | WebUI replies 查询成功 |
-| 业务 | 同 `request_id` 完成 terminal + 最终回复一次 | inbox/execution_record/session_commit/delivery_ledger 行（见 testing-and-acceptance.md 证据字段） |
-
-**三计数核对（必做）：**
-- 模型调用次数：P2 允许 >1，不落库，由执行重试驱动；
-- 任务尝试次数：`execution_record.park_attempt` / `delivery_ledger.attempt`；
-- 最终回复次数：`delivery_ledger` 每 segment 一行，`state='sent'` 后只许 ACK，不许重发。
-
-**反例（任一即判定不通过）：** 超时、原消息丢失、串 tenant/session、旧 fence 迟到提交成功、同一 segment 出现两次 `sent`、必须手工重新入队才完成、把 Provider 无法去重的 P4 写成恰好一次。
-
----
-
-## 10. 工具调用执行中崩溃：记录边界、恢复动作与核对方法
-
-本节回答一个高频误解：**Bot 正在执行工具调用时节点挂了，这次工具执行的记录保住了吗？接管后会不会接着跑没跑完的工具调用？** 前置结论见 [FULL-GUIDE.md](./FULL-GUIDE.md) §4.5，本节给可直接照抄的实现材料。
-
-### 10.1 先厘清两个极易混淆的表族
-
-| 表族 | 表名 | 键 | 谁写 | 用途 |
-|---|---|---|---|---|
-| **官方会话后端（SDK）** | `session_states`、`session_events`、`session_track_events`、`session_summaries`、`app_states`、`user_states` | `(app_name, user_id, session_id)`，其中 `app_name = tenantID + "/" + agentAppID` | `trpc-agent-go/session/postgres` 服务；表由平台迁移创建（`WithSkipDBInit(true)`），写为**同步**（`WithEnableAsyncPersist(false)`） | **对话历史（模型上下文）的唯一权威** |
-| **平台协作** | `session_head`、`session_commit`、`session_event`（**单数**）、`execution_record`、`inbox`、`outbox`、`delivery_ledger`、`tool_attempt`、`tool_result_payload` … | `(tenant_id, agent_app_id, session_id)` | 平台 plpgsql 函数与应用代码 | fence / 序号 / 终态 / 幂等 / 投递 / 工具账本 |
-
-> **单复数必须区分。** 转写是 `session_events`（复数，SDK 表）；`session_event`（单数，平台表）只在调用方显式传入 events 时由 `commit_turn` 写入——生产 durable turn 在 `BufferedTurn.Commit` 中显式把 `Events`/`StateDelta`/`SummaryCandidate` 置 nil（注释原文：避免重建"第二个会话真相源"），因此该路径下平台 `session_event` 不产生新行，`LoadSession` 也没有生产调用方，`session_event_unpack_payload` 触发器只作用于该平台表。**"接管后上下文从哪来"的正确答案是：官方会话后端的 `session_events`。**
-
-### 10.2 哪些事件会进入转写（框架判定式）
-
-```text
-persist := len(StateDelta) > 0 || (Response != nil && !Response.IsPartial && Response.IsValidContent())
-IsValidContent := IsToolCallResponse() || IsToolResultResponse() || 任一 choice 的 Message/Delta 含 payload
-```
-
-| 事件 | 是否写入转写 | 说明 |
-|---|---|---|
-| 用户消息 | ✅ | 框架在**每次** `Run` 时都会把传入消息追加为一条新事件（`appendIncomingMessage`）→ 重跑一轮会留下第二条同内容用户消息 |
-| assistant 的工具调用消息 | ✅ | `IsToolCallResponse()` 为真；**在工具开始执行之前**写入（见 §10.3） |
-| 工具结果消息 | ✅ | 工具返回后写入；返回前不存在 |
-| 流式 partial 输出 | ❌ | `IsPartial` 为真直接跳过 |
-| 纯 TextDelta 状态更新 | ✅ | `StateDelta` 非空即写 |
-
-### 10.3 顺序证据：为什么"模型请求调用哪个工具"先于工具执行落库
-
-框架的 LLM 流处理顺序为：`emitLLMResponse(...)`（发出含 `tool_calls` 的响应事件）→ 事件循环 `handleEventPersistence` → `sessionService.AppendEvent` → **之后**才 `postprocess...` 由响应处理器执行工具。因此崩溃在工具函数体内时，转写里**已经**存在那条 tool_call——这是本窗口唯一与工具相关的 durable 记录。
-
-### 10.4 悬挂工具调用的清洗规则（框架行为，逐字文案）
-
-构造下一次模型请求前，框架会清洗历史中的非法/孤立工具消息。对"有 tool_call、无配对 tool_result"的助手消息，降级为 **user 角色**文本并清空 `ToolCalls`：
-
-````text
-[orphan_tool_call] Tool call was downgraded to a user message because no matching tool result exists.
-name: <工具名>
-id: <调用 ID>
-arguments:
-<参数原文>
-````
-
-同类标签还有 `[orphan_tool_result]`、`[invalid_tool_call]`、`[invalid_tool_result]`。作用：既不破坏上游 provider 对"assistant tool_call 必须有配对 tool 结果"的校验要求，又把事实以文本形式交给模型判断。
-
-### 10.5 `ask` 工具为何不重跑（执行顺序与接管分支）
-
-```text
-GuardedCallable.Call 顺序：
-1) 校验 execution context（tenant / policyVersion / grantID / grantVersion / toolCallID / argsDigest / payloadKeyVersion）
-2) ConsumeGrant：confirmation_grant available→consumed(version+1)
-                 + INSERT tool_attempt(state='effect_unknown')
-                 + confirmation approved→consumed + audit outbox      ← 同一事务
-3) Inner.Call(args)                                                   ← 外部副作用发生在这里
-4) 失败 → FinishToolAttempt(failed)
-5) 成功 → PutToolResult(加密) → FinishToolAttempt(succeeded, resultRef)
-```
-
-接管时（终态未提交的重放路径）：
-
-```text
-confirmation = approved                        → 仍可执行（授权尚未消费，无外部效果）
-confirmation = consumed：
-    tool_attempt.state = 'failed'              → commitContinuationFailure(ReasonToolAttemptFailed)
-    state = 'effect_unknown' | 'succeeded'     → GetToolResult(...)
-          读得到                                → 采用该结果（effect_unknown 升级为 succeeded），不重跑
-          读不到                                → commitContinuationFailure(ReasonToolEffectUnknown)，诚实终结，不重跑
-```
-
-对 `allow` 工具没有这套账本：接管后以同一输入重开一轮，模型重新决策，工具可能被再次调用（从函数入口重新执行）。**因此有副作用的工具必须自带业务幂等键。**
-
-**Graph checkpoint 为什么也救不了自动接管（两层原因，均已核对实现）：**
-
-```text
-① 平台侧：resume 坐标只在 continuation != nil（人工确认续跑）时传入
-            runner.go:444-457  →  graph.CfgKeyLineageID / CfgKeyCheckpointID / CfgKeyCheckpointNS + graph.ResumeCommand
-            自动接管路径 continuation == nil，不带任何 resume 坐标
-② 框架侧：即使想查也查不到
-            graph/executor.go:553-558
-              lineageID := initialState[CfgKeyLineageID]  （未提供时）
-                        → invocation.InvocationID
-                        → lineage_<UnixNano>
-            agent.NewInvocation 每次 Run 都生成新的 invocation uuid
-            ⇒ 重跑落在全新 lineage；checkpointredis 的键按 lineage 摘要隔离 → 查不到上次检查点
-```
-
-结论：**工具级/步骤级"断点续跑"在本系统中没有实现**；实现的是"一轮（一个 `input_seq`）被接管并推进到唯一终态"。需要真正的步骤级续跑时，必须由调用方提供**稳定 lineage**与 resume 坐标，属于未接线项。
-
-### 10.6 核对 SQL（演练与验收直接可用）
-
-```sql
--- ① 转写里是否留下本轮的工具调用（有 tool_calls 的 assistant 消息）
-SELECT id, created_at, event->'choices'->0->'message'->'tool_calls' AS tool_calls
-FROM session_events
-WHERE app_name = $1 AND user_id = $2 AND session_id = $3
-  AND event->'choices'->0->'message'->'tool_calls' IS NOT NULL
-ORDER BY id;
-
--- ② ask 工具是否停在"效果不确定"
-SELECT grant_id, tool_call_id, state, result_ref, updated_at
-FROM tool_attempt WHERE tenant_id = $1 AND request_id = $2;
-
--- ③ ask 工具的结果是否已加密落库
-SELECT grant_id, result_ref, content_digest, key_version, created_at
-FROM tool_result_payload WHERE tenant_id = $1 AND request_id = $2;
-```
-
-### 10.7 复现与观测要点
-
-- **演练脚本停不到这个位置**：`p2` barrier 停在"模型与工具都跑完、结果尚未提交"，是确定性的 P2 边界。要复现"工具函数体内被杀"，须让被测工具自身阻塞（长 sleep 或等待外部信号），再对节点 `docker kill --signal=KILL`。
-- 判定三件事即可：① `session_events` 中存在该 tool_call 事件（用 §10.6 ①）；② 不存在 `tool_attempt`（`allow`）或停在 `effect_unknown`（`ask`）；③ 接管节点取得更高 fence 后重跑，最终只有一行终态 `session_commit`、每 segment 至多一行 `sent`。
-- **不要**把"工具只执行了一次"作为验收项：`allow` 路径不承诺该性质；应改为验收"外部系统按业务幂等键只有一个业务效果"。
-
-## 11. 当前实现增量：`tool_execution` 恢复协议
-
-迁移 `000002_tool_execution_recovery.up.sql` 增加 `tool_execution(tenant_id,request_id,tool_call_id)`；其不可变输入为 tool/version、args digest、recovery policy 和 idempotency key。`Claim` 的 SQL 只允许首次插入或接管过期 `running` lease，并递增 attempt/fence。工具接口为 `RecoveryDescriptor`（策略+稳定 key），可查询工具另实现 `RecoveryQuerier`。已消费 Grant 的恢复不得再次 `ConsumeGrant`；仅当 tool attempt/request/tool call 一致且仍为 `effect_unknown` 时执行策略化恢复。
-
-当前内置 `webui_create_note` 是 `idempotent_key` 工具。新外部工具未声明恢复契约时默认 `manual`，故障后不会自动重放。

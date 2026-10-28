@@ -1,332 +1,527 @@
 # 在途任务接管与幂等投递 — 设计文档
 
-> 本文给出本能力的结构与时序。自足复现材料（DDL / Redis Lua / CAS SQL）见 [REFERENCE-IMPLEMENTATION.md](./REFERENCE-IMPLEMENTATION.md)。
+## 数据层权威与事务边界
 
----
+下表逐字段来自当前迁移，包含默认值、空值和表内约束；唯一键、外键和索引随表列出。DDL 原文位于 REFERENCE-IMPLEMENTATION，直观阅读优先使用这些表格。
 
-## 一、总体架构
+官方 SDK `session_events` 保存聊天转写，`app_name=tenant_id + "/" + agent_app_id`，配合 user_id/session_id。平台 `session_head/session_commit` 保存顺序、fence、终态和 Outbox 协调。SDK 同步持久化与平台 terminal 事务是两个边界：平台 Rollback 不撤销已写的 SDK 事件，故障重跑可留下重复输入或孤立工具调用痕迹；不能把“一个 terminal commit”写成“所有聊天事件一次且全原子”。
 
-```text
-                WeCom / 平台 callback
-                        │
-                        ▼
-   ┌──────────────────────────────────────────────────────────┐
-   │  ingress (route→binding→verify) → claim_inbox (F1)         │
-   │       │ durable inbox + inbound_payload                     │
-   │       ▼                                                    │
-   │  preprocess worker: ClaimJobs → preprocess →               │
-   │       ClaimReadyForDispatch → dispatch() ──[P1]──▶ Dispatch│
-   └──────────────────────────────────────────────────────────┘
-                        │  execution_record (F2, queued)
-                        ▼
-   ┌──────────────────────────────────────────────────────────┐
-   │  worker consumer: Consume/Reclaim → acquire lease(fence)    │
-   │       │ ExecuteWithLease → model/tool → renderOutbound      │
-   │       └──[P2]──▶ PutResult + beforeCommit + commit_turn(F3) │
-   │                  (session_commit/session_head/reply outbox   │
-   │                   + reply outbox 单事务)                     │
-   └──────────────────────────────────────────────────────────┘
-                        │  outbox (kind='reply', pending)
-                        ▼
-   ┌──────────────────────────────────────────────────────────┐
-   │  relay: scan unpublished reply outbox → account queue       │
-   │  delivery consumer: Deliver() → 分片                        │
-   │       └── ClaimDelivery [P3] ──▶ adapter.Deliver ──[P4]──▶  │
-   │           FinishDelivery(sent)  (F4→F5)                     │
-   │           失败/未知 → retry_wait / ambiguous / reconcile     │
-   └──────────────────────────────────────────────────────────┘
-```
+状态表都带 tenant；有意复用基础设施不会改变租户作用域。payload/result/tool result 使用租户密钥版本，解密及摘要校验失败拒绝恢复。
 
-权威存储边界：
-
-| 边界 | 权威存储 | 恢复方式 |
-|---|---|---|
-| 输入接收 | PostgreSQL `inbox` | provider 重试或 Outbox relay 重放 |
-| 任务 transport | Redis Stream pending | consumer group reclaim |
-| 执行权 | Redis lease + PostgreSQL `session_head.last_fence` | TTL 后新 owner acquire，数据库拒绝旧 fence |
-| terminal result | PostgreSQL session/result/reply outbox | 不重跑已提交的 execution |
-| 下游投递 | PostgreSQL `delivery_ledger` + reply stream | claim TTL/retry/reconcile |
-
----
-
-## 二、消息生命周期状态机
-
-### 2.1 主链路状态
+## 事务职责图
 
 ```mermaid
-stateDiagram-v2
-    [*] --> preprocess_pending: claim_inbox
-    preprocess_pending --> dispatch_pending: preprocess 校验
-    dispatch_pending --> dispatch_ready: ClaimReadyForDispatch→dispatch→prepare_dispatch
-    dispatch_ready --> terminal: tenant 非 active
-    dispatch_ready --> running: worker acquire lease
-    running --> waiting_confirmation: 需确认
-    running --> succeeded: commit_turn(F3)
-    running --> denied: commit_turn
-    running --> failed: commit_turn
-    running --> cancelled: commit_turn
-    running --> confirmation_denied: commit_turn
-    running --> confirmation_timeout: commit_turn
-    succeeded --> [*]: reply outbox 已发
+flowchart TD
+  A[持久化输入和预处理工作] --> B[prepare_dispatch 分配顺序和 dispatch Outbox]
+  B --> C[Worker 获得会话 lease 和 fence]
+  C --> T[tool_execution / tool_execution_result 原子成功]
+  T --> F[result_payload 冻结]
+  C --> F
+  F --> S[commit_turn: terminal + head + execution + reply Outbox]
+  S --> O[Relay 发布 reply event]
+  O --> L[Ledger 分段 claim]
+  L --> P[外部渠道接受]
+  P --> X[Ledger sent 条件提交]
 ```
 
-### 2.2 Inbox 状态（`inbox.state` CHECK）
+工具业务效果、工具结果事务、SDK 会话事件、冻结最终结果、terminal/Outbox 和外部发送分别存在独立故障窗口。图上不能把所有箭头解释为一个数据库事务。
 
-```text
-preprocess_pending ──▶ dispatch_pending ──▶ dispatch_ready ──▶ terminal
-```
+### `preprocess_job`
 
-`terminal` 行携带 `terminal_reason`（tenant 非 active 时的 tenant status，或 dispatch 拒绝原因）。`prepare_dispatch` 对 `dispatch_ready` 直接返回既有 `input_seq` + `accepted=true`；对 `terminal` 返回 `accepted=false` + `terminal_reason`。
-
-### 2.3 Execution 状态（`execution_record.outcome` CHECK）
-
-```text
-queued → running → pending → (succeeded|denied|failed|cancelled|confirmation_denied|confirmation_timeout)
-                 ↘ blocked (park 用尽/超时)
-```
-
-`pending` 是 `park_execution` 把尚未轮到的输入「停放」的状态（见 §四）。终态集合在 SQL 中字面为：
-`('succeeded','denied','failed','cancelled','confirmation_denied','confirmation_timeout')`。
-
-### 2.4 Delivery Ledger 状态（`delivery_ledger.state` CHECK）
-
-```text
-pending ──▶ sending ──▶ sent
-   │            │
-   │            └──▶ ambiguous ──▶ (reconcile) ──▶ sent | retry_wait
-   └──▶ retry_wait ──▶ (not_before 到期) ──▶ sending
-                    ambiguous ──▶ failed (reconcile_exhausted)
-```
-
-`CHECK` 约束：`state='sending'` 时 `claim_owner/claim_until` 必须非空；非 sending 时必须为空。这是「不会双发」的数据库层保证（不变量 I6）。
-
----
-
-## 三、四个故障窗口的数据边界
-
-每个窗口的「已持久化 / 未持久化」分界线，决定正确恢复动作：
-
-| 窗口 | 已落库（存活节点可见） | 未落库（随进程死亡丢失） | 接管动作 |
-|---|---|---|---|
-| P1 | `inbox`(F1) + `preprocess_job`(ready) | 尚未创建 `execution_record` | 扫描 ready job 继续 dispatch |
-| P2 | `execution_record`(running) + lease(redis) + Redis stream pending | 模型中间态、render 结果、result_payload | reclaim + 新 fence 重跑，只一个 terminal commit |
-| P3 | `session_commit`(终态) + `session_head` 推进 + reply outbox(claimed) + `result_payload` | reply event 尚未发布，adapter 尚未调用 | relay 重领 outbox 并发布同一 event |
-| P4 | `delivery_ledger`(sending) + 稳定 `client_request_id` | provider 尚未调用 | claim 接管后安全调用；调用后未知结果才走下游去重/对账 |
-
-> 关键洞察：P1/P2 的「半成品」在 PostgreSQL，进程死亡后存活节点能发现；P3/P4 的「半成品」在 ledger/outbox，同样可发现。所有窗口都不依赖进程内存状态——这正是本设计能接管的前提。
-
----
-
-## 四、任务租约与执行权回收设计
-
-### 4.1 三个数字
-
-- **lease（Redis）**：`trpc:{env}:{tag}:lease`，value = `workerID|leaseID|fence`，TTL 由 `LeaseTTL` 控制（`webui-local` 装配值 30s；组件兜底默认仅在其 ≤0 时退化为 5s）。
-- **fence（Redis 计数器）**：`trpc:{env}:{tag}:fence`，`Acquire` 时 `INCR`，单调递增。
-- **last_fence（PostgreSQL）**：`session_head.last_fence`，每次 `commit_turn` 用 `GREATEST(last_fence, fence)` 推进。
-
-### 4.2 为什么需要三道防线
-
-```text
-renew 失败 ──▶ markLeaseLost() ──▶ cancelExecution ──▶ 不 ACK
-lease 过期 ──▶ N2 acquire higher fence ──▶ 重试/续处理
-N1 迟到 commit ──▶ commit_turn 校验 p_fence < last_fence ──▶ stale fence ──▶ no state change
-```
-
-1. **Redis lease TTL**：进程存活时靠续租（间隔 `RenewInterval = LeaseTTL/3`）保活；进程被 SIGKILL 后 TTL 自然过期，锁自动释放。
-2. **Redis fence 单调**：保证后 acquire 的 owner 一定拿到更大 fence。
-3. **PostgreSQL last_fence**：最终防线。即使 Redis 重启导致 fence 计数归零，`EnsureFenceAtLeast(key, persistedFence)` 会用持久化 `last_fence` 校准，避免 fence 倒退让旧 owner 翻案。
-
-### 4.3 acquire / renew / release 语义（Redis Lua）
-
-```lua
--- acquire: 仅当 lease 不存在才成功，并 INCR fence
-if redis.call('EXISTS', KEYS[1]) == 1 then return {0, '0'} end
-redis.call('INCR', KEYS[2])
-local fence = redis.call('GET', KEYS[2])
-redis.call('PSETEX', KEYS[1], ARGV[3], ARGV[1]..'|'..ARGV[2]..'|'..fence)
-return {1, fence}
-
--- renew: 整体值串比对，匹配才续期
-if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-redis.call('PEXPIRE', KEYS[1], ARGV[2]); return 1
-
--- release: 整体值串比对，匹配才删除
-if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
-return redis.call('DEL', KEYS[1])
-```
-
-`acquire` 冲突返回 `runtime.ErrVersionConflict`；fence 解析失败/为 0 → `ErrInvariantViolation`。`workerID` 不得为空、不得含 `|`。
-
-### 4.4 park_execution：尚未轮到的输入
-
-`park_execution(p_tenant_id, p_request_id, p_input_seq, p_base_delay_seconds, p_max_delay_seconds, p_deadline_seconds, p_max_attempts)` 处理 `ErrInputNotReady`：当 `p_input_seq < next_input_seq` 时，必须存在对应终态 `session_commit` 才返回 `terminal`（否则 `XX001`）；当 `p_input_seq = next_input_seq` 返回 `ready`；否则按指数退避停放（`pending` + `not_before`），用尽 `p_max_attempts`(≤64) 或超 `deadline` 转 `blocked`。这把「输入序号尚未轮到」安全停放，不丢任务、不误提交。
-
----
-
-## 五、Outbox / Ledger 设计
-
-### 5.1 Transactional Outbox（F3↔F4 解耦）
-
-`commit_turn` 在单事务写入 `session_commit` + `session_head` + `outbox`（`kind='reply'`，`idempotency_key = format('%s:%s', kind, idempotency_key)`）。**注意**：`p_events` 在生产 durable turn 中为 null（`BufferedTurn.Commit` 置 nil），会话转写由官方会话后端 `session_events` 持有，故不要从平台 `session_event` 找历史（见本包 [REFERENCE-IMPLEMENTATION.md](REFERENCE-IMPLEMENTATION.md) 的会话与 DDL 章节）。outbox 行带 `ON CONFLICT ON CONSTRAINT outbox_tenant_id_kind_idempotency_key_key DO NOTHING`，保证 replay 收敛不报错。
-
-relay 至少一次发布：`ClaimOutbox(kind,state='pending') → 发布 → MarkPublished`。发布失败则 `MarkRetry`（回到 `retry_wait` + `next_attempt_at`），由扫描补发。
-
-### 5.2 Delivery Ledger（F4↔F5 防双发）
-
-`ClaimDelivery` 的核心 CAS 逻辑（逐字语义，见 [REFERENCE-IMPLEMENTATION.md](./REFERENCE-IMPLEMENTATION.md) §Ledger CAS）：
-
-1. 先把 `state='sending' AND claim_until<=now()` 的旧 claim 置 `ambiguous`/`owner_lost`（回收超时 owner）；
-2. `INSERT ... ON CONFLICT (tenant_id,delivery_key,segment_no) DO UPDATE SET state='sending', attempt=attempt+1 ... WHERE state IN ('pending','retry_wait') AND not_before<=now() AND renderer_version/format_version/content_digest/segment_count/client_request_id 全部匹配`；
-3. 无行返回 → `GetDelivery`；若 `Plan != plan` → `ErrIdempotencyCollision`。
-
-`FinishDelivery` 只允许从 `state='sending' AND claim_owner=$owner AND client_request_id=$id` 转换到目标态，成功即清空 owner/claim_until。`RenewDeliveryClaim` 用 `version=$4 AND state='sending' AND claim_owner=$5 AND client_request_id=$6 AND claim_until>now()` 三重条件，失败即 `ErrVersionConflict`（不变量 I6）。
-
-### 5.3 三计数如何落到表
-
-| 计数 | 字段 | 递增时机 |
+| 字段 | 类型、默认值与空值约束 | 直观用途 |
 |---|---|---|
-| 模型调用次数 | （不落库） | 每次 `ExecuteWithLease` 重跑模型 |
-| 任务尝试次数 | `execution_record.park_attempt` | `park_execution` 每次 `attempt = park_attempt+1` |
-| 任务尝试次数 | `delivery_ledger.attempt` | `ClaimDelivery` 冲突更新 `attempt=attempt+1` |
-| 最终回复次数 | `delivery_ledger` 每 segment 一行 | `state='sent'` 后不可重发，只 ACK |
+| `tenant_id` | `text NOT NULL` | 租户强制边界 |
+| `request_id` | `text NOT NULL` | 内部原始输入身份 |
+| `job_id` | `text NOT NULL` | 预处理工作身份；与租户一起构成主键 |
+| `tenant_version` | `bigint NOT NULL` | 受理时固定的租户配置版本 |
+| `agent_app_id` | `text NOT NULL` | 租户内 agent 应用 |
+| `session_id` | `text NOT NULL` | 原会话身份 |
+| `user_id` | `text NOT NULL` | 租户作用域用户 |
+| `channel` | `text NOT NULL` | 渠道类型 |
+| `payload_ref` | `text NOT NULL` | 持久化内容引用 |
+| `traceparent` | `text DEFAULT ''::text NOT NULL` | 跨异步边界传播的追踪上下文，不承载业务权限 |
+| `state` | `text DEFAULT 'pending'::text NOT NULL` | 本层状态；与其他表状态不能混用 |
+| `attempt` | `integer DEFAULT 0 NOT NULL` | 领取/发送尝试次数 |
+| `lease_owner` | `text` | 当前工具/job owner |
+| `lease_until` | `timestamp with time zone` | owner 到期时间（数据库时间） |
+| `not_before` | `timestamp with time zone DEFAULT now() NOT NULL` | 允许下一次处理时间 |
+| `reject_reason` | `text DEFAULT ''::text NOT NULL` | 预处理拒绝原因，进入拒绝结果时记录 |
+| `dispatched_at` | `timestamp with time zone` | 完成dispatch的时刻；为空表示仍需调度 |
+| `version` | `bigint DEFAULT 0 NOT NULL` | 乐观并发版本 |
+| `created_at` | `timestamp with time zone DEFAULT now() NOT NULL` | 创建审计时间 |
+| `updated_at` | `timestamp with time zone DEFAULT now() NOT NULL` | 最近更新审计时间 |
+| `prepared_payload_ref` | `text DEFAULT ''::text NOT NULL` | 预处理结果引用 |
+| `channel_binding_id` | `text NOT NULL` | 冻结 Bot Binding |
+| `config_version` | `bigint NOT NULL` | 绑定的配置版本 |
 
----
+表内约束：
 
-## 六、时序图
+- `CONSTRAINT preprocess_job_attempt_check CHECK ((attempt >= 0))`
+- `CONSTRAINT preprocess_job_check CHECK ((((lease_owner IS NULL) AND (lease_until IS NULL) AND (state <> 'running'::text)) OR ((lease_owner IS NOT NULL) AND (lease_until IS NOT NULL) AND (state = ANY (ARRAY['running'::text, 'ready'::text])))))`
+- `CONSTRAINT preprocess_job_check1 CHECK (((dispatched_at IS NULL) OR (state = 'ready'::text)))`
+- `CONSTRAINT preprocess_job_config_version_check CHECK ((config_version >= 1))`
+- `CONSTRAINT preprocess_job_prepared_ref_complete CHECK ((((state <> 'ready'::text) AND (prepared_payload_ref = ''::text)) OR ((state = 'ready'::text) AND ((prepared_payload_ref = ''::text) OR (length(btrim(prepared_payload_ref)) > 0)))))`
+- `CONSTRAINT preprocess_job_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'running'::text, 'ready'::text, 'rejected'::text, 'retry_wait'::text])))`
+- `CONSTRAINT preprocess_job_tenant_version_check CHECK ((tenant_version >= 1))`
+- `CONSTRAINT preprocess_job_version_check CHECK ((version >= 0))`
 
-### 6.1 P2 接管（最典型）
+主键/唯一键/外键见参考实现对应 DDL；主要约束：
 
-```mermaid
-sequenceDiagram
-    participant U as 用户
-    participant N1 as Worker N1
-    participant R as Redis(lease/fence)
-    participant DB as PostgreSQL
-    participant N2 as Worker N2
+- `ALTER TABLE ONLY public.preprocess_job     ADD CONSTRAINT preprocess_job_pkey PRIMARY KEY (tenant_id, job_id);`
+- `ALTER TABLE ONLY public.preprocess_job     ADD CONSTRAINT preprocess_job_tenant_id_request_id_key UNIQUE (tenant_id, request_id);`
+- `ALTER TABLE ONLY public.preprocess_job     ADD CONSTRAINT preprocess_job_channel_binding_fk FOREIGN KEY (tenant_id, config_version, channel_binding_id) REFERENCES public.channel_binding(tenant_id, config_version, binding_id);`
+- `ALTER TABLE ONLY public.preprocess_job     ADD CONSTRAINT preprocess_job_tenant_id_request_id_fkey FOREIGN KEY (tenant_id, request_id) REFERENCES public.inbox(tenant_id, request_id);`
 
-    U->>N1: 原消息入队
-    N1->>DB: inbox/execution_record(F1,F2)
-    N1->>R: Acquire → fence=5
-    N1->>N1: 模型调用 [#模型次数=1]
-    Note over N1: [P2 barrier 命中] 强杀
-    N1--xR: lease 停止续期
-    R->>R: TTL 过期
-    N2->>R: Reclaim 同 entry
-    N2->>DB: ReadLastFence → last_fence=5
-    N2->>R: EnsureFenceAtLeast(5) → Acquire → fence=6
-    N2->>N2: 模型调用 [#模型次数=2]
-    N2->>DB: commit_turn(fence=6) → 成功, last_fence=6
-    N1-->>DB: commit_turn(fence=5)
-    DB-->>N1: stale fence (40001) → 拒绝
-    N2->>DB: reply outbox → Delivery → sent(F5)
-```
+索引：
 
-### 6.2 P4 不确定投递
+- `CREATE INDEX preprocess_job_claim_idx ON public.preprocess_job USING btree (state, not_before, lease_until, created_at);`
+- `CREATE INDEX preprocess_job_ready_idx ON public.preprocess_job USING btree (created_at) WHERE ((state = 'ready'::text) AND (dispatched_at IS NULL));`
 
-```mermaid
-sequenceDiagram
-    participant D as Delivery owner
-    participant L as delivery_ledger
-    participant P as Provider
 
-    D->>L: ClaimDelivery(sending, attempt+1)
-    D->>P: Deliver(client_request_id)
-    Note over D: [P4 barrier 命中] 强杀（provider 调用前）
-    D->>P: Deliver(client_request_id)
-    P-->>D: 200 + provider_message_id
-    D--xL: state 停在 sending, claim_until 过期
-    Note over L: 存活 delivery 扫描
-    D2->>L: ClaimDelivery → 旧 sending 置 ambiguous/owner_lost → 重新 claim
-    D2->>P: Deliver(client_request_id) 或 Reconcile
-    alt 下游支持去重/查询
-        P-->>D2: 已接受/去重
-        D2->>L: FinishDelivery(sent) 或 ReconcileDelivery(sent)
-    else 下游不支持
-        D2->>L: 保留 ambiguous + 告警
-    end
-```
+### `execution_record`
 
-> 因果链：P4 之所以不能「凭超时判失败重发」，是因为下游可能已经接受；`client_request_id` 去重 + `reconcile` 才是收敛依据，否则只能诚实 `ambiguous`。
-
----
-
-## 七、为什么不能只做 X（设计取舍汇总）
-
-- **只做接收去重（Inbox）→ 不够**：P2/P3/P4 仍需 lease/fence/ledger 三层保证。
-- **只做 lease 不加 fence 校验 → 不够**：Redis 重启或时钟问题会让旧 owner 翻案，`commit_turn` 的 `p_fence < last_fence` 是最终防线。
-- **P3 重跑模型 → 错误**：F3 已是终态，重跑违反「一次 terminal commit」且破坏工具副作用幂等。
-- **ACK 早于 terminal commit → 错误**：丢失在途任务（不变量 I5）。
-- **一个幂等键覆盖全阶段 → 错误**：三个事实落在不同存储/生命周期，必须分层（见 FULL-GUIDE §8）。
-- **P4 承诺 exactly-once → 错误**：只有下游支持 `client_request_id` 去重/查询才收敛，否则诚实 `ambiguous`。
-
----
-
-## 八、数据边界详细字段表
-
-每个窗口的「已落库 / 未落库」分界线由下列字段标识，恢复函数据此决策：
-
-| 窗口 | 关键字段 | 判定式（恢复者应见） |
+| 字段 | 类型、默认值与空值约束 | 直观用途 |
 |---|---|---|
-| P1 | `preprocess_job.state`, `dispatched_at` | `state='ready' AND dispatched_at IS NULL` → 可继续 dispatch |
-| P2 | `execution_record.outcome`, Redis `lease`, `session_head.last_fence` | `outcome IN ('running','pending')` 且 lease 过期 → reclaim + 新 fence |
-| P3 | `session_commit.outcome`, `outbox.state`, `result_payload` | 终态 session_commit + `outbox.state='pending'` → 重放发送 |
-| P4 | `delivery_ledger.state`, `claim_until`, `client_request_id` | `sending` 且 `claim_until<=now()` → 接管并从 provider 调用前继续；真实调用结果未知才转 `ambiguous` |
+| `tenant_id` | `text NOT NULL` | 租户强制边界 |
+| `request_id` | `text NOT NULL` | 内部原始输入身份 |
+| `tenant_version` | `bigint NOT NULL` | 受理时固定的租户配置版本 |
+| `agent_app_id` | `text NOT NULL` | 租户内 agent 应用 |
+| `agent_app_version` | `bigint NOT NULL` | 冻结应用元数据版本 |
+| `agent_app_revision` | `bigint NOT NULL` | 冻结已发布应用修订 |
+| `agent_content_digest` | `text NOT NULL` | 冻结应用内容SHA-256，防止版本内容漂移 |
+| `config_version` | `bigint NOT NULL` | 绑定的配置版本 |
+| `policy_version` | `bigint NOT NULL` | 治理策略版本 |
+| `session_id` | `text NOT NULL` | 原会话身份 |
+| `user_id` | `text NOT NULL` | 租户作用域用户 |
+| `channel` | `text NOT NULL` | 渠道类型 |
+| `input_seq` | `bigint NOT NULL` | 会话内输入顺序 |
+| `payload_ref` | `text NOT NULL` | 持久化内容引用 |
+| `traceparent` | `text` | 跨异步边界传播的追踪上下文，不承载业务权限 |
+| `outcome` | `text DEFAULT 'queued'::text NOT NULL` | 业务执行结果 |
+| `result_ref` | `text` | 已冻结结果引用 |
+| `park_attempt` | `integer DEFAULT 0 NOT NULL` | 输入停放次数 |
+| `model_call_count` | `integer DEFAULT 0 NOT NULL` | 逻辑模型调用数 |
+| `not_before` | `timestamp with time zone` | 允许下一次处理时间 |
+| `version` | `bigint DEFAULT 0 NOT NULL` | 乐观并发版本 |
+| `created_at` | `timestamp with time zone DEFAULT now() NOT NULL` | 创建审计时间 |
+| `park_deadline` | `timestamp with time zone` | 停放截止 |
+| `blocked_at` | `timestamp with time zone` | 输入无法继续推进的持久阻塞时刻 |
+| `blocked_reason` | `text` | 阻塞原因 |
+| `cancel_requested_at` | `timestamp with time zone` | 取消请求时刻 |
+| `cancel_version` | `bigint DEFAULT 0 NOT NULL` | 取消意图单调版本，0表示无取消 |
+| `model_request_count` | `bigint NOT NULL DEFAULT 0 CHECK >=0` | 模型 HTTP transport 尝试计数（000004 增量）。 |
 
-> 注意：`preprocess_job` 的 `prepared_payload_ref` 与 `channel_binding_id` 必须随 job 持久化，否则转入异步链路后 tenant 归属与 payload 会丢失。
+表内约束：
 
-## 九、reclaim 与续租时序
+- `CONSTRAINT execution_record_agent_content_digest_check CHECK ((agent_content_digest ~ '^[0-9a-f]{64}$'::text))`
+- `CONSTRAINT execution_record_cancel_intent_check CHECK (((cancel_version >= 0) AND (((cancel_requested_at IS NULL) AND (cancel_version = 0)) OR ((cancel_requested_at IS NOT NULL) AND (cancel_version >= 1)))))`
+- `CONSTRAINT execution_record_input_seq_check CHECK ((input_seq >= 1))`
+- `CONSTRAINT execution_record_outcome_check CHECK ((outcome = ANY (ARRAY['queued'::text, 'running'::text, 'pending'::text, 'blocked'::text, 'waiting_confirmation'::text, 'succeeded'::text, 'denied'::text, 'failed'::text, 'cancelled'::text, 'confirmation_denied'::text, 'confirmation_timeout'::text])))`
+- `CONSTRAINT execution_record_park_attempt_check CHECK ((park_attempt >= 0))`
+- `CONSTRAINT execution_record_model_call_count_check CHECK ((model_call_count >= 0))`
+- `CONSTRAINT execution_record_park_state_check CHECK (((park_attempt >= 0) AND ((park_deadline IS NULL) OR (not_before IS NULL) OR (not_before <= park_deadline)) AND ((outcome <> 'blocked'::text) OR ((blocked_at IS NOT NULL) AND (blocked_reason = ANY (ARRAY['park_attempts_exhausted'::text, 'park_deadline_exceeded'::text]))))))`
+- `CONSTRAINT execution_record_version_check CHECK ((version >= 0))`
 
-worker `consumer.go` 的 `Run()` 内部：
+主键/唯一键/外键见参考实现对应 DDL；主要约束：
+
+- `ALTER TABLE ONLY public.execution_record     ADD CONSTRAINT execution_record_pkey PRIMARY KEY (tenant_id, request_id);`
+- `ALTER TABLE ONLY public.execution_record     ADD CONSTRAINT execution_record_tenant_id_agent_app_id_session_id_input_se_key UNIQUE (tenant_id, agent_app_id, session_id, input_seq);`
+- `ALTER TABLE ONLY public.execution_record     ADD CONSTRAINT execution_record_tenant_id_agent_app_id_agent_app_revision_fkey FOREIGN KEY (tenant_id, agent_app_id, agent_app_revision) REFERENCES public.agent_app_revision(tenant_id, agent_app_id, revision);`
+- `ALTER TABLE ONLY public.execution_record     ADD CONSTRAINT execution_record_tenant_id_config_version_fkey FOREIGN KEY (tenant_id, config_version) REFERENCES public.config_snapshot(tenant_id, config_version);`
+- `ALTER TABLE ONLY public.execution_record     ADD CONSTRAINT execution_record_tenant_id_request_id_fkey FOREIGN KEY (tenant_id, request_id) REFERENCES public.inbox(tenant_id, request_id);`
+
+索引：
+
+- `CREATE INDEX execution_park_ready_idx ON public.execution_record USING btree (tenant_id, agent_app_id, session_id, input_seq, not_before) WHERE (outcome = 'pending'::text);`
+
+
+### `execution_attempt`
+
+| 字段 | 类型、默认值与空值约束 | 直观用途 |
+|---|---|---|
+| `tenant_id` | `text NOT NULL` | 租户强制边界 |
+| `request_id` | `text NOT NULL` | 内部原始输入身份 |
+| `attempt_no` | `bigint NOT NULL CHECK(attempt_no>0)` | Worker 独立尝试序号 |
+| `worker_id` | `text NOT NULL CHECK(length(btrim(worker_id))>0)` | 进程作用域 Worker owner |
+| `fence` | `bigint NOT NULL CHECK(fence>0)` | 本次执行 fencing token |
+| `state` | `text NOT NULL CHECK(state IN ('running','completed','retryable','superseded'))` | 本层状态；与其他表状态不能混用 |
+| `started_at` | `timestamptz NOT NULL DEFAULT now()` | 执行尝试开始时刻 |
+| `finished_at` | `timestamptz` | 尝试结束时刻 |
+
+表内约束：
+
+- `CHECK((state='running' AND finished_at IS NULL) OR (state<>'running' AND finished_at IS NOT NULL))`
+- `PRIMARY KEY(tenant_id,request_id,attempt_no)`
+- `FOREIGN KEY(tenant_id,request_id) REFERENCES public.execution_record(tenant_id,request_id)`
+
+
+### `outbox`
+
+| 字段 | 类型、默认值与空值约束 | 直观用途 |
+|---|---|---|
+| `tenant_id` | `text NOT NULL` | 租户强制边界 |
+| `outbox_id` | `text NOT NULL` | 该租户Outbox事件主键 |
+| `kind` | `text NOT NULL` | Outbox 事件种类 |
+| `aggregate_id` | `text NOT NULL` | 关联业务聚合 |
+| `event_seq` | `bigint NOT NULL` | 事件顺序 |
+| `idempotency_key` | `text NOT NULL` | 稳定恢复/业务幂等键 |
+| `payload_ref` | `text NOT NULL` | 持久化内容引用 |
+| `traceparent` | `text` | 跨异步边界传播的追踪上下文，不承载业务权限 |
+| `state` | `text DEFAULT 'pending'::text NOT NULL` | 本层状态；与其他表状态不能混用 |
+| `version` | `bigint DEFAULT 0 NOT NULL` | 乐观并发版本 |
+| `attempt` | `integer DEFAULT 0 NOT NULL` | 领取/发送尝试次数 |
+| `next_attempt_at` | `timestamp with time zone DEFAULT now() NOT NULL` | 下一调度时刻 |
+| `claim_owner` | `text` | 当前发布/发送 owner |
+| `claim_until` | `timestamp with time zone` | claim 到期时间 |
+| `published_at` | `timestamp with time zone` | 发布完成时刻 |
+| `created_at` | `timestamp with time zone DEFAULT now() NOT NULL` | 创建审计时间 |
+
+表内约束：
+
+- `CONSTRAINT outbox_attempt_check CHECK ((attempt >= 0))`
+- `CONSTRAINT outbox_event_seq_check CHECK ((event_seq >= 0))`
+- `CONSTRAINT outbox_kind_check CHECK ((kind = ANY (ARRAY['audit'::text, 'tenant-control'::text, 'config-invalidation'::text, 'dispatch'::text, 'reply'::text, 'wakeup'::text, 'execution-control'::text])))`
+- `CONSTRAINT outbox_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'claimed'::text, 'retry_wait'::text, 'published'::text, 'dead_letter'::text])))`
+- `CONSTRAINT outbox_version_check CHECK ((version >= 0))`
+
+主键/唯一键/外键见参考实现对应 DDL；主要约束：
+
+- `ALTER TABLE ONLY public.outbox     ADD CONSTRAINT outbox_pkey PRIMARY KEY (tenant_id, outbox_id);`
+- `ALTER TABLE ONLY public.outbox     ADD CONSTRAINT outbox_tenant_id_kind_idempotency_key_key UNIQUE (tenant_id, kind, idempotency_key);`
+
+索引：
+
+- `CREATE INDEX outbox_claim_idx ON public.outbox USING btree (kind, state, next_attempt_at, created_at);`
+
+
+### `delivery_ledger`
+
+| 字段 | 类型、默认值与空值约束 | 直观用途 |
+|---|---|---|
+| `tenant_id` | `text NOT NULL` | 租户强制边界 |
+| `delivery_key` | `text NOT NULL` | 原回复的稳定幂等身份 |
+| `segment_no` | `integer NOT NULL` | 从零开始的回复片段 |
+| `provider_message_id` | `text` | 渠道接受/交付消息标识 |
+| `state` | `text NOT NULL` | 本层状态；与其他表状态不能混用 |
+| `version` | `bigint DEFAULT 1 NOT NULL` | 乐观并发版本 |
+| `updated_at` | `timestamp with time zone DEFAULT now() NOT NULL` | 最近更新审计时间 |
+| `renderer_version` | `text DEFAULT 'legacy-v1'::text NOT NULL` | 冻结渲染规则版本 |
+| `format_version` | `text DEFAULT 'legacy-v1'::text NOT NULL` | 冻结内容格式版本 |
+| `content_digest` | `text DEFAULT repeat('0'::text, 64) NOT NULL` | 内容 SHA-256 校验 |
+| `segment_count` | `integer DEFAULT 1 NOT NULL` | 该答案的分段总数 |
+| `attempt` | `integer DEFAULT 0 NOT NULL` | 领取/发送尝试次数 |
+| `not_before` | `timestamp with time zone DEFAULT now() NOT NULL` | 允许下一次处理时间 |
+| `last_error_class` | `text` | 脱敏错误分类 |
+| `client_request_id` | `text NOT NULL` | 每片段稳定渠道请求键 |
+| `claim_owner` | `text` | 当前发布/发送 owner |
+| `claim_until` | `timestamp with time zone` | claim 到期时间 |
+| `reconcile_attempt` | `integer DEFAULT 0 NOT NULL` | 自动核对次数 |
+
+表内约束：
+
+- `CONSTRAINT delivery_ledger_attempt_check CHECK ((attempt >= 0))`
+- `CONSTRAINT delivery_ledger_claim_check CHECK ((((state = 'sending'::text) AND (claim_owner IS NOT NULL) AND (length(btrim(claim_owner)) > 0) AND (claim_until IS NOT NULL)) OR ((state <> 'sending'::text) AND (claim_owner IS NULL) AND (claim_until IS NULL))))`
+- `CONSTRAINT delivery_ledger_client_request_id_check CHECK ((length(btrim(client_request_id)) > 0))`
+- `CONSTRAINT delivery_ledger_content_digest_check CHECK ((content_digest ~ '^[0-9a-f]{64}$'::text))`
+- `CONSTRAINT delivery_ledger_format_version_check CHECK ((length(btrim(format_version)) > 0))`
+- `CONSTRAINT delivery_ledger_reconcile_attempt_check CHECK ((reconcile_attempt >= 0))`
+- `CONSTRAINT delivery_ledger_renderer_version_check CHECK ((length(btrim(renderer_version)) > 0))`
+- `CONSTRAINT delivery_ledger_segment_count_check CHECK (((segment_count >= 1) AND (segment_no < segment_count)))`
+- `CONSTRAINT delivery_ledger_segment_no_check CHECK ((segment_no >= 0))`
+- `CONSTRAINT delivery_ledger_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'sending'::text, 'sent'::text, 'ambiguous'::text, 'retry_wait'::text, 'failed'::text])))`
+- `CONSTRAINT delivery_ledger_version_check CHECK ((version >= 1))`
+
+主键/唯一键/外键见参考实现对应 DDL；主要约束：
+
+- `ALTER TABLE ONLY public.delivery_ledger     ADD CONSTRAINT delivery_ledger_pkey PRIMARY KEY (tenant_id, delivery_key, segment_no);`
+
+索引：
+
+- `CREATE INDEX delivery_ledger_claim_expiry_idx ON public.delivery_ledger USING btree (claim_until) WHERE (state = 'sending'::text);`
+- `CREATE INDEX delivery_ledger_retry_idx ON public.delivery_ledger USING btree (state, not_before, updated_at) WHERE (state = ANY (ARRAY['pending'::text, 'retry_wait'::text, 'ambiguous'::text]));`
+
+
+### `delivery_resolution`
+
+| 字段 | 类型、默认值与空值约束 | 直观用途 |
+|---|---|---|
+| `tenant_id` | `text NOT NULL` | 租户强制边界 |
+| `delivery_key` | `text NOT NULL` | 原回复的稳定幂等身份 |
+| `segment_no` | `integer NOT NULL CHECK (segment_no >= 0)` | 从零开始的回复片段 |
+| `expected_version` | `bigint NOT NULL CHECK (expected_version >= 1)` | 处置前 Ledger 版本 |
+| `actor` | `text NOT NULL CHECK (length(btrim(actor)) BETWEEN 1 AND 256)` | 管理调用方声明的处置人 |
+| `evidence_ref` | `text NOT NULL CHECK (length(btrim(evidence_ref)) BETWEEN 1 AND 1024)` | 外部核实证据引用 |
+| `decision` | `text NOT NULL CHECK (decision IN ('delivered', 'not_delivered', 'retry_not_delivered'))` | delivered/not_delivered/retry_not_delivered |
+| `provider_message_id` | `text` | 渠道接受/交付消息标识 |
+| `created_at` | `timestamptz NOT NULL DEFAULT now()` | 创建审计时间 |
+
+表内约束：
+
+- `PRIMARY KEY (tenant_id,delivery_key,segment_no,expected_version)`
+- `FOREIGN KEY (tenant_id,delivery_key,segment_no)         REFERENCES public.delivery_ledger(tenant_id,delivery_key,segment_no)`
+- `CHECK ((decision='delivered' AND provider_message_id IS NOT NULL AND length(btrim(provider_message_id)) > 0)         OR (decision IN ('not_delivered', 'retry_not_delivered') AND provider_message_id IS NULL))`
+
+
+### `prepared_payload`
+
+| 字段 | 类型、默认值与空值约束 | 直观用途 |
+|---|---|---|
+| `tenant_id` | `text NOT NULL` | 租户强制边界 |
+| `request_id` | `text NOT NULL` | 内部原始输入身份 |
+| `payload_ref` | `text NOT NULL` | 持久化内容引用 |
+| `source_payload_ref` | `text NOT NULL` | 预处理前原始输入引用 |
+| `payload_ciphertext` | `bytea NOT NULL` | 加密输入/预处理内容，AAD绑定租户和请求 |
+| `payload_nonce` | `bytea NOT NULL` | 该内容加密nonce，解密必须匹配 |
+| `content_digest` | `text NOT NULL` | 内容 SHA-256 校验 |
+| `key_version` | `bigint NOT NULL` | 租户密钥版本 |
+| `created_at` | `timestamp with time zone DEFAULT now() NOT NULL` | 创建审计时间 |
+| `artifact_retention_seconds` | `bigint DEFAULT 0 NOT NULL` | 预处理附件保留时长，单位秒 |
+
+表内约束：
+
+- `CONSTRAINT prepared_payload_artifact_retention_seconds_check CHECK ((artifact_retention_seconds >= 0))`
+- `CONSTRAINT prepared_payload_content_digest_check CHECK ((content_digest ~ '^[0-9a-f]{64}$'::text))`
+- `CONSTRAINT prepared_payload_key_version_check CHECK ((key_version > 0))`
+
+主键/唯一键/外键见参考实现对应 DDL；主要约束：
+
+- `ALTER TABLE ONLY public.prepared_payload     ADD CONSTRAINT prepared_payload_pkey PRIMARY KEY (tenant_id, request_id);`
+- `ALTER TABLE ONLY public.prepared_payload     ADD CONSTRAINT prepared_payload_tenant_id_payload_ref_key UNIQUE (tenant_id, payload_ref);`
+- `ALTER TABLE ONLY public.prepared_payload     ADD CONSTRAINT prepared_payload_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenant(tenant_id);`
+- `ALTER TABLE ONLY public.prepared_payload     ADD CONSTRAINT prepared_payload_tenant_id_request_id_fkey FOREIGN KEY (tenant_id, request_id) REFERENCES public.inbox(tenant_id, request_id);`
+
+
+### `tool_execution`
+
+| 字段 | 类型、默认值与空值约束 | 直观用途 |
+|---|---|---|
+| `tenant_id` | `text NOT NULL` | 租户强制边界 |
+| `request_id` | `text NOT NULL` | 内部原始输入身份 |
+| `tool_call_id` | `text NOT NULL` | 稳定逻辑工具操作身份 |
+| `tool_id` | `text NOT NULL` | 工具标识 |
+| `tool_version` | `bigint NOT NULL` | 冻结工具版本 |
+| `args_digest` | `text NOT NULL` | 规范化工具参数摘要 |
+| `recovery_policy` | `text NOT NULL` | 工具恢复契约 |
+| `idempotency_key` | `text NOT NULL` | 稳定恢复/业务幂等键 |
+| `state` | `text NOT NULL` | 本层状态；与其他表状态不能混用 |
+| `attempt` | `integer NOT NULL DEFAULT 0` | 领取/发送尝试次数 |
+| `fence` | `bigint NOT NULL DEFAULT 0` | 本次执行 fencing token |
+| `lease_owner` | `text` | 当前工具/job owner |
+| `lease_until` | `timestamp with time zone` | owner 到期时间（数据库时间） |
+| `external_handle` | `text` | 外部查询把手（可选） |
+| `result_ref` | `text` | 已冻结结果引用 |
+| `last_error` | `text` | 工具恢复错误摘要 |
+| `created_at` | `timestamp with time zone NOT NULL DEFAULT now()` | 创建审计时间 |
+| `updated_at` | `timestamp with time zone NOT NULL DEFAULT now()` | 最近更新审计时间 |
+
+表内约束：
+
+- `PRIMARY KEY (tenant_id, request_id, tool_call_id)`
+- `CONSTRAINT tool_execution_policy_check CHECK (recovery_policy IN ('replay_safe','idempotent_key','queryable','manual'))`
+- `CONSTRAINT tool_execution_state_check CHECK (state IN ('pending','running','succeeded','failed','effect_unknown'))`
+- `CONSTRAINT tool_execution_attempt_check CHECK (attempt >= 0)`
+- `CONSTRAINT tool_execution_fence_check CHECK (fence >= 0)`
+- `CONSTRAINT tool_execution_lease_check CHECK ((state = 'running' AND lease_owner IS NOT NULL AND lease_until IS NOT NULL) OR (state <> 'running'))`
+- `CONSTRAINT tool_execution_idempotency_key_check CHECK (length(btrim(idempotency_key)) > 0)`
+
+索引：
+
+- `CREATE INDEX tool_execution_reclaim_idx ON public.tool_execution (lease_until) WHERE state = 'running';`
+- `CREATE UNIQUE INDEX tool_execution_idempotency_idx ON public.tool_execution (tenant_id, tool_id, tool_version, idempotency_key);`
+
+
+### `tool_execution_result`
+
+| 字段 | 类型、默认值与空值约束 | 直观用途 |
+|---|---|---|
+| `tenant_id` | `text NOT NULL` | 租户强制边界 |
+| `request_id` | `text NOT NULL` | 内部原始输入身份 |
+| `tool_call_id` | `text NOT NULL` | 稳定逻辑工具操作身份 |
+| `result_ref` | `text NOT NULL` | 已冻结结果引用 |
+| `content_digest` | `text NOT NULL CHECK(content_digest ~ '^[0-9a-f]{64}$')` | 内容 SHA-256 校验 |
+| `ciphertext` | `bytea NOT NULL` | AES-GCM 密文 |
+| `nonce` | `bytea NOT NULL CHECK(octet_length(nonce)=12)` | AES-GCM nonce（12 字节） |
+| `key_version` | `bigint NOT NULL CHECK(key_version>0)` | 租户密钥版本 |
+| `created_at` | `timestamptz NOT NULL DEFAULT now()` | 创建审计时间 |
+
+表内约束：
+
+- `PRIMARY KEY(tenant_id,request_id,tool_call_id)`
+- `FOREIGN KEY(tenant_id,request_id,tool_call_id) REFERENCES public.tool_execution(tenant_id,request_id,tool_call_id)`
+
+
+### `tool_attempt`
+
+| 字段 | 类型、默认值与空值约束 | 直观用途 |
+|---|---|---|
+| `tenant_id` | `text NOT NULL` | 租户强制边界 |
+| `grant_id` | `text NOT NULL` | 一次性确认授权 |
+| `request_id` | `text NOT NULL` | 内部原始输入身份 |
+| `tool_call_id` | `text NOT NULL` | 稳定逻辑工具操作身份 |
+| `state` | `text NOT NULL` | 本层状态；与其他表状态不能混用 |
+| `result_ref` | `text` | 已冻结结果引用 |
+| `created_at` | `timestamp with time zone DEFAULT now() NOT NULL` | 创建审计时间 |
+| `updated_at` | `timestamp with time zone DEFAULT now() NOT NULL` | 最近更新审计时间 |
+
+表内约束：
+
+- `CONSTRAINT tool_attempt_state_check CHECK ((state = ANY (ARRAY['effect_unknown'::text, 'succeeded'::text, 'failed'::text])))`
+
+主键/唯一键/外键见参考实现对应 DDL；主要约束：
+
+- `ALTER TABLE ONLY public.tool_attempt     ADD CONSTRAINT tool_attempt_pkey PRIMARY KEY (tenant_id, grant_id);`
+- `ALTER TABLE ONLY public.tool_attempt     ADD CONSTRAINT tool_attempt_tenant_id_request_id_tool_call_id_key UNIQUE (tenant_id, request_id, tool_call_id);`
+- `ALTER TABLE ONLY public.tool_attempt     ADD CONSTRAINT tool_attempt_tenant_id_grant_id_fkey FOREIGN KEY (tenant_id, grant_id) REFERENCES public.confirmation_grant(tenant_id, grant_id);`
+
+
+### `tool_result_payload`
+
+| 字段 | 类型、默认值与空值约束 | 直观用途 |
+|---|---|---|
+| `tenant_id` | `text NOT NULL` | 租户强制边界 |
+| `grant_id` | `text NOT NULL` | 一次性确认授权 |
+| `request_id` | `text NOT NULL` | 内部原始输入身份 |
+| `result_ref` | `text NOT NULL` | 已冻结结果引用 |
+| `result_ciphertext` | `bytea NOT NULL` | 加密最终/工具结果内容 |
+| `result_nonce` | `bytea NOT NULL` | 结果加密nonce，不能跨结果复用 |
+| `content_digest` | `text NOT NULL` | 内容 SHA-256 校验 |
+| `key_version` | `bigint NOT NULL` | 租户密钥版本 |
+| `created_at` | `timestamp with time zone DEFAULT now() NOT NULL` | 创建审计时间 |
+
+表内约束：
+
+- `CONSTRAINT tool_result_payload_content_digest_check CHECK ((content_digest ~ '^[0-9a-f]{64}$'::text))`
+- `CONSTRAINT tool_result_payload_key_version_check CHECK ((key_version >= 1))`
+
+主键/唯一键/外键见参考实现对应 DDL；主要约束：
+
+- `ALTER TABLE ONLY public.tool_result_payload     ADD CONSTRAINT tool_result_payload_pkey PRIMARY KEY (tenant_id, grant_id);`
+- `ALTER TABLE ONLY public.tool_result_payload     ADD CONSTRAINT tool_result_payload_tenant_id_result_ref_key UNIQUE (tenant_id, result_ref);`
+- `ALTER TABLE ONLY public.tool_result_payload     ADD CONSTRAINT tool_result_payload_tenant_id_grant_id_fkey FOREIGN KEY (tenant_id, grant_id) REFERENCES public.tool_attempt(tenant_id, grant_id);`
+- `ALTER TABLE ONLY public.tool_result_payload     ADD CONSTRAINT tool_result_payload_tenant_id_request_id_fkey FOREIGN KEY (tenant_id, request_id) REFERENCES public.execution_record(tenant_id, request_id);`
+
+
+### `local_note`
+
+| 字段 | 类型、默认值与空值约束 | 直观用途 |
+|---|---|---|
+| `tenant_id` | `text NOT NULL` | 租户强制边界 |
+| `business_key` | `text NOT NULL` | 笔记业务幂等键 |
+| `request_id` | `text NOT NULL` | 内部原始输入身份 |
+| `note_id` | `text NOT NULL` | 真实业务记录身份 |
+| `args_digest` | `text NOT NULL CHECK(args_digest ~ '^[0-9a-f]{64}$')` | 规范化工具参数摘要 |
+| `ciphertext` | `bytea NOT NULL` | AES-GCM 密文 |
+| `nonce` | `bytea NOT NULL CHECK(octet_length(nonce)=12)` | AES-GCM nonce（12 字节） |
+| `key_version` | `bigint NOT NULL CHECK(key_version>0)` | 租户密钥版本 |
+| `created_at` | `timestamptz NOT NULL DEFAULT now()` | 创建审计时间 |
+
+表内约束：
+
+- `PRIMARY KEY(tenant_id,business_key)`
+- `UNIQUE(tenant_id,note_id)`
+
+
+
+## 其他关联表
+
+Inbox、session_head、session_commit、inbound_payload、result_payload 与 SDK session_events 的逐字段表格见 [会话数据模型](../conversation-continuity/design.md)。本篇参考实现包含两组 DDL，用于从零构建恢复关系。
+
+## 状态机与恢复动作
+
+| 状态层 | 主要状态 | 恢复判定 |
+|---|---|---|
+| Inbox | preprocess_pending / dispatch_pending / dispatch_ready / terminal | 相同渠道消息返回同一持久请求；输入摘要碰撞拒绝。 |
+| execution_record | running、停放/阻塞元数据、业务 outcome | input_seq 未就绪时 ParkInput/Wakeup；不能把正常返回等同成功答案。 |
+| execution_attempt | running → completed / retryable；旧 running → superseded | 尝试日志通过 request 行锁排序，旧 fence 不能覆盖新尝试。 |
+| Outbox | pending → claimed → published | 过期 claimed 可重领；发送后、标记前崩溃可能重复发布。 |
+| 工具执行 | running → succeeded / failed / effect_unknown | Claim 仅允许 pending/effect_unknown/过期 running；成功结果复用。 |
+| Ledger | pending/retry_wait → sending → sent；不确定 → ambiguous | expired sending 先记 owner_lost，不直接证明未发送；核对耗尽 → failed。 |
+
+Ledger 的 sent/failed 视为发送流程终态，但只有 failed/reconcile_exhausted 允许有证据的人工异常处置。sent 不允许被重新打开。
+
+## 并发、错误与竞态
+
+| 竞争/故障 | 强制点 | 结果 |
+|---|---|---|
+| 重复 callback / 队列事件 | Inbox 外部消息唯一键、Outbox 幂等键 | 保持 request/input_seq，不创建第二次业务输入。 |
+| 旧 Worker 迟到提交 | session version、input_seq、fence | stale fence → ErrStaleFence；版本冲突 → ErrVersionConflict；唯一提交冲突 → ErrCommitConflict。 |
+| Redis fence 计数落后 PG | EnsureFenceAtLeast | 下次 Acquire 递增到持久 last_fence 之后；不是 Redis 数据丢失的完整容灾方案。 |
+| 旧工具 owner 写结果 | owner+fence+lease_until>now() | Complete 拒绝并回滚密文插入；外部已生效仍靠业务协议。 |
+| 两 sender / 两管理员 | Ledger claim/version 与 expected_version | 一个有效状态迁移，另一个冲突；不能绕过 claim 直接发送。 |
+| SDK 事件已写、terminal 未提交 | frozen result 或原输入恢复 | 不回滚 SDK；存在冻结结果时复用，避免再生成另一个答案。 |
+| 下游结果未知 | ambiguous/reconcile_exhausted | 不盲重发；保留异常与证据处置。 |
+
+租户密钥投影、Binding 路由、SDK TenantKey/checked facade、SQL tenant 条件和冻结 ReplyRoute 是不同强制点；模型自报租户不能代替它们。
+
+## 工具恢复的执行顺序
+
+1. `GuardedCallable.callDurable` 校验租户执行上下文、payload key version、规范化参数及工具版本。普通 allow 的 operation ID 是 tenant/request/tool/version/参数摘要的 SHA-256；同一输入的同工具同参数视为同一逻辑操作。需要不同效果时必须带不同业务参数/键。ask 使用确认中的持久化调用 ID。
+2. 读取 tool_execution。已 succeeded 且不可变字段一致时，LoadResult 解密并校验摘要，直接复用；failed 拒绝继续。未知新工具默认 manual。
+3. Claim 首次创建 running，或领取 pending/effect_unknown/过期 running；attempt 和工具 fence 增加。未过期 running 不可抢占。
+4. 启动工具续租。ask 消费 grant；遇到已消费冲突时仅允许恢复同 request/tool-call 且 effect_unknown 的 attempt，不再次消费授权。
+5. 恢复时 queryable 先查询；completed=false 必须证明外部操作未被接受，pending/unknown 必须返回错误。idempotent_key 同键调用；replay_safe 重放；manual 再次尝试收敛为 effect_unknown，任务可终结为 tool_effect_unknown。
+6. 外部调用错误可将 tool_execution 标为 effect_unknown；lease 丢失立即取消 call context。外部系统若不响应取消，仍由其幂等/查询协议避免重复业务效果。
+7. 成功后停止续租，Complete 在同一 PostgreSQL 事务中验证 owner/fence/未过期租期、把执行置 succeeded 并写入 AES-GCM 加密的 tool_execution_result。任何一步失败均回滚。
+8. ask 再把结果镜像至 tool_result_payload 并完成 tool_attempt；镜像前故障可从 tool_execution_result 重建。业务效果与平台结果是两个事务；local_note 用 (tenant_id,business_key) 唯一键覆盖这段窗口。
+
+恢复的是已保存结果或外部操作的协议状态，不会恢复工具函数体的内存/指令位置。未冻结最终结果时模型可能重新推理；相同逻辑操作重新进入 GuardedCallable 时复用或安全恢复。任意 Graph 检查点也不能据此推断为自动恢复整张图的执行栈。
+
+## 工具策略与权限
+
+allow/ask 是授权策略，replay_safe/idempotent_key/queryable/manual 是恢复策略，二者正交。普通允许调用也要持久化；确认工具只是增加一次性 grant 和结果镜像。生产组合根注入 execution store 与 payload key resolver，缺少 durable result 能力拒绝降级。旧 nil Store 的独立接口不提供分布式保证。
+
+内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。下游已接受、本地确认未提交的 P4 窗口需要下游可靠去重或查询才能自动收敛。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
+
+## 实体关系与唯一性的层级
+
+| 逻辑对象 | 身份 | 可有多少次尝试 |
+|---|---|---|
+| 原渠道输入 | tenant/channel/account/external_message_id | 渠道可重传，平台request应保持一致。 |
+| 内部任务 | tenant/request_id | 多次execution_attempt。 |
+| 会话轮次 | tenant/app/session/input_seq | 只有一个有效terminal。 |
+| 普通工具操作 | tenant/request/工具版本/规范参数摘要派生ID | 多次tool_execution.attempt。 |
+| 确认工具调用 | tenant/request/持久tool_call_id与grant | grant消费一次，安全恢复可多次领取。 |
+| 最终回复 | 稳定reply ID/DeliveryKey | 多次Outbox发布或queue重投。 |
+| 回复segment | tenant/delivery_key/segment_no | 多次发送/核对尝试，单行权威状态。 |
+| 笔记业务效果 | tenant/business_key | 幂等重试复用同一笔记。 |
+
+这里没有一个“全系统万能幂等键”。每个层级有自己的重复来源和语义，正确性依赖它们能通过tenant/request和固定坐标关联。
+
+## 哪些写在同一事务，哪些不是
 
 ```text
-Run():
-  ├─ 启动 reclaim goroutine：每 ReclaimInterval(装配值 5s) Broker.Reclaim(consumerID, limit=100)
-  │     └─ 对每条走 process → handle（ErrCommitConflict/ErrVersionConflict 按 RetryWait 重试）
-  └─ Consume 回调：执行失败【故意返回 nil】以免 worker 退出，让空闲 delivery 可被 reclaim
+事务A：工具succeeded + tool_execution_result密文
+事务B：ask结果镜像/确认账本推进（另有自己的存储步骤）
+事务C：最终result_payload冻结
+事务D：terminal commit + session/execution推进 + reply Outbox
+事务E：Ledger发送确认
+事务F：管理员Ledger处置 + 审计 + 必要Outbox重调度
+
+外部业务效果、SDK事件、provider接受不是以上全部事务的成员
 ```
 
-`handle()` 续租细节：
+事务B不是事务A的组成部分，A提交后B未完成可以从A结果恢复。外部笔记业务写入也先于A，因此local_note必须按业务键自身幂等。事务C先于D，所以要有冻结答案续提交分支。E在外部接受之后，所以无法消除P4。
 
-```text
-acquire lease → defer Release(1s ctx)
-启动续租 goroutine：每 RenewInterval(=LeaseTTL/3) Renew；失败 → markLeaseLost() + cancelExecution
-beforeCommit：先查 leaseLost → Renew 一次；失败 → ErrLeaseLost
-执行 ExecuteWithLease；ErrInputNotReady → Parker.ParkInput（Ready 重试 / Terminal 视为成功 / Blocked 上报）
-executeErr != nil → 直接 return（不 ACK）
-否则 Broker.Ack
-```
+## tool_execution的状态不等于工具函数进度
 
-关键：续租失败的 `markLeaseLost` 用 `sync.Once` 关闭 `leaseLost` channel 并取消执行 context；`beforeCommit` 是提交前最后一道闸，数据库 fence 是最终防线。
+running表示某个owner拥有租期并正在推进，不能精确证明它已发出外部请求。succeeded加可解密结果表示平台已保存成功输出。effect_unknown表示没有可信结果证明外部状态，需要策略处理；failed也不是所有外部副作用已被撤销。
 
-## 十、对账数据流（ambiguous → 收敛）
+lease_owner、lease_until、fence回答“谁能写平台结果”，external_handle或idempotency_key回答“如何关联外部操作”。args_digest只提供一致性校验，不能替代原参数内容。
 
-```text
-delivery_ledger.state='ambiguous'
-   │ 存活 delivery 定时扫描 delivery_ledger_retry_idx (state IN pending/retry_wait/ambiguous)
-   ▼
-reconcile(): NotBefore 未到 → Deferred
-   │ adapter 未实现 DeliveryReconciler → deferReconciliation（cap=MaxReconcileAttempts=8）
-   ▼
-ReconciliationDelivered → ReconcileDelivery(sent)   [下游确认已接受]
-ReconciliationNotDelivered → retry_wait + 'reconciled_not_delivered'
-ReconciliationUnknown → 继续 defer
-超过 MaxReconcileAttempts → finishFailed(..., 'reconcile_exhausted', reconcile=true)
-```
+## 成功结果的加密绑定
 
-`FindReconciliationIssues(before, limit)` 还会返回 `stuck_inbox`/`expired_outbox_claim`/`parked_input`/`missing_reply_outbox`/`stuck_delivery`/`ambiguous_delivery`，供值班定期扫描（见 [release-and-operations.md](./release-and-operations.md) 对账手册）。
+tool_execution_result保存nonce、key_version、content_digest与结果密文，LoadResult要求对应execution处于succeeded且result_ref一致，再用租户密钥及AAD解密并核对摘要。
 
----
+错误tenant、错误request/call坐标、错误key version或内容篡改都应导致读取失败。把一份密文复制到别的逻辑调用名下不会形成可用恢复结果；不能用“有一行结果”跳过这些校验。
 
-## 十一、窗口与存储的对应关系（一句话速查）
+## Ledger计划碰撞与状态冲突分别意味着什么
 
-| 窗口 | 主存储 | 关键状态 | 恢复者 | 禁止动作 |
-|---|---|---|---|---|
-| P1 | PostgreSQL `inbox` + `preprocess_job` | `preprocess_pending`/`dispatch_pending`/`ready` | preprocess worker | 手工重新入队 |
-| P2 | PostgreSQL `execution_record` + Redis lease | `running`/`pending` + fence | worker reclaim | 删 lease / 早 ACK |
-| P3 | PostgreSQL `session_commit` + `outbox` | 终态 + `pending` reply | relay + delivery | 重跑模型 |
-| P4 | PostgreSQL `delivery_ledger` | `sending`/`ambiguous` | delivery + reconcile | 盲重发 / 伪造 receipt |
+同DeliveryKey/segment但renderer、format、content digest或segment_count不同属于计划不一致，应拒绝。state/version/owner冲突则可能是另一个有效处理者已推进，需要重读状态。
 
-## 当前实现增量：工具执行状态机
+如果把这两类都当普通网络重试，节点会持续重试永远不能匹配的内容，或者不安全地重发已完成段。日志与运维应保留冲突类别和原request关联，避免用删除Ledger消除报错。
 
-`tool_execution` 是 P2 内部的第二层状态机：`pending -> running -> succeeded|failed|effect_unknown`。Claim 只能创建记录，或接管 lease 已过期的 `running` 记录；每次接管增加 `attempt` 与 `fence`。`Renew`/`Finish` 必须同时匹配 `lease_owner+fence`，避免旧节点完成迟到副作用。详细字段与 SQL 见 `REFERENCE-IMPLEMENTATION.md` 的当前实现增量。
+## 新owner与旧owner结果竞争
+
+新owner可能取得更高会话fence，但旧工具owner仍受工具lease约束；新工具claim要等待可领取。旧工具完成即便来不及被新模型看到，成功结果也成为可复用的durable事实。
+
+同时，外部不响应取消的旧调用可能仍有业务效果。平台拒绝旧owner写结果并不等于外部效果不存在，idempotent_key/queryable正是处理这层区别；manual不能靠增加fence自动变安全。

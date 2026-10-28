@@ -1,313 +1,155 @@
 # 故障恢复后继续对话 — 测试与验收
 
-> 本文给出完整测试方案：参数、逐步命令、演练脚本全文与逐条解释、证据字段清单、通过判定表、稳定性/负载检查方法、反例清单、真实 WeCom 外部验收步骤。
-> 脚本事实与默认值均与参考实现逐字一致；如与原实现交叉核对，可见 `scripts/e2e/wecom-ha-failover.sh`。
+## 固定版本、前提与时间口径
 
----
+本文是可复用流程，不包含实际执行结果。每轮固定完整提交 SHA、镜像摘要、配置/迁移版本、资源限制、拓扑、RUN_ID 和证据目录。两个 Bot 对应不同租户；同一真实用户在各自原会话写入不同随机 TOKEN_A/B，后续提问不再提供代号。使用真实模型时记录调用身份但不以共用上游 key 判断隔离。
 
-## 一、参数与证据固定
+关闭受害实例自动重启/替换，共享依赖保持正常，故障节点在本轮业务验收前一直停止。不得手删 lease、重绑 Bot、重投原消息或临时修补业务代码来获得通过。
 
-执行前**必须固定**（写进本轮运行记录，不允许事后补）：
+| 参数 | 执行前必须约定 |
+|---|---|
+| W_BASELINE | 双节点稳定窗口，覆盖多个心跳、租约与调度周期。 |
+| T_READY / T_TASK / T_DELIVER | 整体就绪、原任务完成、最终可见回复时限；不得事后放宽。 |
+| W_DUPLICATE / W_REPEAT | 覆盖 lease/reclaim/retry 的重复检查和稳定窗口。 |
+| DELTA_POLL | 状态采样间隔，恢复时延结论包含采样误差。 |
 
-| 项 | 示例 | 为什么必须固定 |
+t0 为外部确认故障时刻；t_ready 为观察到执行链路就绪；新消息收到至最终可见是请求延迟。人工等待后才发消息不能推算精确端到端 RTO。barrier 主动暂停时长单独记录，不任意扣除。
+
+## 分阶段步骤
+
+1. 只启动 N1，N2 停止。确认两个 Bot 路由、组件 ready；各自写代号，随后不带代号回忆，核对服务端 tenant/session/最终交付。
+2. 启动 N2，记录两个不同 process_start_id，观察完整 W_BASELINE。两租户重叠提问，仍使用原会话。当前 callback 架构记录入口 healthy backends 与 Worker/Delivery 实际 owner，不填写不存在的 Bot 长连接 owner。
+3. 等待基线测试输入全部最终交付后，非优雅终止实际承载职责的节点，记录 t0，确认存活进程及共享依赖未重启。
+4. 不执行人工修复，观察 /readyz、/statusz 和 /ops/session/lease，记录入口重新可转发、Worker/Delivery 可工作时刻。超过阈值按本轮失败/未恢复记录。
+5. 确认接管完成后分别发带新RUN_ID标记的消息：“你属于哪个租户？我此前告诉你的代号是什么？”不得再次提示代号。
+6. 核对各自原 session、正确代号、冻结 reply route、接管者和客户端最终回复。W_REPEAT 内至少再一轮，两租户请求重叠，检查迟到重复与积压。
+7. 如实现提供明确创建新会话方式，另列一轮新会话不读取旧代号；关闭聊天窗口不算创建新会话。
+
+## 判定表与反例
+
+| 项目 | 满足条件 | 反例 |
 |---|---|---|
-| 镜像 digest | `sha256:...` | 否则无法证明"同一份代码"通过 |
-| commit SHA | `a1b2c3d` | 二进制与配置的对应关系 |
-| `config_version` | `7` | binding/route/policy 的版本，直接影响路由 |
-| `W_BASELINE` | `60s` | 双节点无故障基线观察窗 |
-| `T_CONNECT` / `T_READY` / `T_REPLY` | `10s` / `30s` / `30s` | 各阶段时限判据 |
-| `W_REPEAT` | `120s` | 重复观察窗（迟到重复回复） |
-| `DELTA_POLL` | `1s` | 采样间隔，必须随结论记录 |
-| `RUN_ID` / `TOKEN_A` / `TOKEN_B` | 每轮随机 | 隔离本轮证据与代号 |
+| 原会话连续 | 同tenant/app/session读持久历史，正确回忆代号 | 换会话、问题中重带代号或仅模型自报租户。 |
+| 自动接管 | 受害实例一直停止，存活实例实际接收/执行/投递 | Docker自动重建或手删租约后成功。 |
+| 租户隔离 | Binding、payload、SDK key、结果和路由同tenant | A回复B代号/账号，跨租户解密。 |
+| 最终交付 | 客户端与Ledger/原request一致，无迟到重复 | 仅有进度消息、只看一行sent。 |
+| 窗口范围 | 故障在基线完全交付之后 | 处理中的任务故障却只验证后来新消息。 |
+| P4协议边界 | 无能力时如实异常待处置 | ambiguous被写成无条件自动完成。 |
 
-证据目录独立于代码仓库，**不写回设计文档**。
+## 最小证据闭环与计数
 
-### 1.1 脚本参数
+每次证据至少包含：版本/拓扑/参数、实例及 process_start_id、owner 与 fence/lease 变化、tenant/binding/session、external_message_id/request_id/input_seq、execution_attempt、冻结 result_ref/digest、terminal commit、Outbox、Ledger 的 segment/client_request_id/provider_message_id/state/version，以及客户端最终回复。敏感凭据/个人标识脱敏，完整正文按环境要求保护。
 
-| 变量 | 默认 | 作用 |
+| 计数 | 权威记录 | 解释 |
 |---|---|---|
-| `TRPC_WECOM_HA_PROJECT` | `trpc-wecom-ha-$RANDOM$RANDOM` | 隔离的 Compose project 名 |
-| `TRPC_LOCAL_WECOM_HA_ENTRY_PORT` | `58087` | 稳定入口端口 |
-| `TRPC_LOCAL_WECOM_HA_NODE_A_PORT` | `58088` | node-a 观测端口 |
-| `TRPC_LOCAL_WECOM_HA_NODE_B_PORT` | `58089` | node-b 观测端口 |
-| `TRPC_WECOM_HA_TIMEOUT_SECONDS` | `120` | 各项就绪等待上限 |
-| `TRPC_WECOM_REAL_ACCEPTANCE` | `assumed` | 真实双 Bot 对话验收状态（`assumed` / `recorded`，其他值报错退出 2） |
-| `TRPC_WECOM_HA_KEEP_ENVIRONMENT` | `false` | `true` 时结束后保留容器/卷，便于手工核对 DB 行 |
+| Worker 尝试 | `execution_attempt` 的行数 / `attempt_no` | 每次进入执行器一行；新尝试把旧 `running` 标为 `superseded`。completed 仅表示执行器正常返回。 |
+| 逻辑模型调用 | `execution_record.model_call_count` | 进入模型适配器的逻辑调用，可因恢复增加。 |
+| 模型 HTTP 尝试 | `execution_record.model_request_count` | transport 尝试，含连接失败及内部重试；不等于接受数或计费数。 |
+| 工具尝试 / 业务效果 | `tool_execution.attempt` / 外部业务幂等记录 | 同键工具重试可大于一次，业务效果应按工具契约去重。 |
+| 回复发送 / 用户可见答案 | Ledger `attempt`、`segment_no/count` / 客户端证据 | 一条答案可有多个分段；唯一 Ledger 行不能单独证明用户只见一次。 |
 
-### 1.2 前置条件
+服务端 Ledger 一行 sent 只能证明本地终态；客户端可见重复必须直接核对。模型调用多次不直接失败，正确性看同一原请求提交、业务效果和交付边界。
 
-| 前置 | 检查 | 不满足的后果 |
-|---|---|---|
-| `docker` | `command -v docker` | 退出码 2 |
-| Docker Compose v2 | `docker compose version` | 退出码 2 |
-| `curl` | `command -v curl` | 退出码 2 |
-| `deploy/compose/secrets/deepseek-api-key` 非空 | `[[ -s ... ]]` | 退出码 2 |
-| `deploy/compose/secrets/wecom.env` 非空，含 `WECOM_*` 与 `WECOM_SECONDARY_*` 两组凭据 | `[[ -s ... ]]` + 人工确认 `(Corp ID, Agent ID)` 不同 | 退出码 2；或启动时报 `secondary WeCom local configuration is incomplete/incompatible` |
+内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。下游已接受、本地确认未提交的 P4 窗口需要下游可靠去重或查询才能自动收敛。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
 
----
+## 自动脚本的覆盖范围
 
-## 二、逐步命令
+`bash scripts/e2e/single-host-multicontainer.sh` 验证生命周期和入口；`wecom-ha-failover.sh` 直接调用同脚本。TRPC_WECOM_REAL_ACCEPTANCE=assumed 默认仅声明真实会话是外部前提；recorded 也只声明外部证据已保存，脚本不检查客户端对话。两者都不能独立证明代号回忆正确。
 
-```bash
-# 1. 进入仓库根
-cd /Users/everfid/code/trpc-agent-service
+## 代码回归入口
 
-# 2. 确认本地密钥文件存在且非空（脚本会校验）
-#    deploy/compose/secrets/deepseek-api-key
-#    deploy/compose/secrets/wecom.env   （含 WECOM_* 与 WECOM_SECONDARY_* 两组凭据）
-
-# 3. 静态校验编排（可选，快速发现配置错误）
-docker compose -f deploy/compose/docker-compose.local.yml --profile wecom-ha-local config -q
-
-# 4. 运行强杀演练（自动创建独立 Compose project，结束后清理容器与卷）
-bash scripts/e2e/wecom-ha-failover.sh
-
-# 5. 可选：保留环境以便手工核对数据库行
-TRPC_WECOM_HA_KEEP_ENVIRONMENT=true bash scripts/e2e/wecom-ha-failover.sh
+```sh
+go test ./...
+go test -race ./cmd/trpc-service ./trpcservice/worker ./trpcservice/channels/delivery ./trpcservice/relay ./trpcservice/reliability/drain
 ```
 
-手工逐阶段操作（当不使用脚本时，用于取证）：
+这些命令运行包/竞态测试，不等价于真实 WeCom 故障验收。若某集成测试依赖外部服务，应检查是否实际运行或跳过，不能把普通 go test 退出0视为全部部署验证完成。测试结果、日志与时延保存在独立运行目录，不回填本文。
 
-```bash
-# 启动
-docker compose -f deploy/compose/docker-compose.local.yml --profile wecom-ha-local up -d --build
+## 把双Bot业务消息安排成可复查序列
 
-# 基线
-curl -s http://127.0.0.1:58088/readyz && echo node-a ready
-curl -s http://127.0.0.1:58089/readyz && echo node-b ready
-curl -s http://127.0.0.1:58087/livez  && echo entry live
-curl -s http://127.0.0.1:58088/statusz | tee evidence/baseline-node-a.json
-curl -s http://127.0.0.1:58089/statusz | tee evidence/baseline-node-b.json
-curl -s http://127.0.0.1:58087/statusz | tee evidence/baseline-entry.json
+以下仅为用例模板，尖括号内容在每轮生成，不把真实代号写入系统提示、知识库或配置。两租户使用不同随机代号，并记录原external_message_id。
 
-# 故障：非优雅终止（t0）
-docker kill --signal=KILL "$(docker compose -f deploy/compose/docker-compose.local.yml --profile wecom-ha-local ps -q wecom-ha-node-a)"
-
-# 接管观测
-curl -s http://127.0.0.1:58089/readyz && echo node-b still ready
-curl -s http://127.0.0.1:58087/livez  && echo entry still live
-curl -s http://127.0.0.1:58087/statusz | tee evidence/entry-after-kill.json
-curl -s http://127.0.0.1:58089/statusz | tee evidence/node-b-after-kill.json
-
-# 确认受害节点持续停止（间隔数秒复查两次）
-docker inspect --format '{{.State.Running}}' "$(docker compose -f deploy/compose/docker-compose.local.yml --profile wecom-ha-local ps -q wecom-ha-node-a)"
-sleep 3
-docker inspect --format '{{.State.Running}}' "$(docker compose -f deploy/compose/docker-compose.local.yml --profile wecom-ha-local ps -q wecom-ha-node-a)"
-```
-
-> 注意：受害容器在强杀后仍会被 `compose ps -q` 找到（容器记录存在但未运行），因此 `docker inspect` 的 `State.Running` 才是判据，而不是"能否查到容器"。
-
----
-
-## 三、脚本行为逐条解释
-
-### 3.1 `scripts/e2e/wecom-ha-failover.sh`（118 行）
-
-| 行区间 | 行为 | 为什么这样设计 |
-|---|---|---|
-| 1–7 | shebang + `set -euo pipefail` + 头部注释 | 任一断言失败立即终止；注释声明"真实对话记为 assumed" |
-| 8–19 | 解析变量 / 默认端口 58087/58088/58089 / 默认超时 120s / 默认 `assumed` / `mktemp -d` 诊断目录 | 每轮独立 project 与证据目录，互不污染 |
-| 21–27 | 校验 docker / compose v2 / curl / 两个 secret 文件非空 | 前置缺失直接退出码 2，不产生半成品结论 |
-| 29–31 | `compose()` 封装 `docker compose --project-name "${project}" -f "${compose_file}" --profile wecom-ha-local` | 隔离 project，避免影响其他运行中的环境 |
-| 33–36 | `capture_diagnostics()`：`compose ps` + `compose logs --no-color` 落盘 | 失败时保留现场，便于复盘 |
-| 38–51 | `cleanup()`：`trap EXIT`；非 keep 时 `compose down --volumes --remove-orphans`；按退出码打印结论 | 默认不残留容器与卷；诊断目录始终保留 |
-| 53–64 | `wait_http(url, desc)`：循环 `curl --fail --silent --show-error --max-time 3` 直到成功或超时 | 统一就绪探测；超时返回 1 触发 `set -e` |
-| 66–80 | `capture_status(port, expected_instance, label)`：`curl /statusz` 后 `grep -Fq '"instance_id":"<node>"'` 与 `grep -Fq '"worker":"webui-local-worker-<node>-'` | 同时校验**实例身份**与**worker owner 前缀**，防止同名容器换进程 |
-| 82 | `compose up --detach --build` | 拉起 bootstrap + node-a + node-b + entry |
-| 83–87 | 等 node-a/node-b `/readyz`、入口 `/livez`；`capture_status` 两节点 | 基线证据（V1/V2） |
-| 89–91 | `victim_container="$(compose ps -q wecom-ha-node-a)"`；`docker kill --signal=KILL` | **非优雅终止**；记录 `t0` |
-| 93–95 | 等入口 `/livez`、node-b `/readyz`；`capture_status` node-b | 证明入口与存活节点仍可用（V4） |
-| 97–105 | `docker inspect --format '{{.State.Running}}'` 断言 `false`；`sleep 3` 后再断言 `false` | **两次确认**受害节点未自动重启（V8） |
-| 107–118 | 按 `TRPC_WECOM_REAL_ACCEPTANCE` 输出 `assumed` / `recorded` / 报错退出 2 | 真实对话是外部前置，明确区分"自动化通过"与"真实通过" |
-
-**脚本不做的事（同样重要）：**
-
-- 不伪造企业微信用户消息；
-- 不修改租约、不重新入队、不改 delivery 记录、不重启受害节点；
-- 不宣称给出了精确 RTO（`DELTA_POLL` 未定义时不给时限结论）。
-
----
-
-## 四、证据字段清单
-
-每条证据记录需包含（脱敏后）：
-
-```text
-run_id, timestamp, stage(baseline|fault|takeover|verify|repeat),
-node(instance_id), process_start_id, owner(worker/preprocess/dispatch-relay/reply-relay/wakeup-relay/wakeup/delivery),
-tenant_id, binding_id, session_id, request_id, input_seq,
-stream_entry_id, lease_key, fence_before, fence_after,
-delivery_key, segment_no, segment_count, client_request_id,
-delivery_state, provider_message_id, attempt, reconcile_attempt, last_error_class,
-client_observed_reply(tenant 是否正确、代号是否正确、可见最终回复条数),
-delivery_evidence(是否只出现一条 'sent' 记录)
-```
-
-导出命令（保留环境后执行）：
-
-```sql
--- 本轮两个租户的投递台账
-SELECT tenant_id, delivery_key, segment_no, segment_count, state, attempt, reconcile_attempt,
-       client_request_id, provider_message_id, claim_owner, claim_until, updated_at
-FROM delivery_ledger
-WHERE tenant_id IN ('<TENANT_A>', '<TENANT_B>')
-ORDER BY tenant_id, delivery_key, segment_no;
-
--- 本轮会话提交（证明每个 input_seq 只有一条终态）
-SELECT tenant_id, agent_app_id, session_id, input_seq, commit_id, outcome, fence, session_version, reply_cursor, result_ref
-FROM session_commit
-WHERE tenant_id IN ('<TENANT_A>', '<TENANT_B>')
-ORDER BY tenant_id, session_id, input_seq;
-
--- 会话头（fence 单调性与推进状态）
-SELECT tenant_id, agent_app_id, session_id, version, last_fence, last_session_seq, next_input_seq, updated_at
-FROM session_head
-WHERE tenant_id IN ('<TENANT_A>', '<TENANT_B>');
-
--- 入站去重事实
-SELECT tenant_id, channel, external_account_id, external_message_id, request_id, agent_app_id, session_id, input_seq, state
-FROM inbox
-WHERE tenant_id IN ('<TENANT_A>', '<TENANT_B>')
-ORDER BY created_at DESC LIMIT 20;
-```
-
-采样间隔 `DELTA_POLL` 必须随结论记录。**不能声称比采样更精确的 RTO。**
-
----
-
-## 五、完整验收步骤（含时间口径）
-
-| 步骤 | 动作 | 记录 | 判据 |
+| 阶段 | Bot A | Bot B | 本阶段证明什么 |
 |---|---|---|---|
-| 1. N1 基线 | 仅运行 N1；Bot A/B 分别在各自会话写入并回忆不同代号 | 代号 `ALPHA`/`BETA`、`session_commit` 行、`delivery_ledger` 行 | 两租户各自正确；每输入一条终态 |
-| 2. 双节点基线 | 启动 N2，观察完整 `W_BASELINE` | `/statusz`（两节点 + 入口）、owner 名、pending 计数 | 无持续 owner 抖动、无 backlog 增长、入口两个后端均 healthy |
-| 3. 故障 | 选取**实际承担职责**的节点，`docker kill --signal=KILL`，记录 `t0` | 受害 `process_start_id`、`docker inspect` | 受害节点未自动重启（两次确认） |
-| 4. 接管 | 查询 lease、pending stream、delivery claim、队列积压、健康状态 | `t_connect` / `t_worker` / `t_ready` | 存活节点在预设时限内取得有效职责 |
-| 5. 原会话新消息 | 接管后两 Bot 分别发**不含代号**的新消息 | 客户端回复、`delivery_ledger`、`webui_message` | 正确 tenant、各自历史代号、唯一最终回复 |
-| 6. 重复验证 | `W_REPEAT` 内以重叠请求再测一轮 | 连接振荡、积压、迟到重复回复 | 无迟到 duplicate final，无永久 pending |
-| 7. 收尾 | 保留证据目录；如需保留环境则 `KEEP_ENVIRONMENT=true` | `RUN_ID`、`DELTA_POLL`、镜像 digest | 证据可复核 |
+| 单节点写入 | RUN-S1-A：记住TOKEN_A并回显标记。 | RUN-S1-B：记住TOKEN_B并回显标记。 | 原身份和持久会话建立。 |
+| 单节点回忆 | 不带TOKEN，询问此前代号。 | 同左，属于B。 | 代号不是靠提问回显。 |
+| 双节点基线 | RUN-S2-A：回忆代号和租户。 | RUN-S2-B：回忆代号和租户。 | 加入实例不改变原会话。 |
+| 故障后首轮 | RUN-S3-A：回忆代号并回显标记。 | RUN-S3-B：回忆代号并回显标记。 | 接管后原会话可继续。 |
+| 持续第二轮 | 新标记，两边重叠请求。 | 新标记，两边重叠请求。 | 不是偶然一次成功，且无迟到重复。 |
 
----
+用户在企业微信关闭再打开聊天窗口通常仍是同一会话；若没有明确服务端新session动作，不把它记录成“新会话隔离通过”。
 
-## 六、通过判定表
+## 每一轮至少保存一张身份对照表
 
-| 条件 | 判定 | 证据 |
+| 字段组 | 期望关系 | 不通过或覆盖缺口 |
 |---|---|---|
-| 租户与会话 | 两条消息命中**原** tenant/session，且仅回忆本租户代号 | `session_commit` 的 tenant 归属 + 官方会话后端 `session_events.app_name` 的 `tenantID/agentAppID` 前缀；客户端回复内容 |
-| 自动接管 | 受害节点持续停止；存活节点在预设时限内取得有效职责 | `docker inspect` 两次 `Running=false`；`/statusz` 新 owner（含新 `process_start_id`）；lease fence 递增 |
-| 最终回复 | 每个输入一条客户端可见 final，与 terminal/delivery 记录一致 | `delivery_ledger.state='sent'` 每 segment 一行；`webui_message` 一致 |
-| 不重发 | `sent` 后不出现第二条同内容最终回复 | `delivery_ledger` 无重复终态；客户端无重复 |
-| 不串扰 | A 的回复不含 B 的代号，反之亦然 | 回复内容 + tenant 关联校验 |
-| 上下文不丢 | 进程内存全失后仍能回忆代号 | 答对 `ALPHA`/`BETA`；官方会话后端 `session_events`（按 `app_name`/`user_id`/`session_id`）可重放出同一上下文 |
-| 稳定性 | 无持续 ownership 抖动、无长期 pending、无迟到 duplicate final | reclaim 日志、pending 计数、`W_REPEAT` 观察 |
-| 时序 | 各阶段在 `T_CONNECT` / `T_READY` / `T_REPLY` 内完成 | 带 `DELTA_POLL` 的时间记录 |
+| Bot/Binding/tenant | A始终对应A，B始终对应B | 只凭模型口头回答。 |
+| app/user/session | 故障前后原会话键相同 | 故障后创建空历史新session。 |
+| 消息/request/input_seq | 新输入各有身份，原消息不重复建任务 | 同external_message_id产生第二个业务request。 |
+| owner/process/fence | 从故障实例迁移至存活实例，执行权有效 | 同一个旧process偷偷重启恢复。 |
+| result/ReplyRoute | 结果和目的地属于同tenant/request | 内容正确却发送到另一个Bot。 |
+| Ledger/客户端 | 服务端状态与可见回复一致 | 仅一个sent行就声明绝无重复。 |
 
----
+明细表保存在运行目录，可以只用脱敏哈希引用完整个人标识。身份对照是证据关联，不要求把密钥或会话全文导出。
 
-## 七、稳定性与负载检查方法
+## 只读SQL证据示例
 
-本包承诺"故障后继续对话"，因此除单次强杀外，还须在**持续负载**下证明不退化。
-
-### 7.1 连接稳定性（无连接振荡）
-
-**观测：** 在 `W_BASELINE` 与 `W_REPEAT` 两个窗口内，每 `DELTA_POLL` 采样一次入口 `/statusz` 与两节点 `/statusz`。
-
-**判据：**
-
-- 入口 backend 的 `healthy` 字段不应在两个窗口内反复翻转（振荡）；允许一次因果明确的翻转（对应节点终止），不允许持续抖动。
-- 两节点的 `/statusz.process_start_id` 在窗口内必须**不变**（除非本轮显式重新加入）。
-- stream consumer 的 pending 数不应持续在高位徘徊。
-
-**反例：** 若采样发现 owner 名每几秒变化一次 → 说明有进程在反复重启或身份被复用 → 判不通过。
-
-### 7.2 任务积压（backlog 不增长）
-
-**观测：** 在两个窗口内周期记录 Redis stream 的 pending 总数与 oldest pending 年龄，以及 `execution_record` 中 `outcome='queued'/'running'` 的记录数。
-
-**判据：**
-
-- 稳态下 pending 数量围绕一个上界波动，不单调增长。
-- oldest pending 年龄不应超过 `ReclaimInterval` + `LeaseTTL` + 容差的量级；若持续超过，说明 reclaim 没跟上或 worker 不健康。
-- 压测方式：在 `W_BASELINE` 内以固定速率持续投递（每租户多条会话，避免人为串行化），然后在窗口末尾强杀其中一个节点，观察 pending 是否在 `T_READY` 内回落。
-
-**反例：** 积压持续增长且 `readyz` 一直 200 → 说明是吞吐不足而非依赖故障，属容量问题，应记入容量结论而非"接管失败"。
-
-### 7.3 重复回复检查
-
-**观测：**
-
-1. `delivery_ledger` 层面：同一 `(tenant_id, delivery_key, segment_no)` 只能有一条终态；`sent` 之后不得再出现 `sending`。
-2. `session_commit` 层面：同一 `(tenant_id, agent_app_id, session_id, input_seq)` 只能有一条终态（终态唯一索引保证）。
-3. 客户端层面：同一聊天在 `W_REPEAT` 内不得出现第二条同语义最终回复。
-
-**SQL 快速检查：**
+以下使用psql变量，先通过安全方式设置tenant_id和request_id。仅查询元数据，不解密聊天正文；示例不替代客户端记录。
 
 ```sql
--- 1) 每输入是否只有一条终态提交（期望 0 行）
-SELECT tenant_id, agent_app_id, session_id, input_seq, count(*)
+SELECT request_id, agent_app_id, session_id, input_seq, state, result_ref
+FROM inbox
+WHERE tenant_id = :'tenant_id' AND request_id = :'request_id';
+
+SELECT agent_app_id, session_id, last_fence, version, next_input_seq
+FROM session_head
+WHERE tenant_id = :'tenant_id';
+
+SELECT request_id, input_seq, fence, outcome, result_ref
 FROM session_commit
-WHERE outcome IN ('succeeded','denied','failed','cancelled','confirmation_denied','confirmation_timeout')
-GROUP BY 1,2,3,4 HAVING count(*) > 1;
+WHERE tenant_id = :'tenant_id' AND request_id = :'request_id'
+ORDER BY created_at;
 
--- 2) 是否存在同一 segment 的多次终态（期望 0 行；主键应保证唯一）
-SELECT tenant_id, delivery_key, segment_no, count(*)
+SELECT delivery_key, segment_no, segment_count, state, attempt,
+       client_request_id, provider_message_id, last_error_class
 FROM delivery_ledger
-GROUP BY 1,2,3 HAVING count(*) > 1;
-
--- 3) 是否存在已 sent 却仍被重新领取的痕迹（期望无 sending 且 attempt 未继续增长）
-SELECT tenant_id, delivery_key, segment_no, state, attempt, claim_owner, claim_until, updated_at
-FROM delivery_ledger
-WHERE state IN ('sending','ambiguous')
+WHERE tenant_id = :'tenant_id'
 ORDER BY updated_at DESC;
 ```
 
-### 7.4 分片与"重复"的区分
+最后一个查询返回该租户最近投递；应通过原Outbox幂等键把delivery_key关联到request，而不是只按答案文本猜是哪一次回复。一个租户同时进行其他测试时尤其需要这层关联。
 
-若原始回复超过渠道单条上限，`Deliver` 会按 `MaxTextBytes()` 分片，`segment_count > 1`，**每个 segment 一行 Ledger 记录**。客户端看到多条消息属正常分片，不是重复。
+## 如何记录时间而不夸大结论
 
-**判据：** 核对 `segment_count` 与客户端条数是否一致；若 `segment_count = 1` 而客户端看到两条 → 才是真重复，按 `release-and-operations.md` §7.6 处置。
+先记录外部强杀动作与容器退出时刻，再记录入口可用和组件ready的首次观察。轮询每DELTA_POLL采样一次，因此实际恢复发生在上次失败与首次成功之间。
 
----
+故障后人工等待一分钟才发消息，即使秒回，也不能声称业务RTO为一秒。应分别报告“首次观察到ready距故障多久”和“接管后请求响应多久”，并标注采样误差。
 
-## 八、反例清单（以下都不算通过）
+本能力基线要求旧测试输入已交付；若故障时还有旧任务运行，就需要在途验收补齐，不能将它们忽略后仍声称覆盖所有恢复窗口。
 
-| 反例 | 为什么不算 |
-|---|---|
-| 人工等到系统恢复后才发一条成功消息 | 只证明一次业务响应，不是精确 RTO，且未证明"另一节点接管" |
-| 关闭聊天窗口后重新发 | 不是创建或恢复服务端 session 的证据 |
-| 依据模型自报"我是 Tenant A" | 不是可信路由证据；只有 binding/tenant/session/delivery 一致关联才算 |
-| 只看 `/livez` 通过 | `/livez` 恒 200，不代表能处理业务；必须 `/readyz` + `/statusz` owner |
-| 受害节点被 Docker 自动重启后通过 | 验证的是"重启恢复"而非"接管"；本包 `restart:"no"` |
-| 手工删除租约 / 重新入队后通过 | 证明的是人工修复 |
-| 只发新消息，不检查原会话历史 | 无法证明上下文回忆正确 |
-| 只核对客户端，不核对服务端记录 | 无法证明租户归属不串扰 |
-| 用 `W_REPEAT` 缺失的短窗口下结论 | 迟到重复回复可能落在窗口之外 |
-| 把一次强杀演练外推为容量承诺 | 演练证明可用性，不证明容量 |
+## 常见伪通过与纠正动作
 
----
+| 伪通过 | 为什么无效 | 正确核对 |
+|---|---|---|
+| 模型回答“我是租户A” | 文本可来自提示，无服务端归属证据 | 查询Binding/tenant/route。 |
+| 问题里带代号并得到回显 | 没证明历史恢复 | 后续提问不带代号。 |
+| 重绑Bot后正常 | 改变了被测路由 | 保持原Binding配置。 |
+| 重发原消息后有回复 | 不能证明原任务自动续办 | 保持原request不变。 |
+| 重启peer后正常 | 无法归因自动接管 | peer原进程持续运行。 |
+| 未出现错误日志 | 缺少业务完成证据 | terminal、Ledger与客户端关联。 |
 
-## 九、真实 WeCom 外部验收步骤
+## 结论模板
 
-自动化部分只覆盖"入口存活 + 存活节点就绪 + 证书/身份未复用"。真实原会话对话必须由外部账户完成。
+```text
+版本/镜像/配置/迁移：
+RUN_ID与证据目录：
+故障实例及process_start_id：
+存活实例及process_start_id：
+故障时刻、ready观察区间、采样间隔：
+Bot A/B原session及服务端tenant：
+首轮与重复轮客户端最终回复：
+未验证窗口/下游P4边界：
+结论：通过 / 未通过 / 有明确覆盖缺口
+```
 
-1. 以 `TRPC_WECOM_REAL_ACCEPTANCE=recorded` 运行演练，或手动保留环境（`TRPC_WECOM_HA_KEEP_ENVIRONMENT=true`）。
-2. 在 node-a 被强杀、node-b 接管后，打开企业微信，通过 **Bot A** 在**原会话**发送一条带唯一标记（如 `HA-A-<RUN_ID>`）的新消息。
-3. 核对：Bot A 仅回复 Tenant A 的代号 `ALPHA`，且同一聊天中只出现**一条**最终回复。
-4. 通过 **Bot B** 在原会话发送带唯一标记的新消息，核对仅回复 Tenant B 的代号 `BETA`，且**不含** `ALPHA`。
-5. 服务端核对：`delivery_ledger`（tenant_id 分别为 Tenant A/B，`state='sent'`，每 segment 一行）与 `webui_message`（`channel_binding_id` 分别对应两个 binding）。
-6. 将客户端截图 + 服务端行导出至独立运行目录；记录 `RUN_ID`、`DELTA_POLL`、镜像 digest，以及接管前后 node-b 的 `/statusz`（含 `process_start_id`）。
-7. 验证无跨租户痕迹：`session_events`（按两个 Bot 各自的 `app_name` 前缀）/ `session_commit` 中不存在另一 tenant 的历史、工具结果或凭据痕迹。
-
-> 真实验收是外部前置。默认 `assumed` 只表示"自动化可观察部分通过"，**不替代**上述人工/外部核对。对外报告时必须显式标注本轮采用的是 `assumed` 还是 `recorded`。
-
----
-
-## 十、与相邻文档包的边界
-
-| 本包验证 | 不验证（见相邻包） |
-|---|---|
-| 新消息在单节点故障后仍在**原会话**正确对话 | 原始**在途**消息在 P1–P4 各窗口的精确接管 → `inflight-task-takeover` |
-| 单节点故障（受害节点持续停止） | 同主机实例**重新加入**与**反向故障** → `single-host-multicontainer` |
-| 共享 PostgreSQL/Redis 正常前提下的接管 | 共享依赖故障、跨主机、整机断电（不承诺） |
-
-> ⚠️ 不要因为"后一条新消息成功"就判定原在途任务已被接管。两者是不同证据面。
+不要在未执行时填入估算成功值。代码回归、生命周期脚本和真实对话证据各自说明覆盖范围。

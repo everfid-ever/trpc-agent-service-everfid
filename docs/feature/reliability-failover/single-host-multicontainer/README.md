@@ -1,67 +1,59 @@
-# 单主机多容器实例高可用
+# 单主机多容器实例可用性
 
-本目录按 L1–L4 分层；跨层的审查问题见 [文档方法](../DOCUMENTATION-METHOD.md)。Compose profile、稳定入口和双 Bot 独立 tenant 的当前配置以 L3 参考实现和 `docker-compose.local.yml` 为准。
+保护同一主机内两个应用实例的共存、独立身份、强杀后的存活实例接管、重新加入和反向故障。两个实例共同使用一份数据库、队列和协调服务。
 
-## 文档地图
+## 当前实现状态与阅读顺序
 
-| 文件 | 级别 | 回答什么问题 | 谁读 / 何时读 | 可整篇跳过 |
-|---|---|---|---|---|
-| `README.md` | 导航 | 范围、拓扑入口、已实现演练 | 所有人，先读 | — |
-| `OVERVIEW.md` | L1 | 场景、术语、业务故事和不包含 | 管理/产品/交接 | — |
-| `FULL-GUIDE.md` / `design.md` | L2 | 入口/节点机制、故障时序、竞态和隔离 | 架构评审/实现前 | 非代码读者可跳过设计细节 |
-| `implementation-walkthrough.md` / `CODE-APPENDIX.md` / `REFERENCE-IMPLEMENTATION.md` | L3 | 运行时顺序、真实代码、Compose/配置/启动顺序 | 实现/外部复刻 | 非代码/纯验收 |
-| `testing-and-acceptance.md` / `release-and-operations.md` | L4 | 强杀、重加入、反向故障、证据与处置 | QA/SRE/上线 | 非验收角色 |
+正文按当前工作区的迁移000001–000004、运行时、入口与Compose配置编写。CURRENT-IMPLEMENTATION仅提供摘要；各篇正文直接给出当前机制，不通过“历史与基线冲突时覆盖”维持两套说法。
 
-## 拓扑
+| 文件 | 层级 | 负责回答 | 读者与可跳过范围 |
+|---|---|---|---|
+| README.md | 导航 | 范围、当前状态、20角度索引 | 所有人先读。 |
+| OVERVIEW.md | L1 | 场景、保证、术语、计数、边界 | 产品/管理/交接必读。 |
+| FULL-GUIDE.md | L2 | 故障因果链、恢复与不能只做X | 架构与实现评审；非代码读者可只读边界。 |
+| design.md | L2→L3 | 真实字段表、状态、并发和模块 | 实现者；非代码可跳。 |
+| implementation-walkthrough.md | L3 | 运行顺序、durable truth与此刻被杀 | 对照实现；纯验收可跳。 |
+| CODE-APPENDIX.md | L3 | 当前真实代码与状态解释 | 查不变量证据；非代码可跳。 |
+| REFERENCE-IMPLEMENTATION.md | L3 | DDL原文、接口/算法、Redis、配置、启动和复刻前提 | 外部复刻/实现；概览读者可跳。 |
+| testing-and-acceptance.md | L4 | 判定、证据、反例、脚本实际覆盖 | QA/验收。 |
+| release-and-operations.md | L4 | 迁移、发布、告警口径与处置 | 实现/SRE/上线。 |
+| CURRENT-IMPLEMENTATION.md | 摘要 | 已落地路径快速回顾 | 可选；不替代各层正文。 |
 
-`wecom-ha-local` Compose profile 启动一次 bootstrap、两个应用节点和一个稳定入口：
+## 本能力已落地的模块
 
-```text
-WeCom callback
-  -> wecom-ha-entry :58087
-  -> wecom-ha-node-a :58088   ┐
-  -> wecom-ha-node-b :58089   ┘ shared PostgreSQL + Redis
-```
+同机双应用共享PG/Redis、独立槽位/启动身份和端口、稳定callback入口并行probe/epoch/健康过期/重加入窗口、只读root/skills和私有tmpfs、有界drain、强杀重加入/反向故障脚本。
 
-节点容器内均监听 `:8080`。入口持续探测各节点 `/readyz`，只向健康节点转发回调；`/statusz` 显示后端健康状态。节点共享数据库、队列和协调服务，但每次启动均有不同的 `process_start_id`，并据此构造 Worker、Relay、Delivery 等 owner 身份。
+## 保证与边界
 
-当前入口使用并行、有超时的探测，并在网络错误或后端 502/503/504 时尝试其他健康节点。失效的健康记录不用于路由；故障或健康过期后的节点须连续两次探测成功才重新纳入（可配置），旧探测不能覆盖较新的失败。认证拒绝不触发切换，原始签名材料不改变。参数、状态字段及限制见 [部署说明](../../../../deploy/compose/README.md#多实例生命周期与目录隔离)。
+应用节点故障后已durable的工作由系统继续处理；模型/任务尝试可增加。内部terminal唯一与外部最终可见交付分开判断。真实WeCom P4缺少请求级查询/可靠去重时保持不确定异常，核对耗尽可进入failed/reconcile_exhausted，不盲目重发。外部工具须遵守恢复契约；宿主机、入口和共享依赖整体故障不属于双应用实例冗余。
 
-## 隔离与共享
+## 五层20角度：为什么必须有、怎样问、去哪读
 
-| 类别 | 内容 |
-|---|---|
-| 共享权威状态 | PostgreSQL 业务记录、Redis 协调/队列、已发布配置和持久化 payload/result |
-| 节点局部状态 | HTTP 监听端口、进程启动身份、运行中的 goroutine、短暂连接和本地临时状态 |
-| 共享文件内容 | bootstrap 发布不可变技能包，应用节点通过 `:ro` 挂载读取；读节点不会 chmod、创建或修复包文件 |
-| 私有可写文件 | 应用根文件系统只读，`/tmp` 为每容器独立 tmpfs，密钥投影及临时状态不与其他实例共享 |
-| 防冲突机制 | 独立实例 ID/端口、lease、fence、条件更新、Outbox/Delivery Ledger |
+本目录侧重部署、入口、生命周期与节点局部资源；下表逐项追踪，同一问题在L1是承诺、L2是原因、L3是状态和条件、L4是证据。
 
-`restart: "no"` 故意禁用自动重启：演练验证的是存活节点的业务接管，而非 Docker 重启掩盖故障。重新加入的节点必须显式启动，并以新的 `process_start_id` 重新参与竞争，不能复用旧 owner。
+| 角度 | 为什么必须有 | 提问式判据 | 文档位置 |
+|---|---|---|---|
+| A1 保证等级 | 把应用故障承诺扩展成所有系统故障保证。 | 在共享依赖正常、下游能力明确时保证哪些结果？ | [OVERVIEW.md](OVERVIEW.md) |
+| A2 保护对象 | 遗漏原输入、会话或外部业务效果。 | 输入、上下文、工具效果和最终回复各由谁保护？ | [OVERVIEW.md](OVERVIEW.md) |
+| A3 计数语义 | 把模型重试当成重复回复。 | Worker/模型HTTP/工具/业务效果/可见回复如何分别计数？ | [OVERVIEW.md](OVERVIEW.md) |
+| A4 粒度和术语 | 把Bot、tenant、session、request混为一个身份。 | 一条原消息如何关联每段回复和每次尝试？ | [design.md](design.md) |
+| A5 故障对象 | 把共享依赖或入口故障归入应用实例冗余。 | 应用、入口、宿主机、数据库和外部系统哪些假定正常？ | [FULL-GUIDE.md](FULL-GUIDE.md) |
+| A6 故障窗口 | 用提交后的暂停点代替执行中故障。 | 每个窗口已durable的事实与接管动作是什么？ | [testing-and-acceptance.md](testing-and-acceptance.md) |
+| A7 不可测与假设 | 从超时推断外部未接受。 | 何时无证据，如何保留ambiguous/effect_unknown？ | [FULL-GUIDE.md](FULL-GUIDE.md) |
+| A8 失权与死亡判断 | 短暂抖动造成旧owner或后端被错误恢复。 | lease/claim何时到期，ready/健康何时撤销和重新纳入？ | [design.md](design.md) |
+| A9 权威状态 | 把日志、临时目录或平台session_event当聊天历史。 | 恢复读哪些表/键，SDK历史与协调事务如何区分？ | [design.md](design.md) |
+| A10 状态机 | 终态/可恢复状态被错误重开。 | queued/running/terminal、tool、Ledger及drain如何迁移？ | [design.md](design.md) |
+| A11 顺序策略 | ACK、外部调用或发布早于必要状态保存。 | 每个durable写、claim、调用和ACK的前后关系是什么？ | [implementation-walkthrough.md](implementation-walkthrough.md) |
+| A12 并发控制 | 旧Worker/sender覆盖新owner。 | version、fence、租期和入口epoch在哪个写点检查？ | [CODE-APPENDIX.md](CODE-APPENDIX.md) |
+| A13 幂等边界 | 把Ledger唯一行外推为渠道接收一次。 | Inbox/Outbox/工具业务键/Ledger/provider各去重什么？ | [FULL-GUIDE.md](FULL-GUIDE.md) |
+| A14 恢复动作 | 对未知副作用盲重放。 | 哪些复用结果、同键重试、查询、终结或人工处置？ | [implementation-walkthrough.md](implementation-walkthrough.md) |
+| A15 租户隔离 | 依赖调用者记得带tenant。 | Binding、HMAC、SQL、SDK key、密钥和ReplyRoute如何约束？ | [design.md](design.md) |
+| A16 身份授权 | 用Bot/WebUI凭据开放管理处置。 | 谁可验签、消费grant、领取工具、处置Ledger？ | [release-and-operations.md](release-and-operations.md) |
+| A17 证据 | 只看服务ready就声称原任务完成。 | 哪组request/fence/terminal/Ledger/客户端证据组成闭环？ | [testing-and-acceptance.md](testing-and-acceptance.md) |
+| A18 时间容量 | 把TTL当测得RTO，把低负载当容量承诺。 | 超时、轮询误差、重试和survivor负载如何预先设定？ | [release-and-operations.md](release-and-operations.md) |
+| A19 不承诺 | 无限扩大HA、工具断点或交付保证。 | 哪些故障域和协议能力明确不能无条件保证？ | [OVERVIEW.md](OVERVIEW.md) |
+| A20 变更演练 | 升级后破坏旧在途记录/密钥/格式。 | 迁移顺序、回滚、强杀、重新加入和反向故障怎样检查？ | [release-and-operations.md](release-and-operations.md) |
 
-## 计划内停止
+## 验证与结果边界
 
-SIGTERM 撤销 readiness 并关闭业务接入，停止 Worker、预处理、Relay、Wakeup、Delivery 的新领取，保留在途执行/发送的工作上下文直到结束或排空超时。监督器不会把正常排空的消费者重启。默认应用排空时限 30 秒，Compose 停止宽限 45 秒；自定义时必须让后者更长。退出不等待共享队列清空，已持久化的待处理输入或新 Outbox 由存活节点续办。超时会取消未完成工作并保留恢复依据；SIGKILL 完全依赖原有故障接管机制，不被当成优雅排空。
-
-## 非优雅终止与重新加入
-
-当任一节点被 `SIGKILL`：
-
-1. 稳定入口将其标记为不健康，继续向存活节点转发后续回调。
-2. 已领取但未 ACK 的任务在 lease/消费者 reclaim 条件满足后由存活节点重新领取。
-3. 会话 fence、工具执行 lease、Relay claim 和 Delivery Ledger 防止旧 owner 或并发 owner 重复提交、发送或产生业务副作用。
-4. 重启受害容器后，节点以新身份加入；再强杀原存活节点，重加入节点可反向接管。
-
-## 演练
-
-准备 `deploy/compose/secrets/deepseek-api-key` 与 `deploy/compose/secrets/wecom.env` 后运行：
-
-```bash
-bash scripts/e2e/single-host-multicontainer.sh
-```
-
-脚本验证：双节点和入口 ready、N1 强杀后 N2 健康、N1 新身份重加入、N2 反向强杀后 N1 健康，并保留 `/statusz`、Compose 状态和日志诊断。`TRPC_WECOM_REAL_ACCEPTANCE=recorded` 只表示真实渠道会话证据已在外部保存；本地脚本本身不伪造真实 WeCom 消息。
-
-## 范围
-
-本能力处理同一宿主机上单个应用实例的故障。它不覆盖宿主机掉电、Docker daemon、共享 PostgreSQL/Redis、外部模型或渠道整体故障；这些属于共享故障域或跨主机 HA 议题。
+代码测试覆盖相关状态、竞态与恢复分支；脚本证明其明确列出的拓扑/本地交付行为。真实渠道、持续负载和实测RTO另需运行证据。assumed不是测得通过，recorded仅是外部证据已保存的声明；本文不记录未执行验收为成功。

@@ -1,397 +1,754 @@
 # 单主机多容器实例可用性 — 实现代码附录
 
-> 本文逐段摘录稳定 callback 入口、双实例编排和生命周期演练的关键代码，并解释语义。重点不是"多启动一个容器"，而是公开入口、实例身份、健康判定和故障动作都具有可验证语义。所有摘录来自仓库真实文件（可选核对：`cmd/trpc-service/wecom_ha_entry_role.go`、`cmd/trpc-service/webui_local_role.go`、`deploy/compose/docker-compose.local.yml`、`scripts/e2e/single-host-multicontainer.sh`）。完整可照抄材料见 `REFERENCE-IMPLEMENTATION.md`。
+本篇代码从当前工作区源码逐字提取；省略的文件 import/其他函数以明确的节选说明表示。每段均给出状态变化与故障含义。示例身份、测试时延与状态不是运行结果。
 
-## 1. 入口配置校验（至少两个合规后端）
+## 当前入口完整实现
+
+来源：`cmd/trpc-service/wecom_ha_entry_role.go`；并行探测、健康有效期、epoch、连续成功重加入、响应缓冲与错误切换均包含在实际实现中。
 
 ```go
-func loadWeComHAEntryConfig(getenv func(string) string) (weComHAEntryConfig, error) {
-	value := weComHAEntryConfig{
-		ListenAddress: valueOr(getenv("TRPC_LISTEN_ADDRESS"), ":8080"),
-		ProbeInterval: time.Second,
-		RequestLimit:  2 << 20, // 2 MiB
-	}
-	if raw := strings.TrimSpace(getenv("TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL")); raw != "" {
-		interval, err := time.ParseDuration(raw)
-		if err != nil || interval < 100*time.Millisecond || interval > time.Minute {
-			return weComHAEntryConfig{}, errors.New("entry probe interval is invalid")
-		}
-		value.ProbeInterval = interval
-	}
-	seen := map[string]struct{}{}
-	for _, raw := range strings.Split(getenv("TRPC_WECOM_HA_ENTRY_BACKENDS"), ",") {
-		parsed, err := url.Parse(strings.TrimSpace(raw))
-		if err != nil || parsed.Scheme != "http" || parsed.Host == "" ||
-			parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-			return weComHAEntryConfig{}, errors.New("entry backend is invalid")
-		}
-		parsed.Path = strings.TrimSuffix(parsed.Path, "/")
-		key := parsed.String()
-		if _, ok := seen[key]; ok {
-			return weComHAEntryConfig{}, errors.New("entry backend is duplicated")
-		}
-		seen[key] = struct{}{}
-		value.Backends = append(value.Backends, parsed)
-	}
-	if len(value.Backends) < 2 {
-		return weComHAEntryConfig{}, errors.New("entry requires at least two backends")
-	}
-	return value, nil
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+// wecomHAEntryConfig describes the small, stable callback entrypoint used by
+// the local multi-container drill. Backends are private Compose addresses; no
+// node address is exposed to the callback provider.
+type wecomHAEntryConfig struct {
+	ListenAddress     string
+	Backends          []*url.URL
+	ProbeInterval     time.Duration
+	ProbeTimeout      time.Duration
+	RequestTimeout    time.Duration
+	HealthTTL         time.Duration
+	RecoverySuccesses int
 }
-```
 
-**语义**：入口拒绝重复或异常 URL，并要求至少两个内部后端。探测间隔有上下限（`[100ms, 1m]`），防止配置过快拖垮依赖，或过慢造成不可接受的故障窗口。`RequestLimit = 2<<20`（2 MiB）是单 callback 请求体上限。
-
-## 2. readiness 才是是否接收 callback 的判据（probe）
-
-```go
-func (p *weComHAEntryPool) probe(ctx context.Context) {
-	for _, backend := range p.backends {
-		probeURL := *backend.URL
-		probeURL.Path = strings.TrimSuffix(probeURL.Path, "/") + "/readyz"
-		probeURL.RawQuery = ""
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL.String(), nil)
-		if err != nil { backend.healthy.Store(false); continue }
-		response, err := p.client.Do(request)
-		if err != nil { backend.healthy.Store(false); continue }
-		_, _ = io.Copy(io.Discard, response.Body)
-		_ = response.Body.Close()
-		backend.healthy.Store(response.StatusCode == http.StatusOK)
+func loadWeComHAEntryConfig(getenv func(string) string) (wecomHAEntryConfig, error) {
+	if getenv == nil {
+		return wecomHAEntryConfig{}, errors.New("missing environment reader")
 	}
-}
-```
-
-**语义**：探测应用的 `/readyz`，而非 Docker 进程状态。实例即使还活着，只要无法访问数据库、队列或必需依赖，也会被入口摘除。健康状态以原子布尔值保存，转发和状态接口可并发读取。
-
-## 3. healthyBackends 轮转（round-robin 起点）
-
-```go
-func (p *weComHAEntryPool) healthyBackends() []*weComHAEntryBackend {
-	ordered := make([]*weComHAEntryBackend, 0, len(p.backends))
-	start := int(p.next.Add(1)-1) % len(p.backends)
-	for offset := range p.backends {
-		candidate := p.backends[(start+offset)%len(p.backends)]
-		if candidate.healthy.Load() {
-			ordered = append(ordered, candidate)
+	interval := time.Second
+	if value := strings.TrimSpace(getenv("TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL")); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil || parsed < 100*time.Millisecond || parsed > time.Minute {
+			return wecomHAEntryConfig{}, errors.New("invalid WeCom HA entry probe interval")
+		}
+		interval = parsed
+	}
+	parts := strings.Split(strings.TrimSpace(getenv("TRPC_WECOM_HA_ENTRY_BACKENDS")), ",")
+	if len(parts) < 2 {
+		return wecomHAEntryConfig{}, errors.New("at least two WeCom HA entry backends are required")
+	}
+	backends := make([]*url.URL, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		parsed, err := url.Parse(strings.TrimSpace(part))
+		if err != nil || parsed.Scheme != "http" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "" {
+			return wecomHAEntryConfig{}, errors.New("invalid WeCom HA entry backend")
+		}
+		if _, exists := seen[parsed.String()]; exists {
+			return wecomHAEntryConfig{}, errors.New("duplicate WeCom HA entry backend")
+		}
+		seen[parsed.String()] = struct{}{}
+		backends = append(backends, parsed)
+	}
+	listenAddress := valueOr(getenv("TRPC_LISTEN_ADDRESS"), ":8080")
+	if strings.TrimSpace(listenAddress) != listenAddress || listenAddress == "" {
+		return wecomHAEntryConfig{}, errors.New("invalid WeCom HA entry listen address")
+	}
+	config := wecomHAEntryConfig{ListenAddress: listenAddress, Backends: backends, ProbeInterval: interval, ProbeTimeout: time.Second, RequestTimeout: 2 * time.Second, RecoverySuccesses: 2}
+	for _, setting := range []struct {
+		name   string
+		target *time.Duration
+	}{
+		{"TRPC_WECOM_HA_ENTRY_PROBE_TIMEOUT", &config.ProbeTimeout}, {"TRPC_WECOM_HA_ENTRY_REQUEST_TIMEOUT", &config.RequestTimeout},
+	} {
+		if raw := strings.TrimSpace(getenv(setting.name)); raw != "" {
+			duration, err := time.ParseDuration(raw)
+			if err != nil || duration < 100*time.Millisecond || duration > 30*time.Second {
+				return config, errors.New("invalid WeCom HA entry timeout")
+			}
+			*setting.target = duration
 		}
 	}
-	return ordered
+	config.HealthTTL = 3 * (interval + config.ProbeTimeout)
+	if raw := strings.TrimSpace(getenv("TRPC_WECOM_HA_ENTRY_RECOVERY_SUCCESSES")); raw != "" {
+		count, err := strconv.Atoi(raw)
+		if err != nil || count < 1 || count > 10 {
+			return config, errors.New("invalid entry recovery threshold")
+		}
+		config.RecoverySuccesses = count
+	}
+	return config, nil
 }
-```
 
-**语义**：每次调用从原子下标 `next` 自增后开始按序收集健康后端。这保证多健康后端下 callback 负载分布，且单点失败时自然切换到下一个。
+type wecomHAEntryBackend struct {
+	URL                  string    `json:"url"`
+	Healthy              bool      `json:"healthy"`
+	CheckedAt            time.Time `json:"checked_at,omitempty"`
+	HealthySince         time.Time `json:"healthy_since,omitempty"`
+	Failures             uint64    `json:"failures"`
+	LastFailure          string    `json:"last_failure,omitempty"`
+	ConsecutiveSuccesses int       `json:"consecutive_successes"`
+}
 
-## 4. callback 在尚未返回时尝试另一健康后端（serveCallback）
+type wecomHAEntry struct {
+	backends                                []wecomHAEntryBackend
+	health                                  []atomic.Bool
+	next                                    atomic.Uint64
+	client                                  *http.Client
+	mu                                      sync.Mutex
+	epoch                                   []uint64
+	probeTimeout, requestTimeout, healthTTL time.Duration
+	recoverySuccesses                       int
+}
 
-```go
-func (p *weComHAEntryPool) serveCallback(writer http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodGet && request.Method != http.MethodPost {
-		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+func newWeComHAEntry(backends []*url.URL, client *http.Client) (*wecomHAEntry, error) {
+	if len(backends) < 2 {
+		return nil, errors.New("at least two backends are required")
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	clientCopy := *client
+	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	entry := &wecomHAEntry{backends: make([]wecomHAEntryBackend, len(backends)), health: make([]atomic.Bool, len(backends)), client: client}
+	entry.client = &clientCopy
+	entry.epoch = make([]uint64, len(backends))
+	entry.probeTimeout, entry.requestTimeout, entry.healthTTL, entry.recoverySuccesses = time.Second, 2*time.Second, 6*time.Second, 2
+	for index, backend := range backends {
+		if backend == nil {
+			return nil, errors.New("nil backend")
+		}
+		entry.backends[index] = wecomHAEntryBackend{URL: backend.String()}
+	}
+	return entry, nil
+}
+
+func (entry *wecomHAEntry) probe(ctx context.Context) {
+	var pending sync.WaitGroup
+	for index := range entry.backends {
+		pending.Add(1)
+		go func(index int) {
+			defer pending.Done()
+			entry.mu.Lock()
+			epoch := entry.epoch[index]
+			entry.mu.Unlock()
+			probeCtx, cancel := context.WithTimeout(ctx, entry.probeTimeout)
+			defer cancel()
+			request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, entry.backends[index].URL+"/readyz", nil)
+			if err != nil {
+				entry.recordProbe(index, epoch, false)
+				return
+			}
+			response, err := entry.client.Do(request)
+			if err == nil && response != nil && response.Body != nil {
+				_, bodyErr := io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
+				if bodyErr != nil {
+					err = bodyErr
+				}
+				response.Body.Close()
+			}
+			entry.recordProbe(index, epoch, err == nil && probeCtx.Err() == nil && response != nil && response.Body != nil && response.StatusCode == http.StatusOK)
+		}(index)
+	}
+	pending.Wait()
+}
+
+func (entry *wecomHAEntry) recordProbe(index int, epoch uint64, healthy bool) {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.epoch[index] != epoch {
 		return
 	}
-	if request.Body == nil { request.Body = http.NoBody }
-	body, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, p.limit))
+	backend := &entry.backends[index]
+	if !backend.CheckedAt.IsZero() && time.Since(backend.CheckedAt) > entry.healthTTL {
+		backend.Failures++
+		backend.LastFailure = "health_expired"
+		backend.ConsecutiveSuccesses = 0
+		backend.HealthySince = time.Time{}
+		entry.health[index].Store(false)
+	}
+	backend.CheckedAt = time.Now().UTC()
+	if !healthy {
+		entry.epoch[index]++
+		backend.Failures++
+		backend.LastFailure = "probe_failed"
+		backend.ConsecutiveSuccesses = 0
+		backend.HealthySince = time.Time{}
+		entry.health[index].Store(false)
+		return
+	}
+	backend.ConsecutiveSuccesses++
+	if backend.Failures == 0 || backend.ConsecutiveSuccesses >= entry.recoverySuccesses {
+		if !entry.health[index].Load() {
+			backend.HealthySince = time.Now().UTC()
+		}
+		entry.health[index].Store(true)
+		backend.LastFailure = ""
+	}
+}
+func (entry *wecomHAEntry) failBackend(index int, reason string) {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	entry.epoch[index]++
+	backend := &entry.backends[index]
+	backend.Failures++
+	backend.LastFailure = reason
+	backend.ConsecutiveSuccesses = 0
+	backend.HealthySince = time.Time{}
+	entry.health[index].Store(false)
+}
+func (entry *wecomHAEntry) healthy(index int) bool {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	return entry.health[index].Load() && !entry.backends[index].CheckedAt.IsZero() && time.Since(entry.backends[index].CheckedAt) <= entry.healthTTL
+}
+
+func (entry *wecomHAEntry) anyHealthy() bool {
+	for index := range entry.backends {
+		if entry.healthy(index) {
+			return true
+		}
+	}
+	return false
+}
+
+func (entry *wecomHAEntry) nextHealthy(excluded map[int]struct{}) (int, bool) {
+	start := int((entry.next.Add(1) - 1) % uint64(len(entry.backends)))
+	for offset := range entry.backends {
+		index := (start + offset) % len(entry.backends)
+		if entry.healthy(index) {
+			if _, skip := excluded[index]; !skip {
+				return index, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func (entry *wecomHAEntry) serveHTTP(writer http.ResponseWriter, request *http.Request) {
+	switch request.URL.Path {
+	case "/livez":
+		writer.WriteHeader(http.StatusOK)
+		return
+	case "/readyz":
+		if !entry.anyHealthy() {
+			http.Error(writer, "no healthy callback backend", http.StatusServiceUnavailable)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		return
+	case "/statusz":
+		entry.mu.Lock()
+		status := make([]wecomHAEntryBackend, len(entry.backends))
+		copy(status, entry.backends)
+		for index := range status {
+			status[index].Healthy = entry.health[index].Load() && !status[index].CheckedAt.IsZero() && time.Since(status[index].CheckedAt) <= entry.healthTTL
+		}
+		entry.mu.Unlock()
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(map[string]any{"backends": status})
+		return
+	}
+	if request.URL.Path != "/callbacks/wecom" {
+		http.NotFound(writer, request)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, 2<<20))
 	if err != nil {
-		http.Error(writer, "request body too large", http.StatusRequestEntityTooLarge)
+		http.Error(writer, "callback body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	for _, backend := range p.healthyBackends() {
-		response, forwardErr := p.forward(request, body, backend)
-		if forwardErr != nil { backend.healthy.Store(false); continue }
-		if response.StatusCode == http.StatusBadGateway ||
-			response.StatusCode == http.StatusServiceUnavailable ||
-			response.StatusCode == http.StatusGatewayTimeout {
-			_, _ = io.Copy(io.Discard, response.Body)
-			_ = response.Body.Close()
-			backend.healthy.Store(false)
+	excluded := make(map[int]struct{}, len(entry.backends))
+	for range entry.backends {
+		index, ok := entry.nextHealthy(excluded)
+		if !ok {
+			break
+		}
+		excluded[index] = struct{}{}
+		forwardCtx, cancel := context.WithTimeout(request.Context(), entry.requestTimeout)
+		response, forwardErr := entry.forward(request.WithContext(forwardCtx), body, entry.backends[index].URL)
+		if forwardErr != nil {
+			cancel()
+			if request.Context().Err() != nil {
+				return
+			}
+			entry.failBackend(index, "transport_failed")
 			continue
 		}
-		copyResponse(writer, response)
+		if response == nil || response.Body == nil {
+			cancel()
+			entry.failBackend(index, "invalid_response")
+			continue
+		}
+		if response.StatusCode == http.StatusBadGateway || response.StatusCode == http.StatusServiceUnavailable || response.StatusCode == http.StatusGatewayTimeout {
+			response.Body.Close()
+			cancel()
+			entry.failBackend(index, "backend_unavailable")
+			continue
+		}
+		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
+		response.Body.Close()
+		cancel()
+		if request.Context().Err() != nil {
+			return
+		}
+		if readErr != nil || len(responseBody) > 2<<20 {
+			if response.StatusCode >= 400 && response.StatusCode < 500 {
+				http.Error(writer, "callback rejected", response.StatusCode)
+				return
+			}
+			entry.failBackend(index, "response_incomplete")
+			continue
+		}
+		copyHeaders(writer.Header(), response.Header)
+		writer.WriteHeader(response.StatusCode)
+		_, _ = writer.Write(responseBody)
 		return
 	}
-	http.Error(writer, "no ready callback backend", http.StatusServiceUnavailable)
+	http.Error(writer, "no healthy callback backend", http.StatusServiceUnavailable)
+}
+
+func (entry *wecomHAEntry) forward(inbound *http.Request, body []byte, backend string) (*http.Response, error) {
+	target := backend + inbound.URL.RequestURI()
+	request, err := http.NewRequestWithContext(inbound.Context(), inbound.Method, target, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	copyHeaders(request.Header, inbound.Header)
+	request.Host = ""
+	return entry.client.Do(request)
+}
+
+func copyHeaders(destination, source http.Header) {
+	hop := map[string]bool{"Connection": true, "Keep-Alive": true, "Proxy-Authenticate": true, "Proxy-Authorization": true, "Te": true, "Trailer": true, "Transfer-Encoding": true, "Upgrade": true}
+	for _, token := range strings.Split(source.Get("Connection"), ",") {
+		hop[http.CanonicalHeaderKey(strings.TrimSpace(token))] = true
+	}
+	for key, values := range source {
+		if hop[http.CanonicalHeaderKey(key)] {
+			continue
+		}
+		destination.Del(key)
+		for _, value := range values {
+			destination.Add(key, value)
+		}
+	}
+}
+
+func runWeComHAEntryRole(parent context.Context, getenv func(string) string, logger *roleLogger) error {
+	config, err := loadWeComHAEntryConfig(getenv)
+	if err != nil {
+		return fmt.Errorf("configuration rejected: %w", err)
+	}
+	entry, err := newWeComHAEntry(config.Backends, nil)
+	if err != nil {
+		return err
+	}
+	entry.probeTimeout, entry.requestTimeout, entry.healthTTL, entry.recoverySuccesses = config.ProbeTimeout, config.RequestTimeout, config.HealthTTL, config.RecoverySuccesses
+	entry.probe(parent)
+	processCtx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		ticker := time.NewTicker(config.ProbeInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-processCtx.Done():
+				return
+			case <-ticker.C:
+				entry.probe(processCtx)
+			}
+		}
+	}()
+	server := &http.Server{Addr: config.ListenAddress, Handler: http.HandlerFunc(entry.serveHTTP), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.ListenAndServe() }()
+	select {
+	case runErr := <-errCh:
+		if errors.Is(runErr, http.ErrServerClosed) {
+			return nil
+		}
+		return runErr
+	case <-processCtx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return server.Shutdown(shutdownCtx)
+	}
 }
 ```
 
-**语义**：入口只在尚未返回企业微信响应时切换后端；一旦后端返回业务响应，不会自行进行第二次业务调用。前端切换不能替代后端 Inbox 幂等：callback 超时、入口切换或平台重传最终仍由后端的 provider message identity 归并。
+## 排空准入门
 
-## 5. forward：路径/查询串/header 处理
+来源：`trpcservice/reliability/drain/gate.go`；Begin 后关闭新准入，活动任务 leave 幂等；所有已接纳项退出才关闭 Done。
 
 ```go
-func (p *weComHAEntryPool) forward(request *http.Request, body []byte, backend *weComHAEntryBackend) (*http.Response, error) {
-	target := *backend.URL
-	target.Path = strings.TrimSuffix(target.Path, "/") + request.URL.Path
-	target.RawQuery = request.URL.RawQuery
-	forwarded, err := http.NewRequestWithContext(request.Context(), request.Method, target.String(), bytes.NewReader(body))
-	if err != nil { return nil, err }
-	forwarded.Header = request.Header.Clone()
-	forwarded.Header.Del("Connection")
-	forwarded.Header.Del("Proxy-Connection")
-	forwarded.Header.Del("Transfer-Encoding")
-	forwarded.Header.Set("X-Forwarded-For", request.RemoteAddr)
-	forwarded.Header.Set("X-Forwarded-Proto", "http")
-	forwarded.ContentLength = int64(len(body))
-	return p.client.Do(forwarded)
+// Package drain separates stopping admission from canceling active work.
+package drain
+
+import "sync"
+
+type Gate struct {
+	mu           sync.Mutex
+	stopping     bool
+	active       int
+	signal, done chan struct{}
 }
-```
 
-**语义**：路径拼接保留原 `request.URL.Path`（因此 `/callbacks/wecom` 原样转发到后端同路径），查询串完整保留；删除 hop-by-hop header，注入代理头；`ContentLength` 显式设置避免 chunked 误判。
-
-## 6. 入口自身的 live、ready 与状态接口
-
-```go
-mux.HandleFunc("/livez", func(writer http.ResponseWriter, _ *http.Request) {
-	writer.WriteHeader(http.StatusOK)
-})
-mux.HandleFunc("/readyz", func(writer http.ResponseWriter, _ *http.Request) {
-	if len(pool.healthyBackends()) == 0 {
-		http.Error(writer, "no ready callback backend", http.StatusServiceUnavailable)
+func New() *Gate                        { return &Gate{signal: make(chan struct{}), done: make(chan struct{})} }
+func (g *Gate) Signal() <-chan struct{} { return g.signal }
+func (g *Gate) Done() <-chan struct{}   { return g.done }
+func (g *Gate) Draining() bool          { g.mu.Lock(); defer g.mu.Unlock(); return g.stopping }
+func (g *Gate) Begin() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopping {
 		return
 	}
-	writer.WriteHeader(http.StatusOK)
-})
-mux.HandleFunc("/statusz", func(writer http.ResponseWriter, _ *http.Request) {
-	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(writer).Encode(pool.status())
-})
-mux.HandleFunc("/callbacks/wecom", pool.serveCallback)
-server := &http.Server{Addr: config.ListenAddress, Handler: mux,
-	ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
-	WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
-```
-
-**语义**：当入口进程仍活着但 N1/N2 都不可用时，`/livez` 成功、`/readyz` 失败。这样监控能区分入口故障和无可用业务后端两种场景；`/statusz` 则给出演练时需要的后端健康集合（`{"backends":[{"url":...,"healthy":bool}]}`）。
-
-## 7. 节点侧实例身份与 process_start_id
-
-```go
-func (value webUILocalConfig) instanceName(component string) string {
-	return "webui-local-" + component + "-" + value.InstanceID + "-" + value.ProcessStartID
+	g.stopping = true
+	close(g.signal)
+	if g.active == 0 {
+		close(g.done)
+	}
+}
+func (g *Gate) Enter() (func(), bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopping {
+		return nil, false
+	}
+	g.active++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			g.active--
+			if g.stopping && g.active == 0 {
+				close(g.done)
+			}
+		})
+	}, true
 }
 
-// cmd/trpc-service/webui_local_role.go
-mux.HandleFunc("/statusz", func(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"instance_id": configValue.InstanceID, "process_start_id": processStartID,
+func Signaled(signal <-chan struct{}) bool {
+	select {
+	case <-signal:
+		return true
+	default:
+		return false
+	}
+}
+```
+
+## 运行时停止新轮询与防重启
+
+来源：`cmd/trpc-service/runtime_drain.go`；drainPoll 防新批次；runUntilDrained 不复活已正常排空的消费者；业务 HTTP 返回 503。
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"time"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/drain"
+)
+
+var errRuntimeDrained = errors.New("runtime admissions stopped")
+
+func drainPoll(gate *drain.Gate, operation func(context.Context, int) (int, error)) func(context.Context, int) (int, error) {
+	return func(ctx context.Context, limit int) (int, error) {
+		leave, ok := gate.Enter()
+		if !ok {
+			return 0, errRuntimeDrained
+		}
+		defer leave()
+		return operation(ctx, limit)
+	}
+}
+
+// Keep retrying failed consumers while serving. A completed drain is final:
+// do not resurrect the consumer after it has stopped admitting work.
+func runUntilDrained(ctx context.Context, signal <-chan struct{}, name string, operation func(context.Context) error, logger *roleLogger) error {
+	retryCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	err := runRecoverableLoop(retryCtx, name, func(runCtx context.Context) error {
+		err := operation(runCtx)
+		if drain.Signaled(signal) {
+			cancel()
+		}
+		return err
+	}, 250*time.Millisecond, logger)
+	if ctx.Err() == nil && drain.Signaled(signal) {
+		return nil
+	}
+	return err
+}
+
+func drainingHTTP(next http.Handler, gate *drain.Gate) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if gate.Draining() && r.URL.Path != "/livez" && r.URL.Path != "/readyz" && r.URL.Path != "/statusz" {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "instance draining", http.StatusServiceUnavailable)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
-})
+}
 ```
 
-**语义**：owner/consumer 名 = `webui-local-<component>-<InstanceID>-<ProcessStartID>`。`ProcessStartID` 每次启动随机 8 字节 hex（16 字符），不可配置。重新加入时该值改变，使所有 owner 名随之改变——旧 lease 在 TTL 后过期，旧 consumer 的 pending 被新进程或 peer reclaim。这是"重新加入 ≠ 旧 owner 复活"的代码基础。
+## 只读校验与原子发布
 
-## 8. 节点侧 statusz / readyz / livez / barrier-release
+来源：`cmd/trpc-service/runtime_files.go`；读节点不写；临时文件在摘要目录外，原子 link 不覆盖已有版本。
 
 ```go
-mux.HandleFunc("/livez", func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusOK) })
-mux.HandleFunc("/statusz", func(writer http.ResponseWriter, _ *http.Request) {
-	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(writer).Encode(map[string]string{"instance_id": configValue.InstanceID, "process_start_id": processStartID})
-})
-if inflightBarrier != nil {
-	registerWebUILocalFailoverTestEndpoints(mux, configValue.Token, inflightBarrier)
-	// Registers point-scoped POST arm/release and GET status handlers at
-	// /test/failover/{p1|p2|p3|p4}/..., all token protected.
-}
-mux.HandleFunc("/readyz", func(writer http.ResponseWriter, request *http.Request) {
-	if db.PingContext(request.Context()) != nil || redis.Ping(request.Context()).Err() != nil || malware.Probe(request.Context()) != nil {
-		http.Error(writer, "not ready", http.StatusServiceUnavailable)
-		return
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+func ensureSkillDirectory(path string, readOnly bool) error {
+	if readOnly {
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("shared skill directory unavailable: %w", err)
+		}
+		if !info.IsDir() {
+			return errors.New("shared skill path is not a directory")
+		}
+		return nil
 	}
-	writer.WriteHeader(http.StatusOK)
-})
-```
-
-**语义**：`/statusz` 输出实例身份和组件 owner；`/readyz` 覆盖 db+redis+malware 三个依赖，任一失败即 503；仅在 failover test 启用时注册 point-scoped `/test/failover/{p1|p2|p3|p4}/{arm,status,release}`，所有操作均须 token。标准 E2E 强杀命中节点，不通过 release 改变业务接管。
-
-## 9. 双实例编排：相同业务能力，不同实例身份（Compose 片段）
-
-```yaml
-wecom-ha-node-a:
-  command: ["wecom-local"]
-  restart: "no"
-  environment: &wecom-ha-runtime-environment
-    TRPC_POSTGRES_DSN: postgres://postgres:postgres@postgres:5432/trpc_agent_service_test?sslmode=disable
-    TRPC_REDIS_ADDRESS: redis:6379
-    TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS: clamav:3310
-    TRPC_LISTEN_ADDRESS: ":8080"
-    TRPC_WECOM_LOCAL_ENABLED: "true"
-    TRPC_WECOM_SECONDARY_LOCAL_ENABLED: "true"
-    TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
-    TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
-    TRPC_OTEL_ENDPOINT: http://otel-collector:4318
-    TRPC_OTEL_ALLOW_INSECURE: "true"
-    TRPC_SERVICE_VERSION: ${TRPC_LOCAL_SERVICE_VERSION:-development}
-    TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-node-a
-  secrets: [deepseek_api_key]
-  volumes: [webui-local-skills:/var/lib/trpc-webui-local/skills]
-  ports: ["${TRPC_LOCAL_WECOM_HA_NODE_A_PORT:-58088}:8080"]
-  depends_on:
-    wecom-ha-bootstrap: { condition: service_completed_successfully }
-    clamav: { condition: service_healthy }
-    otel-collector: { condition: service_started }
-
-wecom-ha-node-b:
-  command: ["wecom-local"]
-  restart: "no"
-  environment:
-    <<: *wecom-ha-runtime-environment
-    TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-node-b
-  # ... 其余同 node-a
-  ports: ["${TRPC_LOCAL_WECOM_HA_NODE_B_PORT:-58089}:8080"]
-
-wecom-ha-entry:
-  command: ["wecom-ha-entry"]
-  restart: "no"
-  environment:
-    TRPC_LISTEN_ADDRESS: ":8080"
-    TRPC_WECOM_HA_ENTRY_BACKENDS: http://wecom-ha-node-a:8080,http://wecom-ha-node-b:8080
-    TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL: 1s
-  ports: ["${TRPC_LOCAL_WECOM_HA_ENTRY_PORT:-58087}:8080"]
-  depends_on:
-    wecom-ha-node-a: { condition: service_started }
-    wecom-ha-node-b: { condition: service_started }
-```
-
-**语义**：N1/N2 共享版本、tenant 配置、数据库和协调服务，但部署身份不同。`restart: "no"` 是接管验收的关键：强杀 N1 后，运行时不得暗中重建 N1 来掩盖 N2 是否真的接管。自动重启是另一个独立场景，不应混入本测试。完整服务定义见 `REFERENCE-IMPLEMENTATION.md` 第 3 节。
-
-## 10. 生命周期脚本检查的是故障语义，不只是命令成功
-
-```bash
-# 变量（来自 single-host-multicontainer.sh）
-project="${TRPC_SINGLE_HOST_PROJECT:-trpc-single-host-${RANDOM}${RANDOM}}"
-entry_port="${TRPC_LOCAL_WECOM_HA_ENTRY_PORT:-58087}"
-node_a_port="${TRPC_LOCAL_WECOM_HA_NODE_A_PORT:-58088}"
-node_b_port="${TRPC_LOCAL_WECOM_HA_NODE_B_PORT:-58089}"
-timeout_seconds="${TRPC_SINGLE_HOST_TIMEOUT_SECONDS:-120}"
-stability_seconds="${TRPC_SINGLE_HOST_STABILITY_SECONDS:-5}"
-
-compose() { docker compose --project-name "${project}" -f "${compose_file}" --profile wecom-ha-local "$@"; }
-
-wait_entry_backend() {
-  local node=$1 healthy=$2
-  local expected="\"url\":\"http://${node}:8080\",\"healthy\":${healthy}"
-  while true; do
-    if curl --fail --silent --show-error "http://127.0.0.1:${entry_port}/statusz" >"${diagnostics}/entry-probe.json" 2>/dev/null &&
-       grep -Fq "${expected}" "${diagnostics}/entry-probe.json"; then return 0; fi
-    (( SECONDS >= deadline )) && return 1
-    sleep 1
-  done
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o700)
 }
 
-process_start_id() { sed -nE 's/.*"process_start_id":"([^"]+)".*/\1/p' "$1" | head -n 1; }
-
-assert_stopped() {
-  [[ "$(docker inspect --format '{{.State.Running}}' "$1")" == "false" ]] || { echo "victim restarted unexpectedly: $1" >&2; return 1; }
+// Only the bootstrap writer may publish immutable package content. Publication
+// is atomic and never overwrites an existing version, even across processes.
+func ensureSkillFile(stagingRoot, path string, content []byte, readOnly bool) error {
+	check := func() error {
+		existing, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(existing, content) {
+			return errors.New("published skill content does not match this binary")
+		}
+		return nil
+	}
+	if err := check(); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if readOnly {
+		return errors.New("shared skill package is missing; run bootstrap before starting readers")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	// Keep unfinished files outside every published package's digest root.
+	publishing := filepath.Join(stagingRoot, ".publishing")
+	if err := os.MkdirAll(publishing, 0o700); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(publishing, ".skill-publish-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if _, err = file.Write(content); err != nil {
+		file.Close()
+		return err
+	}
+	if err = file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err = file.Close(); err != nil {
+		return err
+	}
+	if err = os.Link(file.Name(), path); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	return check()
 }
-
-# 核心流程
-compose up --detach --build
-wait_http "http://127.0.0.1:${node_a_port}/readyz" "node A readiness"
-wait_http "http://127.0.0.1:${node_b_port}/readyz" "node B readiness"
-wait_http "http://127.0.0.1:${entry_port}/readyz" "stable entry readiness"
-wait_entry_backend "wecom-ha-node-a" true
-wait_entry_backend "wecom-ha-node-b" true
-node_a_start_before="$(process_start_id "${diagnostics}/baseline-node-a.json")"
-
-node_a_container="$(compose ps -q wecom-ha-node-a)"
-docker kill --signal=KILL "${node_a_container}"
-wait_entry_backend "wecom-ha-node-a" false
-wait_entry_backend "wecom-ha-node-b" true
-assert_stopped "${node_a_container}"; sleep 2; assert_stopped "${node_a_container}"
-
-compose start wecom-ha-node-a
-wait_entry_backend "wecom-ha-node-a" true
-node_a_start_after="$(process_start_id "${diagnostics}/node-a-rejoined-node-a.json")"
-[[ -n "${node_a_start_after}" && "${node_a_start_after}" != "${node_a_start_before}" ]] || { echo "no new process identity"; exit 1; }
-sleep "${stability_seconds}"
-
-node_b_container="$(compose ps -q wecom-ha-node-b)"
-docker kill --signal=KILL "${node_b_container}"
-wait_entry_backend "wecom-ha-node-a" true
-wait_entry_backend "wecom-ha-node-b" false
-assert_stopped "${node_b_container}"
 ```
 
-**语义**：演练依次验证——N1 被杀后确实保持停止、入口只保留 N2；N1 显式重新加入后进程身份变化；N2 被反向强杀后入口只保留 N1。`wait_entry_backend` 通过 grep `/statusz` 中的 `"url":"http://<node>:8080","healthy":<bool>` 子串判定入口健康集合；`process_start_id` 比较判定重新加入产生新 owner；`assert_stopped` 二次确认不是瞬时。`restart: "no"` 保证 `docker kill` 后容器不会自动复活，使"存活实例接管"可被严格证明。HTTP 检查不能代替真实 Bot 原会话和最终回复验证，但能证明实例生命周期与入口接管逻辑实际发生。
+## 组合根实际接线：排空与退出
 
-## 11. 节点侧 owner 装配代码（摘录自 webui_local_role.go）
+来源：cmd/trpc-service/webui_local_role.go 的运行函数尾段（节选，依赖前文已构造的组件与drainGate）。HTTP与进度发布不参与draining WaitGroup，活动工作等待结束/到期后才取消processCtx，随后有界等待后台退出。
 
 ```go
-// worker：owner 同时作为 ConsumerID；Shards 固定 [0,1,2,3]
-workerConsumer := worker.Consumer{
-	WorkerID: configValue.instanceName("worker"),
-	Shards:   []broker.Shard{0, 1, 2, 3},
-	Broker:   streamBroker, Leases: leases, Sessions: sessionStore, Parker: tasks, Statuses: tasks,
-	Executor: executor,
-	LeaseTTL: 30 * time.Second, RenewInterval: 10 * time.Second, RetryWait: 250 * time.Millisecond,
-	ReclaimInterval: 5 * time.Second, ReclaimLimit: 100, DrainTimeout: 30 * time.Second,
+signalCtx, stopSignals := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	processCtx, stop := context.WithCancel(context.WithoutCancel(parent))
+	defer stop()
+	server := &http.Server{Addr: configValue.ListenAddress, Handler: drainingHTTP(mux, drainGate), ReadHeaderTimeout: 5 * time.Second,
+		BaseContext: func(net.Listener) context.Context { return processCtx },
+		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+
+	errorsCh := make(chan error, 8)
+	var background sync.WaitGroup
+	var draining sync.WaitGroup
+	start := func(name string, operation func(context.Context) error) {
+		background.Add(1)
+		mustDrain := name != "http" && name != "progress publisher"
+		if mustDrain {
+			draining.Add(1)
+		}
+		go func() {
+			defer background.Done()
+			if mustDrain {
+				defer draining.Done()
+			}
+			operationErr := operation(processCtx)
+			if operationErr == nil && !drainGate.Draining() && processCtx.Err() == nil {
+				operationErr = errors.New("component stopped unexpectedly")
+			}
+			if operationErr != nil && !errors.Is(operationErr, context.Canceled) && !drainGate.Draining() {
+				select {
+				case errorsCh <- fmt.Errorf("%s stopped: %w", name, operationErr):
+				case <-processCtx.Done():
+				}
+			}
+		}()
+	}
+	start("preprocess", func(ctx context.Context) error {
+		return runPreprocessLoop(ctx, drainPoll(drainGate, health.poll("preprocess", func(ctx context.Context) (int, error) { return preprocessor.RunOnce(ctx, 100) })), 100*time.Millisecond, 100, logger)
+	})
+	start("progress publisher", progressPublisher.Run)
+	start("confirmation expiry reconciler", func(ctx context.Context) error {
+		reconciler := governance.ConfirmationExpiryReconciler{Coordinator: governanceStore, BatchSize: 100}
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-drainGate.Signal():
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+				leave, ok := drainGate.Enter()
+				if !ok {
+					return nil
+				}
+				if _, expiryErr := reconciler.RunOnce(ctx); expiryErr != nil {
+					health.observe("confirmation-expiry", expiryErr)
+					logger.Printf("webui confirmation expiry degraded: %v", expiryErr)
+				} else {
+					health.observe("confirmation-expiry", nil)
+				}
+				leave()
+			}
+		}
+	})
+	start("dispatch relay", func(ctx context.Context) error {
+		return runPreprocessLoop(ctx, drainPoll(drainGate, health.poll("dispatch-relay", dispatchRelay.RunOnce)), 100*time.Millisecond, 100, logger)
+	})
+	start("worker", func(ctx context.Context) error {
+		return runUntilDrained(ctx, drainGate.Signal(), "webui worker", health.run("worker", workerConsumer.Run), logger)
+	})
+	start("reply relay", func(ctx context.Context) error {
+		return runPreprocessLoop(ctx, drainPoll(drainGate, health.poll("reply-relay", replyRelay.RunOnce)), 100*time.Millisecond, 100, logger)
+	})
+	start("wakeup relay", func(ctx context.Context) error {
+		return runPreprocessLoop(ctx, drainPoll(drainGate, health.poll("wakeup-relay", wakeupRelay.RunOnce)), 100*time.Millisecond, 100, logger)
+	})
+	start("wakeup dispatcher", func(ctx context.Context) error {
+		return runUntilDrained(ctx, drainGate.Signal(), "webui wakeup dispatcher", health.run("wakeup", wakeupDispatcher.Run), logger)
+	})
+	start("delivery", func(ctx context.Context) error {
+		return runUntilDrained(ctx, drainGate.Signal(), "webui delivery", health.run("delivery", deliverySupervisor.Run), logger)
+	})
+	start("http", func(context.Context) error { return server.ListenAndServe() })
+	logger.Printf("WebUI local node=%q started; business readiness available at /readyz: http://localhost%s/webui/ route=%q account=%q model=deepseek",
+		configValue.InstanceID, configValue.ListenAddress, configValue.RouteKey, webUILocalAccountID)
+
+	var terminalErr error
+	select {
+	case <-signalCtx.Done():
+	case terminalErr = <-errorsCh:
+	}
+	health.beginDrain()
+	drainGate.Begin()
+	logger.Printf("runtime drain started instance=%q timeout=%s", configValue.InstanceID, configValue.DrainTimeout)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), configValue.DrainTimeout)
+	defer cancelShutdown()
+	httpDone := make(chan error, 1)
+	go func() { httpDone <- server.Shutdown(shutdownCtx) }()
+	drainDone := make(chan struct{})
+	go func() { draining.Wait(); close(drainDone) }()
+	select {
+	case <-drainDone:
+		logger.Printf("runtime drain completed instance=%q", configValue.InstanceID)
+	case <-shutdownCtx.Done():
+		terminalErr = errors.Join(terminalErr, errors.New("runtime drain timed out; durable work left for takeover"))
+	}
+	stop()
+	if httpErr := <-httpDone; httpErr != nil {
+		_ = server.Close()
+		terminalErr = errors.Join(terminalErr, httpErr)
+	}
+	health.stop()
+	done := make(chan struct{})
+	go func() { background.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-shutdownCtx.Done():
+		if terminalErr == nil {
+			terminalErr = errors.New("webui local shutdown timed out")
+		}
+	}
+	return terminalErr
 }
-
-// relay / delivery：ClaimTTL 30s, ClaimRenewInterval 10s, PollInterval 100ms
-dispatchRelay := relay.DispatchRelay{Outbox: inbox, Tasks: tasks, Broker: streamBroker,
-	Owner: configValue.instanceName("dispatch-relay"), ShardCount: 4,
-	ClaimTTL: 30 * time.Second, ClaimRenewInterval: 10 * time.Second, PollInterval: 100 * time.Millisecond}
-replyRelay := relay.ReplyRelay{Outbox: inbox, Results: payloads, Routes: inbox, Replies: publisher,
-	Owner: configValue.instanceName("reply-relay"),
-	ClaimTTL: 30 * time.Second, ClaimRenewInterval: 10 * time.Second, PollInterval: 100 * time.Millisecond}
-wakeupRelay := relay.WakeupRelay{Outbox: inbox, Wakeups: publisher,
-	Owner: configValue.instanceName("wakeup-relay"),
-	ClaimTTL: 30 * time.Second, ClaimRenewInterval: 10 * time.Second, PollInterval: 100 * time.Millisecond}
-wakeupDispatcher := relay.WakeupDispatcher{ConsumerID: configValue.instanceName("wakeup"),
-	Wakeups: wakeupQueue, Store: tasks, Dispatch: streamBroker, ShardCount: 4,
-	ReclaimInterval: 5 * time.Second, ReclaimLimit: 100}
-deliveryService := channeldelivery.Service{Results: payloads, Ledger: inbox, Adapters: deliveryCatalog,
-	Owner: configValue.instanceName("delivery"),
-	ClaimTTL: 30 * time.Second, ClaimRenewInterval: 10 * time.Second,
-	DefaultRetryDelay: time.Second, MaxRetryDelay: time.Minute, MaxAttempts: 8, MaxReconcileAttempts: 8}
 ```
 
-**语义**：7 个组件的 owner/consumer 名均由 `instanceName(component)` 生成，内含 `InstanceID` 与 `process_start_id`，因此重新加入时全部改变，旧占用由存活实例按 lease/claim 过期规则回收。
+## 结论与证据回查
 
-## 12. 入口与节点 `/statusz` 示例快照
+字段及约束见 [design.md](design.md)，故障判定见 [testing-and-acceptance.md](testing-and-acceptance.md)。代码只能证明条件更新和恢复分支存在，真实渠道可见次数仍需客户端证据，不能从 Ledger 一行推断下游接收次数。
 
-入口 `GET /statusz`（基线，两后端健康）：
+## 代码证据与外部演练的对应
 
-```json
-{"backends":[
-  {"url":"http://wecom-ha-node-a:8080","healthy":true},
-  {"url":"http://wecom-ha-node-b:8080","healthy":true}
-]}
-```
+| 已摘录的代码 | 能直接审查的性质 | 外部仍需验证 |
+|---|---|---|
+| loadWeComHAEntryConfig | origin、参数范围和默认值校验 | 部署实际注入值和容器DNS可达。 |
+| probe/recordProbe | 并发、epoch与恢复窗口 | 实际延迟下摘除/重加入时间。 |
+| serveHTTP/forward | 签名材料保持、拒绝不切换、转发有界 | 真实callback与Inbox重复接收。 |
+| gate/runtime drain | 停准入、停止读取、工作有界结束 | 目标工具/渠道是否响应取消。 |
+| runtime_files | 读模式不写、原子发布不覆盖 | 主机卷权限、空间与镜像内容一致。 |
+| 组合根接线 | 角色接入同一drain信号，结束不重启 | 长期负载、资源趋势与反向故障。 |
 
-入口 `GET /statusz`（N1 强杀后）：
+## 为什么此处保留完整入口源码
 
-```json
-{"backends":[
-  {"url":"http://wecom-ha-node-a:8080","healthy":false},
-  {"url":"http://wecom-ha-node-b:8080","healthy":true}
-]}
-```
+入口的安全性质分散在配置、client构造、状态记录、路由选择和响应读取中。只贴健康布尔值或forward函数会遗漏重定向、逐跳头、旧探测和响应已写后的切换问题。
 
-节点 `GET /statusz`（N1 重新加入前后对比）：
-
-```json
-// 基线
-{"instance_id":"wecom-ha-node-a","process_start_id":"9f3c1a2b4d5e6f07"}
-// 重新加入后（process_start_id 已变）
-{"instance_id":"wecom-ha-node-a","process_start_id":"1b2c3d4e5f6a7b8c"}
-```
-
-`process_start_id` 前后对比的判定（脚本逻辑等价）：
-
-```bash
-before="9f3c1a2b4d5e6f07"; after="1b2c3d4e5f6a7b8c"
-[[ -n "$after" && "$after" != "$before" ]] && echo "rejoin produced new owner" || echo "FAIL"
-```
-
-## 13. 代码与设计结论的对应关系
-
-| 设计结论 | 本文代码证据 |
-|---|---|
-| 公开地址不随 N1/N2 切换 | 第 1–6 节独立入口 |
-| 只有可处理业务的实例接收回调 | 第 2 节 readiness 探测 |
-| 前端转发失败可换健康后端 | 第 4 节 callback 轮询 |
-| 强杀不会被自动重启掩盖 | 第 9 节 `restart: "no"` |
-| 重新加入不是旧 owner 复活 | 第 7、10 节 process identity 比较 |
-| 同一会话单有效提交者 | Redis lease + `commit_turn` fence 拒绝（见本包 `FULL-GUIDE.md` §14 与 `REFERENCE-IMPLEMENTATION.md` 的不变量表） |
+排空同样不能只看Consumer：组合根若立刻取消活动context，Consumer自己的“读取消/工作取消分离”仍会失去意义。附录保留组合根接线，便于把局部协议与进程生命周期一起审查。

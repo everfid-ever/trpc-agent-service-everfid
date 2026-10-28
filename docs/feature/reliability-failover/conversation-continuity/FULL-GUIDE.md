@@ -1,361 +1,249 @@
-# 故障恢复后继续对话：完整实现说明
+# 故障恢复后继续对话 — 完整实现说明
 
-> 本文是**自包含**的能力说明，可直接照其实现等价系统。凡涉及表名、字段、函数、环境变量、Lua、Go 标识符，均与参考实现逐字一致；如需与原实现交叉核对，可在括号内标注的位置查看对应源文件。
+## 从渠道身份到持久化会话
 
----
+本能力保护 身份映射与官方会话后端。BindingRoute 先由 opaque route key 定位渠道配置，协议验签后才形成可信 Binding。用户不能通过正文任意选择租户。身份映射按租户 identity/session 密钥做 HMAC，字段按长度前缀编码，避免拼接碰撞：单聊 session 使用 channel/account/dm/user，群聊使用 channel/account/group/chat。映射密钥版本、账号或身份维度改变可能改变会话，发布时必须保持兼容。
 
-## 1. 要解决的实际问题
+SDK app_name 用 TenantKey 编码 tenant 和 agent app，生产每轮由BufferedTurn的checked facade检查app/user/session；TenantGetSessionHook为单作用域调用提供相应hook。聊天内容由官方SDK session_events保存；平台session_head/session_commit管理输入顺序、提交和fence。BufferedTurn.Commit不再给平台session_event写第二份聊天真相；平台LoadSession方法存在，不代表生产上下文从它加载。
 
-平台同时服务两个企业微信 Bot。Bot A 绑定 Tenant A，Bot B 绑定 Tenant B。用户曾分别在两个原会话中输入不同代号；任一应用节点故障后，用户继续在同一聊天窗口询问代号，系统必须：
+## 为什么消息和路由必须同时保存
 
-1. **身份不能串**：A 的回复只能含 Tenant A 的代号，B 只能含 Tenant B 的；服务端 `request` / `session` / `terminal result` / `delivery record` 必须指向同一 tenant。
-2. **历史不能丢**：进程内存全失后仍能从持久化 `session` 回忆各自上下文。
-3. **旧执行者不能覆盖新执行者**：隔离后的旧 N1 即便恢复网络，也不能用迟到写入覆盖 N2 已提交的结果。
+验签完成后先保存 Inbox、加密输入与预处理工作，并冻结 ReplyRoute。Inbox 的渠道消息唯一键防止入口重试或 provider 重传创建新任务。request_id 在 dispatch、worker、result 和 reply event 之间贯穿。若只保存消息文本而恢复时重新猜 Bot/tenant，节点接管可能把结果发往错误账号；冻结路由避免这一问题。
 
-仅靠模型 Prompt、进程内缓存、Docker 重启或“再发一条消息成功”都不能证明上述三点成立——它们都绕过了“服务端持久化链路”这一真正证据面。
+## 故障瞬间发生什么
 
----
+1. 稳定入口发现故障节点 ready 失败或转发失败，后续回调选择存活节点；两 Bot 仍使用相同公开 origin。
+2. 未确认工作保留在 Redis pending；Worker reclaim 后读 PostgreSQL last_fence，校准 Redis 计数，再取得会话 lease。
+3. 原会话持久历史被新运行读取，input_seq 与 session version 限制顺序；旧 owner 失权后取消执行，迟到写入仍须通过数据库 fence 校验。
+4. 已 terminal 的输入直接识别终态，不重跑模型。未 terminal 但已有冻结 result 的输入校验原答案后续提交；其余进入模型/工具恢复。
+5. terminal commit 与 reply Outbox 同事务产生。Relay 和 Delivery 可由其他节点继续，不要求执行节点也持有发送职责。
 
-## 2. 参与者与权威状态
+## 为什么 lease、fence、Inbox、Outbox 都要有
 
-| 参与者 | 职责 | 绝不能作为唯一事实的内容 |
-|---|---|---|
-| 企业微信 | 原始消息、签名、最终显示回复 | 服务端是否已持久接收、是否已提交业务结果 |
-| 稳定入口 | 将 callback 交给健康节点 | tenant 路由、消息去重、会话状态 |
-| N1 / N2 | 验签、执行、转发、投递 | 会话历史、未完成任务、发送完成状态 |
-| PostgreSQL | binding、Inbox、session、result、outbox、ledger | 高吞吐消费调度 |
-| Redis | 任务传输、pending reclaim、lease/fence | tenant 或 terminal result 的最终裁决 |
-
-**分层原则：** 数据库保存业务事实；队列保存可重放工作；应用节点保存暂态计算。节点死亡后仍继续，正是因为权威事实在库里，不在进程里。
-
----
-
-## 3. 从 Bot 到 tenant 的可信路径（为什么身份不串）
-
-外部请求**不能**自行指定 tenant。系统先通过 callback 的 route key 找到候选 Bot binding，再在该 binding 的凭据范围内验签。验签成功后，binding 才决定 tenant、Agent、发送凭据、配置版本和能力集合：
-
-```text
-callback → channel_public_route(route_key_digest) → channel_binding_locator(opaque_binding_id)
-        → channel_ingress_candidate 验签 → binding → Tenant Context(tenant_id, agent_app_id, config_version, secrets)
-```
-
-相关表（真实字段见 `REFERENCE-IMPLEMENTATION.md` §2）：
-
-- `channel_public_route(channel, route_key_digest, opaque_binding_id, binding_version, enabled, ...)`：公开路由表，约束 `opaque_binding_id` 长度 16..256、`route_key_digest` 长度 16..256。
-- `channel_binding_locator(opaque_binding_id, tenant_id, config_version, binding_id, identity_secret_ref/version, session_secret_ref/version)`。
-- `channel_ingress_candidate(candidate_token_digest, opaque_binding_id, channel, route_key_digest, purpose='channel_verify', binding_version, state, ...)`，`state IN ('issued','verifier_acquired','verified','promoted','burned')`。
-- `channel_binding(tenant_id, config_version, binding_id, channel, external_account_id, agent_app_id, secret_ref, secret_version, send_secret_ref, send_secret_version)`。
-
-因此两个 Bot 即使使用同一模型上游，也不共享会话、工具、知识或发送身份。测试中模型“自称属于某租户”**没有证据价值**；只有 binding、tenant、session 与投递记录的一致关联才是证据（不变量 I1）。
-
----
-
-## 4. 如何保存原会话（四元组持久化链路）
-
-会话链路由四个稳定身份串起：
-
-```text
-tenant_id（验签后推出）
-  + agent_app_id（Bot Binding 推出）
-  + session_id（外部 chat 稳定标识）
-  + external_message_id（单条入站消息）
-```
-
-- `inbox` 唯一键：`(tenant_id, channel, external_account_id, external_message_id)`（PK，行 5105）。每次入站消息先 `claim_inbox` 去重并持久化原始输入。
-- 入站经 `prepare_dispatch` 分配 `input_seq`，写入 `session_head(tenant_id, agent_app_id, session_id)`（PK 三元组）与 `execution_record`。
-- 会话只保存**已提交** turn；模型生成到一半、工具失败或取消的内容不进入下一轮上下文。
-
-完成一轮时，系统在同一持久化提交（`commit_turn`）中完成（不变量 I4）：
-
-1. 写 terminal result（`result_payload` + `session_commit.outcome`）；
-2. 推进 `session_head` 的已提交历史和 `next_input_seq`；
-3. 写 reply `outbox`（kind='reply'，idempotency_key = `reply:<request_id>`）；
-4. 更新本会话最后有效 `last_fence`。
-
-这样 N2 接管后从数据库读取的永远是稳定历史。若节点死在提交前，该轮没有进入历史；若死在提交后发送前，结果和待发回复仍存在，不需要重跑模型。
-
----
-
-## 5. 为什么需要 lease 和 fence 两种机制（因果链）
-
-**只做 Redis 锁行不行？不行。** Redis 锁（lease）解决“谁当前可执行”，但解决不了**网络隔离后的迟到写**：
-
-```text
-N1 fence=20，随后失联（未死，只是连不上协调服务）
-N2 fence=21，提交成功，session_head.last_fence=21
-N1 恢复网络，带 fence=20 提交
-数据库拒绝 N1（p_fence=20 < last_fence=21）；N2 的结果保持不变
-```
-
-Lease 是带 TTL 的临时执行许可，防止 N1/N2 在同一时刻正常并发执行同一 session。故障节点停止续租后 lease 到期，N2 可领取新的许可。但 lease 不能解决“旧执行者迟到写”，于是每次许可都会得到**递增 fence**，数据库在 `commit_turn` 中以 `IF p_fence < v_head.last_fence THEN RAISE 'stale fence' USING ERRCODE='40001'` 拒绝更小 fence 的写入。
-
-**为什么不能 ACK 后再写库？** 如果先 `Broker.Ack`、再写 `session_commit`，那么节点在 ACK 之后、写库之前崩溃，这条消息既不会重投（已 ACK）也不会有结果（未写库），永久丢失。正确顺序是：**terminal commit 成功 → 才 `Broker.Ack`**；`executeErr != nil` 时直接返回（不 ACK），保留 pending 供存活节点 reclaim（不变量 I5）。
-
-**为什么容器重启不算接管？** 本包 `restart: "no"`，强杀后受害节点必须保持停止。若依赖 Docker 重启，验证的是“重启恢复”，且旧 ProcessStartID 可能复用，无法证明“另一节点接管”。每次启动新生成的 `ProcessStartID`（8 字节 hex）使重新加入不复用旧 owner（不变量 I9）。
-
----
-
-## 6. 正常消息的完整时序
-
-```text
-用户 → Bot A → 稳定入口 → 健康节点
-  → 可信 Ingress：route key → binding → 验签 → Tenant A Context
-  → claim_inbox 去重并持久化原始输入（state=preprocess_pending/dispatch_pending）
-  → prepare_dispatch 分配 input_seq，写 session_head + execution_record，inbox→dispatch_ready
-  → Dispatch Outbox 产生执行任务
-  → Worker 获取该会话 lease/fence（ReadLastFence → EnsureFenceAtLeast → Acquire）
-  → 读取 Tenant A 的已提交历史（session_head + session_event）并执行模型
-  → 原子提交 commit_turn：result + session turn + reply outbox（单事务）
-  → Relay 发布 reply 事件
-  → Delivery 领取台账 ClaimDelivery、调用企业微信、FinishDelivery 置 sent
-```
-
-任何一步失败都不能跳过前面的持久化边界。尤其 ACK 只能在 terminal commit 之后。
-
----
-
-## 7. N1 强杀后会发生什么（接管时序）
-
-```text
-t0    N1 被 SIGKILL：停止续租、停止消费、停止发送；受害节点保持停止
-t1    N2 reclaim goroutine（每秒 Broker.Reclaim）发现 pending entry / 入口摘除 N1
-t2    入口 readiness 探测把 N1 摘除，新 callback 转给 N2（/statusz healthy 轮转）
-t3    N2 读取相同 binding 与共享数据库，仍可验证 Bot A/B 并找到各自原会话
-t4    若有未确认工作，N2 在 reclaim 周期后领取；若需处理同一 session，则取得更大 fence
-t5    N2 按持久化历史继续下一轮；旧 N1 即使后续恢复也因 stale fence 失去提交权
-t6    N2 发送最终回复并把 delivery_ledger 推进为 sent
-```
-
-> `t_connect`（连接/入口恢复）、`t_worker`（执行者可处理/回收）、`t_ready`（业务链路整体 ready）各自代表不同事实，不能把任一当作精确端到端 RTO（见 §10）。
-
-这个过程**不允许**手工删除租约、手工重绑 Bot、手工重新入队或先重启受害节点，否则只能证明人工恢复，不是自动接管。
-
-### 7.1 术语澄清：需求里的"连接接管"在本架构中具体指什么
-
-需求表述为"通过**连接**与 Worker 自动接管"。这一条需要澄清，否则容易去找并不存在的机制：
-
-- **本系统是 HTTP 回调（webhook）架构，不存在需要转移所有权的长连接。** WeCom / 飞书 / WebUI / 通用 httpcallback 四个渠道全部是"平台主动向登记 URL 发 HTTP 请求"（`trpcservice/channels/` 下无 WebSocket 或长连接消费者）。
-- 因此"连接接管"在这套实现里等价于三件可核查的事：
-  1. **公开回调地址不变** —— 企业微信登记的 URL 始终指向稳定入口，实例生死不改变它；
-  2. **新回调能到达存活节点** —— 入口按 `/readyz` 摘除受害节点并转发给健康节点（对应上表 `t_connect`）；
-  3. **Bot 身份本身是共享配置** —— 两个节点持有相同的版本化 binding，所以存活节点本来就能代表同一个 Bot A/B 完成验签与回复；不需要"把 Bot 连接交过去"。
-- **推论：** 验收时不要寻找"连接所有权转移"的日志或状态；正确的证据是 ① 入口健康集合只剩存活节点；② 该节点仍在同一租户会话上取得更高 fence 并提交成功；③ 客户端在故障后仍能收到回复。三者合计即"连接接管成立"。
-
-> 与之相对，**Worker 接管**是真实存在的状态转移：Redis pending entry 被 reclaim、lease 被重新取得、fence 递增（对应 `t_worker`）。
-
----
-
-## 8. 什么叫“最终回复正确”（计数区分，务必写清）
-
-必须区分三类计数，混为一谈会误判：
-
-| 计数 | 含义 | 本子系统约束 |
-|---|---|---|
-| **模型调用次数** | P2 执行中调用 LLM 的次数 | 允许 >1（接管可重跑模型），不承诺恒为 1 |
-| **任务尝试次数** | `execution_record.park_attempt` / `delivery_ledger.attempt` | 受 `park_execution` 的 max_attempts(≤64) 与 delivery MaxAttempts(8) 约束 |
-| **最终回复次数** | `delivery_ledger` 每 segment 一行，state='sent' 后不可重发 | 每输入一份内容只对应一条客户端可见 final |
-
-“最终回复正确”需同时满足：客户端只看到一条最终回复；回复内容只含所属 tenant 的代号；服务端 `request` / `session` / `terminal result` / `delivery record` 指向同一 tenant；没有另一租户的历史、工具结果或凭据痕迹。流式占位、进度消息与最终回复分别计数，不能用“正在处理”代替最终交付。
-
----
-
-## 9. 投递为何必须 P3/P4 两段对账
-
-`delivery_ledger` 状态机：`pending → sending → sent`，并含 `retry_wait` / `ambiguous` / `failed`。
-
-- **P3 barrier**（`ReplyRelay` 已构造 reply event、`PublishReply` 前）：暂停点验证已提交结果的 relay publish 可由存活节点重放，不重跑模型。
-- **P4 barrier**（`ClaimDelivery` 成功、调用 provider 前）：暂停点验证 delivery claim 接管后可安全调用 provider。provider 已接受但本地未知的独立窗口由 `client_request_id` 去重/对账收敛。
-
-错误分类（见 `delivery/service.go`）：
-- `AmbiguousDeliveryError` → state=`ambiguous`，`last_error_class='response_lost'`，进入 `reconcile`。
-- `PermanentDeliveryError` → `finishFailed(reconcile=false)`。
-- `RetryableDeliveryError` → `finishRetry(请求的 delay)`；其他 → `finishRetry(0)`。
-- `Delivered=false` → `finishRetry(ErrBackendUnavailable)`。
-- `ProviderMessageID==""` → `ambiguous`，`last_error_class='missing_provider_message_id'`。
-
-发送 owner 崩溃时，Claim TTL（默认 30s）到期后由存活节点接管；`sent` 记录只能 ACK，不能重发（不变量 I6）。下游可去重时 P4 收敛，否则诚实 `ambiguous`（不变量 I7）。
-
----
-
-## 10. 观测与时间口径（不能夸大精度）
-
-| 时刻 | 代表的事实 | 不代表什么 |
-|---|---|---|
-| `t0` | 外部确认 N1 被终止 | 业务已恢复 |
-| `t_connect` | 入口/连接所有者已恢复 | Worker 一定能提交 |
-| `t_worker` | 执行者可处理/回收任务 | 用户已经看到回复 |
-| `t_ready` | 所需业务链路均已 ready | 精确端到端 RTO |
-| 收到→最终可见 | 一条请求的真实响应时间 | 故障期间未接收消息的恢复时间 |
-
-需要在独立证据目录保存：节点状态、`owner`、`lease/fence`、关联 ID（`tenant_id, binding_id, session_id, request_id, stream_entry_id, fence, delivery_key`）和客户端结果。采样间隔 `DELTA_POLL` 必须随结论记录，**不能宣称比观测频率更精确的结论**。
-
----
-
-## 11. 设计边界与明确不承诺
-
-| 边界 | 说明 |
+| 只保留一个机制 | 会遗漏什么 |
 |---|---|
-| 单节点故障 | 本包验证单应用节点 SIGKILL 后两 Bot 继续对话 |
-| 不替代 P1–P4 | 在途任务接管见相邻 `inflight-task-takeover` |
-| 不替代重加入 | 同主机多容器见相邻 `single-host-multicontainer` |
-| 跨主机/整机/共享依赖 | 不承诺；PostgreSQL·Redis·Qdrant·ClamAV 为共享故障域 |
-| 模型次数 | 不承诺恒为 1，P2 可重跑 |
-| 下游不可去重/不可查询 | P4 不承诺绝对 exactly-once，诚实 `ambiguous` |
-| 自动重启 | 不把 Docker 重启（`restart:"no"`）当作存活节点接管 |
-| RTO | 不把健康/连接/队列恢复单独当作完整业务 RTO |
+| 只健康探测 | 入口摘除不能撤销旧 Worker 的写权限。 |
+| 只 lease | 旧进程在暂停后恢复可能迟到写，必须用数据库 fence/version 拒绝。 |
+| 只数据库 fence | 无法限制并发昂贵执行，也需要校准 Redis 计数以避免回退。 |
+| 只队列 | 无法原子保存业务结果与“应发回复”，提交后崩溃可能漏发。 |
+| 只 Ledger | 不保存身份、上下文或结果；唯一行也不能让无幂等协议的渠道实现 exactly-once。 |
 
----
+## 稳定入口的当前算法
 
-## 12. 网络隔离（脑裂）场景的专门分析
+`wecomHAEntry` 对每个后端并行执行有超时的 `/readyz` 探测。HTTP 200、响应有效且探测 context 未失效才算成功；探测 body 最多读取 1024 字节。每次探测记录开始时的 epoch，较新的失败会递增 epoch，旧结果因 epoch 不匹配被丢弃。
 
-单节点故障有两类，恢复策略完全不同，**必须分开验收**：
+路由须满足健康且 `checked_at` 未过期。初次成功可立即纳入；探测/转发失败或健康过期后需连续成功次数达到阈值。健康有效期为 `3 × (ProbeInterval + ProbeTimeout)`。epoch 是进程内竞态控制字段，不在 /statusz 中公开。
 
-| 故障类型 | 受害节点实际状态 | 谁能提交 | 必须靠什么机制 |
-|---|---|---|---|
-| **进程死亡** | 进程不存在，不再持有任何资源 | N2 | lease TTL 到期 + reclaim |
-| **网络隔离** | 进程**仍活着**，只是连不上 Redis/DB | 只有 N2 能成功；N1 的提交必须被拒 | **fence**（lease 本身不足以解决） |
+`serveHTTP` 只为 callback 路径做转发。正文上限 2 MiB；按轮转起点选择有效健康节点，每次回调对每个节点最多一次。网络失败、502/503/504、非 4xx 的响应读取失败或超限会摘除该后端并尝试另一节点。4xx 拒绝不切换，4xx body 读取失败时仍返回该状态；客户端取消不据此惩罚后端。完整响应缓冲成功后才写给客户端。
 
-网络隔离是这套设计里最容易被低估的场景。假设只做 lease：
+`forward` 保留 RequestURI、正文和签名相关头，`copyHeaders` 去掉逐跳头及 Connection 指定的头，不新增 X-Forwarded-*，也不跟随重定向。入口重试靠后端 durable Inbox 去重；不能代替投递端的幂等协议。
 
-```text
-N1 与 Redis 之间网络中断，但 N1 进程仍在跑、模型已算完
-  → N1 无法续租，lease 在 TTL 后过期
-  → N2 取得新 lease 并提交
-  → 网络恢复，N1 尝试提交它"算好的"结果
-  → 若没有 fence：N1 的迟到写会覆盖 N2 的结果（lost update）
-```
+## SIGTERM 排空顺序
 
-加入 fence 后的正确行为：
+`signalCtx` 接收 SIGTERM/父 context 取消；活动工作使用独立 `processCtx`。主运行时先 `health.beginDrain()`，再 `drainGate.Begin()`，同时调用 HTTP Shutdown 并等待参与排空的角色退出。业务 HTTP 在排空期间返回 503，live/ready/status 路径可检查；ready 不会被迟到的成功轮询恢复成 true。
 
-```text
-N1 acquire 时拿到 fence=20
-  → 网络中断，N1 无法续租，但进程仍持有 fence=20 的执行上下文
-N2 acquire 时拿到 fence=21，提交成功 → session_head.last_fence=21
-  → N1 网络恢复，携带 fence=20 调 commit_turn
-  → commit_turn: IF p_fence(20) < v_head.last_fence(21) THEN RAISE 'stale fence' (40001)
-  → N1 提交被拒，N2 结果不变
-```
+Worker、Delivery 和 Wakeup 的读取 context 先取消，活动工作 context 保留。预处理和 Relay 通过 drainPoll 停止下一批；Delivery Supervisor 停止 refresh/新建消费者，runUntilDrained 不重启已排空的消费者。活动进度发布在最终 processCtx 取消时退出。
 
-**关键推论：**
+默认排空 30 秒；Worker/Delivery 的局部超时装配为应用时限加 1 秒，让主运行时先控制全局期限。正常结束后取消 processCtx；超时则报告排空超时、取消工作并退出。未完成的 durable 工作留给存活节点。排空不是共享队列清零，也不会人工删除 lease。SIGKILL 完全跳过本流程。
 
-1. `EnsureFenceAtLeast` 不是可选优化。没有它，Redis fence 计数在重启/主从切换后回退，新 lease 可能拿到小于数据库 `last_fence` 的值，合法接管者反被拒绝。
-2. fence 的权威在**数据库**，不在 Redis。Redis 只负责"发放严格递增的值"，数据库负责"拒绝任何小于 `last_fence` 的提交"。
-3. `CancelWithLease` 也必须走 `beforeCommit` 续租检查——否则"取消"这一写操作本身可能由已失权的节点完成。
-4. 网络隔离下 N1 可能已经把模型调用完成、甚至已经调用过外部写工具。因此对**外部副作用**必须有业务幂等键，不能靠"提交被拒"来避免重复副作用。
+## 回复承诺与故障假设
 
-**验收方法：** 不要只测 SIGKILL。额外做一次"网络隔离"演练（例如临时阻断 N1 到 Redis 的连接而不杀进程，或在测试环境用 iptables/网络策略模拟），观察 `commit_turn` 是否报出 `stale fence`（SQLSTATE 40001）并且 `session_head.last_fence` 未被回退。这是唯一能证明 fence 真正生效的方法。
+内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。下游已接受、本地确认未提交的 P4 窗口需要下游可靠去重或查询才能自动收敛。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
 
----
-
-## 13. 为什么"Docker 把 N1 拉起来了"不能证明接管
-
-四类恢复机制必须拆开验收，混在一起会得出错误归因：
-
-| 子场景 | 受害节点状态 | 能得出的结论 | 不能得出的结论 |
-|---|---|---|---|
-| **存活实例接管** | 受害实例**持续停止** | N2 是否能自行承接 N1 职责 | — |
-| 自动重启 / 平台重建 | 允许重建受害实例 | 容器重建时间与恢复行为 | 不能证明 N2 曾接管 |
-| 计划内优雅停机 | 先摘除、排空、退出 | 维护停机是否安全 drain | 不能替代强杀验收 |
-| 共享依赖故障 | 应用实例可仍在，依赖停止 | 影响范围、降级一致性 | 不应预设持续服务 |
-
-因此本包编排显式设置 `restart: "no"`：
-
-- 若允许自动重启，`docker kill` 之后 Docker 会很快把容器拉起来，入口的健康集合可能从未真正变成"只剩 N2"，而 `process_start_id` 也会变成新值——此时"用户还能对话"既可能来自 N2 接管，也可能来自 N1 自愈，**结论无法归因**。
-- 另一个隐患：自动重启会掩盖真正的启动期问题。若新进程因配置错误起不来，自动重启会进入 crash loop，把"接管成功"伪装成"间歇可用"。
-
-**验收纪律：** 强杀后必须用两次 `docker inspect` 断言 `State.Running == false`，且**在接管验收完成前不启动受害节点**。只有在接管验收完成后，才允许显式 `compose start` 让 N1 重新加入（重新加入属相邻 `single-host-multicontainer` 包的验收范围）。
-
----
-
-## 14. 配置与部署最小清单
-
-| 配置 | 要求 | 违反后果 |
+| 计数 | 权威记录 | 解释 |
 |---|---|---|
-| `TRPC_WEBUI_LOCAL_INSTANCE_ID` | N1/N2 唯一且稳定 | owner 名称重合 → 接管不可归因 |
-| 进程启动身份 | 每次启动随机 8 字节 hex，不可配置 | 重新加入被误认为旧 owner 复活（I9） |
-| `TRPC_POSTGRES_DSN` | 两节点同一库 | N2 看不到 N1 已接收的消息 |
-| `TRPC_REDIS_ADDRESS` | 两节点同一实例 | 队列/租约分裂 |
-| `TRPC_LISTEN_ADDRESS` | 默认 `:8080` | 启动拒绝 |
-| `TRPC_WECOM_LOCAL_ENABLED` | `true` | 主 Bot 不可用 |
-| `TRPC_WECOM_SECONDARY_LOCAL_ENABLED` | `true`，且 `(Corp ID, Agent ID)` 与主 Bot 不同 | 配置解析拒绝：`incomplete` / `incompatible` |
-| 主 Bot：`WECOM_CORP_ID` / `WECOM_AGENT_ID` / `WECOM_APP_SECRET` / `WECOM_CALLBACK_TOKEN` / `WECOM_ENCODING_AES_KEY` | 齐全；`WECOM_AGENT_ID` 为正整数 | 缺失即启动失败 |
-| 次 Bot：`WECOM_SECONDARY_CORP_ID` / `WECOM_SECONDARY_AGENT_ID` / `WECOM_SECONDARY_APP_SECRET` / `WECOM_SECONDARY_CALLBACK_TOKEN` / `WECOM_SECONDARY_ENCODING_AES_KEY` | 齐全，且 `(Corp ID, Agent ID)` 与主 Bot 不同 | `incomplete` / `incompatible` |
-| 恶意内容探针地址 | 可用（参与 `/readyz`） | `/readyz` 恒 503 → 节点被摘除 |
-| `TRPC_WECOM_HA_ENTRY_BACKENDS` | ≥2、`http`、去重 | 入口拒绝启动 |
-| `TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL` | 默认 1s，范围 `[100ms, 1m]` | 入口拒绝启动 |
-| 回调地址 | 两个 Bot 同一 origin + 不同 `route_key` | 登记节点观测端口会使强杀后 callback 打到死节点 |
+| Worker 尝试 | `execution_attempt` 的行数 / `attempt_no` | 每次进入执行器一行；新尝试把旧 `running` 标为 `superseded`。completed 仅表示执行器正常返回。 |
+| 逻辑模型调用 | `execution_record.model_call_count` | 进入模型适配器的逻辑调用，可因恢复增加。 |
+| 模型 HTTP 尝试 | `execution_record.model_request_count` | transport 尝试，含连接失败及内部重试；不等于接受数或计费数。 |
+| 工具尝试 / 业务效果 | `tool_execution.attempt` / 外部业务幂等记录 | 同键工具重试可大于一次，业务效果应按工具契约去重。 |
+| 回复发送 / 用户可见答案 | Ledger `attempt`、`segment_no/count` / 客户端证据 | 一条答案可有多个分段；唯一 Ledger 行不能单独证明用户只见一次。 |
 
-**装配值（部署生效，告警与时限结论必须引用）：** worker `LeaseTTL=30s` / `RenewInterval=10s` / `RetryWait=250ms` / `ReclaimInterval=5s` / `ReclaimLimit=100` / `DrainTimeout=30s`；delivery `ClaimTTL=30s` / `ClaimRenewInterval=10s` / `MaxAttempts=8` / `MaxReconcileAttempts=8`；relay `PollInterval=100ms`。
+| 参数 | 当前本地组合根装配 | 意义 |
+|---|---|---|
+| Worker lease / renew | 30s / 10s | 失权取消执行；lease 到期才可换 owner。 |
+| Worker reclaim / limit | 5s / 100 | 扫描 pending；不代表 5 秒内必完成恢复。 |
+| Relay claim / renew / poll | 30s / 10s / 100ms | 先发布，再标记 published；发布后崩溃可重发同一事件。 |
+| Delivery claim / renew | 30s / 10s | 每分段发送权。 |
+| Delivery reclaim / limit | 5s / 100 | 回收账号回复队列 pending。 |
+| Delivery retry | 初始 1s，最大 1m，最多 8 次 | 明确可重试错误的有界退避。 |
+| Delivery reconcile | 最多 8 次 | 无查询能力或核对失败最终保留 failed/reconcile_exhausted 事件。 |
+| 工具 lease / renew | 默认 30s / TTL÷3 | PostgreSQL 工具 lease，与会话 lease 是两套执行权。 |
+| 应用排空 | 默认 30s，可配置 1s–5m | 停止新领取，保留已接纳工作，超时再取消。 |
+| Compose 停止宽限 | 默认 45s | 必须比应用排空更长并留退出余量。 |
 
-> ⚠️ 组件内部另有代码级兜底默认（如 `worker.Consumer` 在 `LeaseTTL<=0` 时退化为 5s）。文档、告警阈值、时限结论**一律引用装配值**，否则会得出错误量级的故障检测时限（差 6 倍）。
+这些值是当前 `webui-local`/`wecom-local` 装配值，不能与 Consumer 未配置时的包级兜底值混用。恢复耗时还包含排队、上游延迟、退避和采样误差，不能把 TTL 相加写成已验证的 RTO。
 
----
+## 验证含义
 
-## 15. "上下文回忆正确"的判据（不是模型说了什么）
+双 Bot 需要不同随机代号，原会话恢复后提问不得再带代号；服务端租户/会话/路由和客户端回复一起核对。基线全部交付后强杀属于本能力；任务处理期间强杀要按在途窗口独立判定。ready/脚本成功只证明各自可观察项，不能替代真实上下文和最终可见性证据。
 
-验收时容易犯的错误是：让模型自报租户，然后以此作为证据。**模型输出不构成路由证据。** 正确判据是四层一致：
+## 正常一轮的完整时序
+
+下面的图按持久化职责拆开组件。省略的验签细节并不表示允许绕过验签；图中所有内部身份均来自可信Binding和固定配置。
+
+```mermaid
+sequenceDiagram
+    participant U as 用户/Bot
+    participant E as 稳定入口
+    participant I as 渠道接收
+    participant P as PostgreSQL
+    participant Q as Redis队列
+    participant W as Worker
+    participant H as SDK会话后端
+    participant D as Relay/Delivery
+    U->>E: 原Bot中的消息
+    E->>I: 原签名材料与正文
+    I->>I: 验签、解析Binding、派生user/session
+    I->>P: Inbox/输入/预处理工作与回复路由
+    Note over I,P: durable接收后可异步推进
+    W->>Q: 消费dispatch delivery
+    W->>P: 读取session head与last_fence
+    W->>Q: 校准并获取会话lease
+    W->>H: 同tenant/app/user/session读取历史
+    W->>H: SDK同步保存本轮事件
+    W->>P: 保存冻结result
+    W->>Q: beforeCommit校验/续租
+    W->>P: terminal+会话推进+reply Outbox
+    W->>Q: 对已有durable disposition ACK
+    D->>P: 领取reply Outbox与冻结路由
+    D->>Q: 发布账号reply event
+    D->>P: claim回复segment
+    D->>U: 调用渠道发送
+    D->>P: 确认sent或保存不确定状态
+```
+
+图中的SDK事件写入和terminal提交是两次持久化边界。如果后者失败，前者可能仍在历史中；这正是恢复时不能把SDK转写当作“本轮最终业务已经成功”的原因。
+
+## 会话身份为什么在节点更换后不变
+
+### 用户身份与会话身份分开派生
+
+identity密钥用于派生用户标识，session密钥用于派生会话标识。使用不同purpose可以避免一个用途的密钥被不恰当地用于另一个用途。派生输入带channel、account和会话类型，单聊与群聊的命名空间不会仅因一个字符串恰巧相同而合并。
+
+### 长度前缀避免字段拼接歧义
+
+例如(account="ab",user="c")和(account="a",user="bc")若直接拼接都会得到"abc"。当前derive在每个字段前写入固定宽度长度，再写字段内容，因此这两组输入不同。HMAC又使用租户作用域密钥，使相同外部用户在不同租户中形成不同内部身份。
+
+### 节点身份不能参与业务身份派生
+
+process_start_id用于owner和日志，不能加到session_id里。否则同一用户在N1与N2之间切换会出现两套历史。恢复正确性依赖业务身份稳定、执行身份更新，这两件事同时成立。
+
+## 为什么Bot凭据与数据库tenant都要核对
+
+外部请求只证明“某个渠道消息通过某个Binding验签”。它没有权限直接声明任意内部tenant。持久route把验签配置与tenant/app绑定，后续查询又用tenant筛选，密钥解析再次限定tenant/purpose/version。
+
+这些检查是串联的防线。仅检查一次路由而后续用无tenant条件的结果查询仍会串数据；仅在数据库带tenant而让外部任意填写tenant，也会形成越权入口。ReplyRelay还校验result与route的tenant/request一致，避免最后一跳重新放开隔离。
+
+## 故障恢复的分支树
 
 ```text
-① 路由一致： callback 的 route_key → channel_public_route → channel_binding_locator
-             → 验签 → binding，binding 的 tenant_id 与期望租户相同
-② 入站一致： inbox 行 (tenant_id, channel, external_account_id, external_message_id) 命中期望租户
-③ 会话一致： session_head / session_commit 的 (tenant_id, agent_app_id, session_id)
-             三元组与期望租户一致；input_seq 连续推进；
-             对话历史（模型上下文）取自官方会话后端的 session_events，
-             其 app_name 前缀必须是 tenantID + "/" + agentAppID
-④ 投递一致： delivery_ledger 的 tenant_id 与期望租户一致；每 segment 恰有一条终态
+收到可恢复的原delivery
+├─ authoritative输入/版本/租户不匹配 → 拒绝，保留错误证据
+├─ 输入已terminal → 读取终态，不重跑模型
+├─ 前序输入未完成 → durable停放/阻塞，由唤醒链路继续
+└─ 当前输入可执行
+   ├─ 有冻结result → 校验后续提交
+   └─ 无冻结result → 读取SDK历史并运行模型/工具
+      ├─ 已完成工具结果 → 复用
+      ├─ 可恢复外部操作 → 按契约恢复
+      └─ 无安全恢复契约 → 明确不确定/安全终结
 ```
 
-> **注意表名：** 平台表 `session_event`（单数）在生产 durable turn 中不产生新行（`p_events` 为 null），**不是**对话历史的来源；历史在官方会话后端的 `session_events`（复数，键为 `app_name`/`user_id`/`session_id`）。详见本包 [REFERENCE-IMPLEMENTATION.md](REFERENCE-IMPLEMENTATION.md) 的数据模型章节。
+这棵树解释了为什么“节点恢复后继续”不等于每次都从模型入口重新做一遍。系统优先使用更靠后的durable事实，但不会跨过尚未满足的权限、取消或顺序条件。
 
-四层全部一致，且客户端可见回复内容只含本租户代号 → 才算"回忆正确且不串扰"。
+## 排他执行与拒绝迟到提交如何配合
 
-**接管后转写（对话历史）会变成什么样（诚实说明）：** 由于一次接管 = 以同一输入重开一轮，且框架每次运行都会把输入追加为一条新事件，接管后的历史里会出现：① 上一次尝试留下的痕迹（若当时已请求工具调用，则该 tool_call 消息仍在；它没有配对结果，构造模型请求时会被降级为带 `[orphan_tool_call]` 文本标记的 user 消息）；② 重开的这一轮追加的**第二条同内容用户消息**。这不影响正确性（回复仍只提交一次、租户边界不变），但会让历史变长；排查时不要把它误判为"重复投递"或"串扰"。机制细节见 [../inflight-task-takeover/REFERENCE-IMPLEMENTATION.md](../inflight-task-takeover/REFERENCE-IMPLEMENTATION.md) §10。
+假设N1持有fence=41，在网络异常后停止续租。N2取得新lease的fence=42，不表示数据库立即把所有状态都改成42。旧N1提交前的beforeCommit必须匹配旧lease并续租；旧lease失效时该检查失败。N2提交后，数据库last_fence推进，旧41即使迟到到达数据库也会被拒绝。
 
-**自动化的快速核对（SQL）：**
+这里有两道条件：lease控制当前执行资格，数据库fence/version控制状态推进。不能只看“新节点拿到42”就省略旧节点提交前的检查，也不能认为fence会撤销已经写入外部系统的效果。
 
-```sql
--- ② 入站归属
-SELECT tenant_id, channel, external_account_id, external_message_id, request_id, agent_app_id, session_id, input_seq, state
-FROM inbox WHERE request_id = '<REQUEST_ID>';
+## SDK历史与平台协调分别承担什么
 
--- ③ 会话归属与推进
-SELECT tenant_id, agent_app_id, session_id, input_seq, commit_id, outcome, fence, session_version, reply_cursor, result_ref
-FROM session_commit WHERE request_id = '<REQUEST_ID>';
-
--- ④ 投递归属与唯一性
-SELECT tenant_id, delivery_key, segment_no, segment_count, state, attempt, client_request_id, provider_message_id
-FROM delivery_ledger WHERE tenant_id = '<TENANT_ID>' AND delivery_key = '<DELIVERY_KEY>';
-```
-
-**跨租户污染检查（期望 0 行）：**
-
-```sql
-SELECT s.tenant_id, s.session_id, c.tenant_id AS commit_tenant
-FROM session_head s JOIN session_commit c
-  ON c.agent_app_id = s.agent_app_id AND c.session_id = s.session_id
-WHERE c.tenant_id <> s.tenant_id;
-```
-
----
-
-## 16. 与相邻文档包如何组合
-
-| 能力 | 回答的问题 | 不能替代什么 |
+| 问题 | SDK历史 | 平台协调 |
 |---|---|---|
-| **本包**（故障后继续对话） | 新消息能否在原 tenant / 原会话正确处理 | 不能证明旧的在途消息已被接管 |
-| `inflight-task-takeover` | 已接收的原消息在 P1–P4 各窗口是否自动完成 | 不能证明公开入口在节点故障时仍能接收新 callback |
-| `single-host-multicontainer` | 两实例生命周期、稳定入口与反向故障是否稳定 | 不能证明整机故障或跨故障域可用性 |
+| 用户此前说过什么？ | 保存并加载消息/状态。 | 不复制第二份完整转写。 |
+| 哪条输入现在允许执行？ | 不作为唯一顺序裁决。 | session_head的输入闸门。 |
+| 哪个owner可提交业务结果？ | 不能替代lease/fence。 | lease、beforeCommit、commit_turn。 |
+| 某个答案是否已经成为最终结果？ | 一条assistant事件不足以证明。 | terminal commit与result_ref。 |
+| 最终结果是否需要发出？ | 不负责可靠发送调度。 | reply Outbox与Ledger。 |
 
-三者组合后的完整故事才是：**入口仍能收到新消息 → 正确路由到租户和会话 → 已接收旧任务可回收 → 新节点有唯一提交权 → 最终回复可恢复且可追踪。**
+平台Rollback不会撤销SDK已同步写入的事件。重试中可能出现重复输入或孤立工具调用痕迹；不能把这些记录机械地计为多条最终回复。反过来，发生SDK会话读取失败时也不能用空历史“正常继续”并声称上下文恢复成功。
 
----
+## 新消息可用与原任务恢复的分界
 
-## 17. 如何阅读其余文档
+节点故障前基线已完成、故障后才发的新问题，主要验证身份映射与历史读取。故障时已经持久接收的旧问题，必须按同一个request_id追踪到完成或明确失败。这两种场景需要分别有证据。
 
-- `design.md`：架构图、四元组持久化链路、数据模型、会话状态机、正常/故障时序图、模块划分、错误码与拒绝语义。
-- `implementation-walkthrough.md`：启动装配 → 可信入口候选生命周期 → inbox → dispatch → worker 接管 → 会话存储 → 原子提交 → relay → delivery，逐步给出 durable truth 与"此刻被杀会怎样"。
-- `CODE-APPENDIX.md`：关键实现代码摘录与状态变化解释。
-- `REFERENCE-IMPLEMENTATION.md`：**从零复现**所需的完整 DDL、Redis Lua 契约、Go 接口、算法、配置全表、启动顺序、验证清单。
-- `testing-and-acceptance.md`：测试方案、脚本逐条解释、稳定性/负载检查、通过判定。
-- `release-and-operations.md`：配置门禁、部署、发布顺序、观测、告警、回滚约束、分场景故障处置手册。
+例如N2能回答“你好”只能说明新消息链路可工作，不能证明N1上的长任务没有丢。代号回忆能证明某些历史被加载，也不能证明尚未发出的旧答案已经送达。
+
+## 配置变更可能破坏连续性的方式
+
+| 变更 | 可能结果 | 发布时的要求 |
+|---|---|---|
+| 更换session派生密钥 | 同一外部会话映射成新session。 | 设计兼容/迁移，不能当普通滚动重启。 |
+| 更换Bot Binding或账号 | 路由、权限和目的地变化。 | 保留在途冻结版本可解析，核对新旧Bot。 |
+| 删除历史数据/旧key version | 旧上下文或加密结果无法读取。 | 保留覆盖恢复窗口的历史与密钥。 |
+| SDK app_name编码变化 | 命中另一个历史命名空间。 | 同步迁移/兼容，不静默创建空会话。 |
+| renderer/format变更 | 旧结果分段计划冲突。 | 已冻结投递计划不能被重新解释。 |
+
+## 常见反例的定位顺序
+
+如果“回忆不正确”，先核对session是否相同，再核对SDK作用域和原历史是否存在，最后区分模型回答质量；不要先归因模型。如果“回忆对但发错Bot”，检查冻结ReplyRoute与DeliveryTarget，不能用答案正确掩盖路由错误。
+
+如果“故障后一直处理中”，从原request查execution/input_seq、lease/fence、Outbox和Ledger，不只看HTTP健康。恢复到哪个durable边界，就由哪个模块负责下一步，避免所有问题都落到Worker重试上。
+
+## 一条输入的状态快照：从记住代号到故障后回忆
+
+下面使用示意身份tenant-A/app-A/session-A。它们不是仓库常量，也不是实际运行结果，用来解释字段如何关联。
+
+### 写入代号时
+
+用户向Bot A发送“记住代号M7”。验签后的身份指向tenant-A；Inbox保存外部消息m1与内部request r1。Dispatch为原会话分配input_seq=1，Worker获得会话lease后运行。
+
+| 层 | 示意记录 | 含义 |
+|---|---|---|
+| Inbox | tenant-A / m1 → r1 / session-A | 原输入身份。 |
+| execution_record | r1 / input_seq1 / 固定配置版本 | 该轮执行责任。 |
+| SDK会话 | app_name=tenant-A/app-A，session-A | 用户原文和本轮事件。 |
+| result_payload | r1 → result-ref-1 | 冻结回复内容。 |
+| session_commit | r1 / seq1 / terminal | 第一轮已经成为权威结果。 |
+| reply Outbox/Ledger | 原reply键 / segment0 / sent | 发送调度和本地确认。 |
+
+此时即使N1内存完全丢失，代号仍在SDK会话后端。终态和投递完成不需要保存在N1本地目录中。
+
+### N1被强杀时
+
+本用例先确认r1最终交付，再强杀。因为故障时没有未完成测试输入，本轮主要验证后续身份与历史连续性。入口摘除N1，N2能够继续接收；各角色由自己的健康与共享协调正常工作。
+
+这里不必凭空“恢复r1的工具进度”，因为r1已经完成。将这轮结果写成覆盖全部P2工具故障会扩大验证范围。
+
+### 故障后第二条输入
+
+用户仍在Bot A原会话问“我刚才告诉你的代号是什么”，形成m2/r2/input_seq2。m2是新消息身份；session-A和SDK app_name必须保持不变。
+
+N2读取该原会话历史，模型才有条件回答M7。r2产生自己的结果和reply身份，但回复目的地仍来自Bot A原输入及固定配置，而不是从模型输出决定。
+
+## 并发租户对照为什么有用
+
+同时让Bot B记住另一个代号Q9，可以发现全局变量、默认配置或缓存key缺失tenant维度的问题。若只测A，即使历史被放在全局共享对象里，也可能偶然答对。
+
+对照负载还可以揭示“其中一个租户永远无法领取工作”的问题。A成功不应被当成B也能被接管；两个Bot都要有独立request、session和最终投递证据。
+
+## 历史里出现重试痕迹时怎样解释
+
+SDK可能已经保存用户输入和部分助手/工具事件，而平台terminal尚未完成。故障重跑可能让转写出现第二条同内容输入，或上次工具调用缺少配对结果。它说明运行发生过中断，不能直接等同用户看到了两次最终答案。
+
+检查时先用request/input_seq及terminal判断业务结果，再看冻结结果和Ledger，最后对客户端。仅按SDK某类事件行数统计“任务完成次数”会把重试和中间事件误算进去。
+
+同样，只有终态唯一并不能反向证明历史事件从未发生重复。文档将这两个事实分开，便于定位未来的上下文质量优化，而不是把所有问题都归到投递幂等。
+
+## 网络隔离时的安全边界
+
+应用进程可能没有退出，只是暂时访问不到Redis或PostgreSQL。无法续租时取消执行，提交前检查应拒绝旧资格；健康检查也可能撤销ready。另一节点只有在共享协调允许后才能取得执行权，不能因为“感觉N1坏了”立即抢占。
+
+如果共享协调服务本身不可用，两个实例可能都无法继续处理；这属于共享依赖故障，不是“应用冗余保证仍能服务”的情形。安全失败比在没有执行权时继续写更重要。
+
+## 为什么最终路线使用原配置版本
+
+节点切换可能恰好遇到配置更新。若发送者只加载最新默认Binding，一条早先受理的消息可能被新配置发到另一账号。ResolveReplyRoute读取execution_record的原config_version，联结原Inbox与该版本Binding，使路由随原输入稳定。
+
+保留旧配置版本可读是这个机制的前提。版本不可读时明确报错，让运维恢复正确配置；静默回退到最新配置虽然“看起来恢复了发送”，却可能产生跨Bot错误。

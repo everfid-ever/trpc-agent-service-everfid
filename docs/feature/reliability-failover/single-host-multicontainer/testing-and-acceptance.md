@@ -1,291 +1,155 @@
 # 单主机多容器实例可用性 — 测试与验收
 
-> 本文给出完整测试方案：参数、逐步命令、脚本行为逐条解释、证据字段清单（含 `/statusz` 三种快照）、通过判定表、反例清单，以及**持续负载下的连接稳定性 / 任务积压 / 重复回复检查方法**。所有端口、变量、断言与实现代码一致（可选核对：`scripts/e2e/single-host-multicontainer.sh`、`scripts/e2e/wecom-ha-failover.sh`、`cmd/trpc-service/wecom_ha_entry_role.go`、`cmd/trpc-service/webui_local_role.go`）。
+## 固定版本、前提与时间口径
 
-## 一、参数总表
+本文是可复用流程，不包含实际执行结果。每轮固定完整提交 SHA、镜像摘要、配置/迁移版本、资源限制、拓扑、RUN_ID 和证据目录。两个 Bot 对应不同租户；同一真实用户在各自原会话写入不同随机 TOKEN_A/B，后续提问不再提供代号。使用真实模型时记录调用身份但不以共用上游 key 判断隔离。
 
-| 变量 | 默认 | 含义 |
+关闭受害实例自动重启/替换，共享依赖保持正常，故障节点在本轮业务验收前一直停止。不得手删 lease、重绑 Bot、重投原消息或临时修补业务代码来获得通过。
+
+| 参数 | 执行前必须约定 |
+|---|---|
+| W_BASELINE | 双节点稳定窗口，覆盖多个心跳、租约与调度周期。 |
+| T_READY / T_TASK / T_DELIVER | 整体就绪、原任务完成、最终可见回复时限；不得事后放宽。 |
+| W_DUPLICATE / W_REPEAT | 覆盖 lease/reclaim/retry 的重复检查和稳定窗口。 |
+| DELTA_POLL | 状态采样间隔，恢复时延结论包含采样误差。 |
+
+t0 为外部确认故障时刻；t_ready 为观察到执行链路就绪；新消息收到至最终可见是请求延迟。人工等待后才发消息不能推算精确端到端 RTO。barrier 主动暂停时长单独记录，不任意扣除。
+
+## 部署前核对
+
+两个实例使用相同提交、共享PG/Redis、相同RedisEnvironment、相容迁移和密钥；instance_id、process_start_id、宿主端口不同。检查root只读、/tmp各自tmpfs、skills卷节点只读而bootstrap可写，stop_grace_period大于应用drain期限。单实例资源足以承担计划流量，记录资源限制，低负载不外推容量。
+
+当前WeCom是HTTP callback，公开origin只指向entry58087，节点58088/58089仅观测。共享依赖/入口自身单点故障另列，不预设能继续服务。
+
+## 生命周期步骤
+
+1. 仅N1运行，完成两个租户写入与回忆代号，确认原会话/最终交付。
+2. 加入N2，检查两进程新身份、实际组件ready和入口健康；按W_BASELINE持续重叠对话。
+3. 强杀实际持有执行/发送职责的实例，记录t0；保持停止，peer原进程和共享依赖不重启。
+4. 等待入口和执行链路自动恢复；原会话连续对话按会话验收，旧在途任务另按P1–P4验收。单实例维持预定负载与观察窗口。
+5. 完成本轮业务判定后才重新启动旧实例，检查process_start_id更新，入口经过连续成功重新纳入，旧探测不能恢复失败节点。
+6. 等待稳定窗口，检查无健康振荡、长期积压和迟到回复。重建双实例基线，反向强杀另一节点并重复业务判定。
+7. 预定轮次重复，检查goroutine/连接/资源趋势。未执行轮次不计结论。
+
+## 计划停止独立判定
+
+SIGTERM应使ready503、停止新业务/新领取，在途任务和发送在期限内继续；完成后退出。超时应记录错误并保留durable恢复状态，不能ACK未完成发送。验证Delivery Supervisor不重建消费者、旧成功poll不能恢复ready。Compose强杀超出grace的进程不能计为优雅排空成功。
+
+| 子用例 | 验证对象 | 不可替代 |
 |---|---|---|
-| `TRPC_SINGLE_HOST_PROJECT` | `trpc-single-host-${RANDOM}${RANDOM}` | Compose project 名（隔离） |
-| `TRPC_LOCAL_WECOM_HA_ENTRY_PORT` | `58087` | 入口宿主端口 |
-| `TRPC_LOCAL_WECOM_HA_NODE_A_PORT` | `58088` | N1 宿主端口（仅观测） |
-| `TRPC_LOCAL_WECOM_HA_NODE_B_PORT` | `58089` | N2 宿主端口（仅观测） |
-| `TRPC_SINGLE_HOST_TIMEOUT_SECONDS` | `120` | 各 `wait_http` / `wait_entry_backend` 超时 |
-| `TRPC_SINGLE_HOST_STABILITY_SECONDS` | `5` | 重新加入后稳定窗口观察时长 |
-| `TRPC_SINGLE_HOST_KEEP_ENVIRONMENT` | `false` | true 时退出不 `compose down` |
-| `TRPC_WECOM_REAL_ACCEPTANCE` | `assumed` | `assumed`（默认）/`recorded` |
+| 存活实例接管 | 关闭自动恢复，强杀后持续停止 | 容器重启成功。 |
+| 容器自动恢复 | 独立启用重启/替换再故障 | 原任务已完成。 |
+| SIGTERM | 撤ready、停止准入、有界排空 | SIGKILL非优雅故障。 |
+| 共享依赖故障 | 明确降级、错误与恢复一致性 | 双应用实例高可用。 |
 
-前置约束：本机需 `docker` + Compose v2 + `curl`；`deploy/compose/secrets/deepseek-api-key` 与 `deploy/compose/secrets/wecom.env` 必须**非空**，否则脚本直接退出 2。
+## 入口/隔离代码回归与外部证据
 
-## 二、逐步命令（基线 → 强杀 → 重加入 → 反向）
+| 检查 | 当前测试证据 |
+|---|---|
+| 慢节点不阻塞peer probe | wecom_ha_entry_resilience_test.go |
+| 502/503/504切换、鉴权拒绝不切换、签名保持 | wecom_ha_entry_resilience_test.go |
+| 旧probe不复活节点、健康过期与恢复连续成功 | wecom_ha_entry_resilience_test.go |
+| RO root/skills、私有tmpfs、停止宽限配置 | compose_isolation_test.go |
+| 文件只读校验与禁止覆盖 | runtime_files_test.go |
+| 停新领取、活动发送完成、超时不ACK | delivery/drain_test.go、relay/wakeup_drain_test.go、worker/consumer_test.go |
+| 排空后不重新服务 | runtime_drain_test.go |
 
-```bash
+epoch是内部字段，/statusz不公开；通过状态转移和上述代码测试验证，不要求外部采集不存在的epoch字段。客户端表现、持续负载及真实回复唯一性仍需外部业务证据。
+
+## 最小证据闭环与计数
+
+每次证据至少包含：版本/拓扑/参数、实例及 process_start_id、owner 与 fence/lease 变化、tenant/binding/session、external_message_id/request_id/input_seq、execution_attempt、冻结 result_ref/digest、terminal commit、Outbox、Ledger 的 segment/client_request_id/provider_message_id/state/version，以及客户端最终回复。敏感凭据/个人标识脱敏，完整正文按环境要求保护。
+
+| 计数 | 权威记录 | 解释 |
+|---|---|---|
+| Worker 尝试 | `execution_attempt` 的行数 / `attempt_no` | 每次进入执行器一行；新尝试把旧 `running` 标为 `superseded`。completed 仅表示执行器正常返回。 |
+| 逻辑模型调用 | `execution_record.model_call_count` | 进入模型适配器的逻辑调用，可因恢复增加。 |
+| 模型 HTTP 尝试 | `execution_record.model_request_count` | transport 尝试，含连接失败及内部重试；不等于接受数或计费数。 |
+| 工具尝试 / 业务效果 | `tool_execution.attempt` / 外部业务幂等记录 | 同键工具重试可大于一次，业务效果应按工具契约去重。 |
+| 回复发送 / 用户可见答案 | Ledger `attempt`、`segment_no/count` / 客户端证据 | 一条答案可有多个分段；唯一 Ledger 行不能单独证明用户只见一次。 |
+
+服务端 Ledger 一行 sent 只能证明本地终态；客户端可见重复必须直接核对。模型调用多次不直接失败，正确性看同一原请求提交、业务效果和交付边界。
+
+内部保证与外部交付分别判定：同一输入只有一个有效 terminal commit；每个回复 segment 在 Ledger 中只有一行权威状态，`sent` 后自动路径只跳过发送。该行唯一不等于渠道只接收一次。下游已接受、本地确认未提交的 P4 窗口需要下游可靠去重或查询才能自动收敛。当前 WeCom 没有请求键查询适配器，内容级有限时间去重不足以提供永久请求级幂等；取消、HTTP 5xx 和响应丢失均可能留下不确定结果。系统不盲目补发，先保留 `ambiguous`；核对次数耗尽可转为 `failed/reconcile_exhausted`，仍需运维查证。
+
+## 脚本实际覆盖
+
+```sh
 bash scripts/e2e/single-host-multicontainer.sh
 ```
 
-脚本内部顺序（与 `implementation-walkthrough.md` 模块 J 一致）：
+脚本验证A强杀、A新身份加入、B反向强杀及入口/status/容器状态；默认稳定5秒可配置。TRPC_SINGLE_HOST_KEEP_ENVIRONMENT=true保留环境；默认清理该测试项目和卷，诊断目录保留。TRPC_WECOM_REAL_ACCEPTANCE=assumed/recorded都是外部证据声明，不是自动化真对话验证。wecom-ha-failover.sh为同脚本兼容入口。
 
-1. `compose up --detach --build`
-2. `wait_http node-a/readyz`、`wait_http node-b/readyz`、`wait_http entry/readyz`
-3. `wait_entry_backend wecom-ha-node-a true`、`wait_entry_backend wecom-ha-node-b true`
-4. `capture baseline` → 取 `node_a_start_before = process_start_id(baseline-node-a.json)`
-5. `docker kill --signal=KILL <node-a container>`
-6. `wait_http node-b/readyz`、`wait_http entry/readyz`
-7. `wait_entry_backend node-a false`、`wait_entry_backend node-b true`
-8. `assert_stopped node-a`；`sleep 2`；`assert_stopped node-a`（二次确认）
-9. `compose start wecom-ha-node-a` → `wait_http node-a/readyz`、`wait_entry_backend node-a true`
-10. `node_a_start_after = process_start_id(node-a-rejoined-node-a.json)`；断言 `非空 且 != node_a_start_before`
-11. `sleep ${stability_seconds}`
-12. `docker kill --signal=KILL <node-b container>` → `wait_http node-a/readyz`、`wait_http entry/readyz`
-13. `wait_entry_backend node-a true`、`wait_entry_backend node-b false`
-14. `assert_stopped node-b`
-15. 按 `TRPC_WECOM_REAL_ACCEPTANCE` 输出 assumed/recorded
+## 代码回归入口
 
-## 三、脚本行为逐条解释
-
-- `capture(label)`：对 `node-a`/`node-b`/entry 三个 `/statusz` 各 `curl` 一次写入 `${diagnostics}/${label}-{node-a,node-b,entry}.json`（`--fail` 失败不写但继续）。这是三种快照的来源。
-- `wait_http(url, desc)`：`curl --fail --silent --show-error --max-time 3` 轮询，超时返回 1（脚本因 `set -euo pipefail` 退出）。用于**存活实例** ready 与**入口** ready 的等待。
-- `wait_entry_backend(node, healthy)`：轮询入口 `/statusz`，`grep -F` 子串 `"url":"http://<node>:8080","healthy":<bool>` 是否出现。这是判定"入口是否把某节点列入/移出健康集合"的核心断言。注意它只校验入口视图，不校验节点自身 `/readyz`（节点 ready 由 `wait_http` 单独校验）。
-- `process_start_id(file)`：`sed -nE 's/.*"process_start_id":"([^"]+)".*/\1/p' | head -n 1`，从 `/statusz` JSON 抽取进程身份。
-- `assert_stopped(container)`：`docker inspect --format '{{.State.Running}}'` 必须等于 `false`，否则"victim restarted unexpectedly"。**二次 `sleep 2` 再断言**是为了排除"瞬时又被某机制拉起"。
-- `cleanup()`（`trap EXIT`）：先 `capture final`；`compose ps`/`compose logs` 落盘；若 `KEEP=false` 则 `compose down --volumes --remove-orphans`；保留诊断目录路径到 stderr/stdout。
-
-> 重要：`wait_entry_backend node-a false` 与 `assert_stopped node-a` 是**两条独立证据**：前者证明入口不再向 N1 转发，后者证明 N1 容器确实持续停止（未被 `restart: "no"` 之外的机制复活）。两者缺一不可，否则"存活实例接管"不可证。
-
-## 四、证据字段清单（含 `/statusz` 三种快照）
-
-每次 `capture(label)` 产生三份快照：`${label}-node-a.json`、`${label}-node-b.json`、`${label}-entry.json`。
-
-| 快照 | 关键字段 | 用途 |
-|---|---|---|
-| `baseline-*` | `instance_id`、`process_start_id`、`owners.*` | 记录基线身份，供重加入前后对比 |
-| `node-a-down-*` | entry 的 `backends[wecom-ha-node-a].healthy==false` | 证明强杀后入口摘除 N1 |
-| `node-a-rejoined-*` | `process_start_id` 与 baseline 不同 | 证明重加入产生新 owner（I9） |
-| `node-b-down-*` | entry 的 `backends[wecom-ha-node-b].healthy==false` | 证明反向故障后入口只剩重加入的 N1 |
-| `final-*` | 全流程结束态 | 排障与归档 |
-
-入口快照 `backends` 形如：
-
-```json
-{"backends":[
-  {"url":"http://wecom-ha-node-a:8080","healthy":false},
-  {"url":"http://wecom-ha-node-b:8080","healthy":true}
-]}
+```sh
+go test ./...
+go test -race ./cmd/trpc-service ./trpcservice/worker ./trpcservice/channels/delivery ./trpcservice/relay ./trpcservice/reliability/drain
 ```
 
-节点快照 `owners` 形如（见 REFERENCE-IMPLEMENTATION.md 第 2 节）。
+这些命令运行包/竞态测试，不等价于真实 WeCom 故障验收。若某集成测试依赖外部服务，应检查是否实际运行或跳过，不能把普通 go test 退出0视为全部部署验证完成。测试结果、日志与时延保存在独立运行目录，不回填本文。
 
-## 五、通过判定表
+## 基线、强杀、重新加入的证据时间表
 
-| # | 判定项 | 通过条件 | 证据 |
+| 采样点 | 节点证据 | 入口证据 | 业务证据 |
 |---|---|---|---|
-| P1 | 双实例稳定共存 | `node-a`/`node-b` 各自 `/readyz` 200 且 entry 两后端 healthy | baseline 快照 |
-| P2 | 强杀 N1 后入口仍可用 | `entry/readyz` 200 且 `wecom-ha-node-a` healthy=false、`wecom-ha-node-b` healthy=true | node-a-down-entry.json |
-| P3 | N1 持续停止 | `docker inspect node-a` `State.Running==false`（含 sleep 2 后） | `assert_stopped` |
-| P4 | N1 重新加入新身份 | `node_a_start_after` 非空且 `!= node_a_start_before` | node-a-rejoined-node-a.json |
-| P5 | 重加入后入口恢复双健康 | `wait_entry_backend node-a true` | 重加入后 entry 快照 |
-| P6 | 反向强杀 N2 后入口仍可用 | `entry/readyz` 200，`node-a` healthy=true、`node-b` healthy=false | node-b-down-entry.json |
-| P7 | N2 持续停止 | `docker inspect node-b` `State.Running==false` | `assert_stopped` |
-| P8 | 公开地址不变 | 全程未改企业微信回调 URL | 人工/配置审查 |
-| P9 | 真实最终回复唯一且 tenant 正确 | `TRPC_WECOM_REAL_ACCEPTANCE=recorded` 时的外部证据；否则 assumed | 外部或 assumed |
+| 仅N1 | N1身份与组件ready | 可转发N1 | 两Bot原会话代号基线。 |
+| 双节点稳定 | 两个不同进程身份 | A/B健康快照 | 两租户重叠输入。 |
+| N1已强杀 | N1退出且无重启，N2原进程 | A摘除、B有效 | 原任务或后续原会话结果。 |
+| N1重新加入 | 新process_start_id | 连续成功后重新健康 | 旧session不变、无迟到重复。 |
+| N2反向强杀 | N2退出、N1持续运行 | B摘除、A有效 | 反向接管结果。 |
+| 观察窗口结束 | 无意外重启/资源异常趋势 | 无持续健康振荡 | 无不可恢复积压与重复答案。 |
 
-## 六、反例清单（任一出现即失败/需排查）
+在途任务要额外记录P点及实际执行/发送owner。入口先把回调发到A，并不说明模型执行也在A。
 
-- ❌ 强杀后 `docker inspect` 显示 `State.Running==true` 或 sleep 后变 true → 被自动重启，违反 `restart:"no"`，**结论无效**。
-- ❌ 入口 `/statusz` 中受害节点仍 `healthy:true` → probe 未摘除，故障未体现。
-- ❌ 重加入后 `process_start_id` 与基线相同 → 不是新进程（可能是复用容器/卷误挂载），判定 I9 失败。
-- ❌ 重新加入后出现旧 reply 重发、`stale fence` 写回、连接振荡或 backlog 增长 → 稳定窗口未通过。
-- ❌ 反向故障后入口只剩 N2 健康 → 说明重加入未真正生效。
-- ❌ 把 `wecom-ha-node-a:80888`/`58088` 端口登记为企业微信回调 → 违反"唯一对外端口"约束（应只用 `58087`）。
-- ❌ 用 `docker compose down` 模拟单实例故障 → 会连带关闭共享依赖，不属于本能力范围。
+## 部署配置的静态核对
 
-## 七、持续负载下的连接稳定性 / 任务积压 / 重复回复检查
+可在不发送业务消息的情况下检查Compose展开结果和容器挂载。重点是实际生效配置，不只看模板文件里是否写了字段。
 
-> 上述 P1–P9 是生命周期验收；本节能**独立附加**于演练，用于验证"持续负载下"三项指标。可在 `up` 后、强杀前后，用独立客户端向入口 `58087/callbacks/wecom` 注入带唯一标记的消息（或依赖真实 Bot 会话），并周期性采集。
+| 项目 | 期望 | 常见错误 |
+|---|---|---|
+| PG/Redis | 同一实例与相同协调环境 | 两套独立环境无法接管。 |
+| 实例ID与启动ID | 槽位不同；每次启动身份更新 | 同owner造成日志/claim难归因。 |
+| 端口 | 容器内可相同、宿主端口不同 | 宿主监听冲突。 |
+| root/skills | root只读、技能卷只读 | 节点启动时悄悄修改共享包。 |
+| /tmp | 每容器独立tmpfs | 共享密钥投影或临时状态。 |
+| bootstrap | 完成后再启动读节点 | 缺包时让节点自己创建。 |
+| restart | 接管轮次no | 自动重建掩盖peer接管。 |
+| 停止宽限 | 大于drain且留余量 | Docker在应用排空前SIGKILL。 |
 
-### 7.1 连接稳定性（connection stability）
+静态配置检查无法证明文件读写权限在目标主机上实际可用，应结合启动结果；但读节点不应通过放宽共享目录权限来绕过版本错误。
 
-**观测**：在负载注入期间与故障切换窗口，持续探测入口 `/livez` 与 `/readyz`，以及两节点 `/readyz`。
+## 计划内停止的逐步观察
 
-**判据**：
-- 入口 `/livez` 全程 200（进程不崩）。
-- 入口 `/readyz` 仅在"两后端均不健康"的极短窗口（≤ 探测周期 + 切换延迟）内可能 503，之后立即恢复 200。
-- 切换期间已发出但未获响应的 callback：入口会在本次请求内换健康后端重试，**不丢**；企业应能最终收到响应。
-- 不得出现入口进程重启、端口不可达、或两后端同时长期不健康的"连接振荡"。
+1. 让一个任务执行或回复发送处于可观察的在途阶段，记录原request与owner。
+2. 对该实例发送SIGTERM，记录它开始draining与ready撤销。
+3. 验证不再接收新的业务/领取下一批；既有活动工作未立即因停止读取而取消。
+4. 若工作在期限内完成，核对其terminal/发送确认后实例退出；监督器没有重新创建消费者。
+5. 若特意让工作超过期限，核对超时退出错误、未完成发送没有成功ACK，以及peer可按durable状态恢复。
+6. 上述两种情形分别记录，不能把“最终被Docker强杀”计为正常排空完成。
 
-**可执行命令**：
-```bash
-# 每 1s 记录入口 ready 状态，持续 5 分钟
-for i in $(seq 1 300); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:58087/readyz || echo 000)
-  echo "$(date +%T) entry_ready=$code"
-  sleep 1
-done > entry-ready.log
-grep -c '000\|503' entry-ready.log   # 期望极小或为 0（非切换窗口）
-```
+已在关闭准入前接纳的HTTP请求仍可能刚保存一条新工作，这条工作可交给peer；不要要求drain清空整个共享队列。
 
-### 7.2 任务积压（backlog）
+## 持续负载观察应记录什么
 
-**观测**：采集 PostgreSQL / Redis 中待处理工作的堆积量。关键表/流：
-- `inbox`：`state` 非 `terminal` 且长时间不前进（如 `dispatch_pending`/`dispatch_ready` 行数）。
-- `execution_record`：`outcome='queued'/'pending'/'blocked'` 行数。
-- `outbox`：`state='pending'/'claimed'/'retry_wait'` 行数。
-- Redis：Work/Reply/Wakeup Stream 的 pending entries（`XPENDING`）与 consumer 空闲。
-- `delivery_ledger`：`state IN ('pending','sending','retry_wait','ambiguous')` 行数。
+| 类别 | 采集方式 | 关注趋势 |
+|---|---|---|
+| 输入与终态 | RUN_ID消息清单、execution/commit查询 | 原输入最终有明确结果，不永久处理中。 |
+| 队列/Outbox | pending与状态分组、最老未完成年龄 | 故障后增长能否收敛，是否持续堆积。 |
+| 入口与组件 | status时间序列及失败原因 | 健康持续振荡、反复创建消费者。 |
+| 资源 | 容器CPU/内存、连接与临时空间 | 单实例承载是否稳定、重新加入是否累积泄漏。 |
+| 回复与业务效果 | 客户端、Ledger、外部业务键 | 迟到重复和重复写入。 |
 
-**判据**：
-- 稳定负载下 pending 数应在有界范围内波动，不单调增长。
-- 故障切换后，原属受害实例的 pending 应在 `LeaseTTL(30s)` + `ReclaimInterval` 内被存活实例 reclaim 并下降。
-- 不得出现"积压无限增长且无人消费"——这是 reclaim 失效的信号。
+每轮固定请求速率、并发、请求内容分布、观察时长和资源限制。只有短聊天低并发时，结论限于该负载。若负载生成器失败或渠道限流，分别说明，不把它们静默扣除。
 
-**可执行查询（示例）**：
-```sql
--- 积压计数（PostgreSQL）
-SELECT 'inbox_nonterminal' AS metric, count(*) FROM inbox WHERE state <> 'terminal'
-UNION ALL SELECT 'execution_active', count(*) FROM execution_record WHERE outcome IN ('queued','pending','blocked')
-UNION ALL SELECT 'outbox_active', count(*) FROM outbox WHERE state IN ('pending','claimed','retry_wait')
-UNION ALL SELECT 'delivery_active', count(*) FROM delivery_ledger WHERE state IN ('pending','sending','retry_wait','ambiguous');
-```
-```bash
-# Redis pending（以 webui worker group 为例）
-docker exec <redis> redis-cli XPENDING trpc-webui-work webui-worker > work-pending.log
-```
+## 时间口径的额外注意
 
-### 7.3 重复回复（duplicate reply）
+脚本的timeout_seconds是轮询尝试次数，循环中的curl本身还有超时，因此它不是精确秒数。稳定窗口默认5秒是脚本控制值，不自动覆盖所有发送退避或长期资源趋势。
 
-**观测**：最终用户收到的回复是否唯一；底层以 `delivery_ledger` 的 `sent` 段为单位判定。
+故障时刻、入口首次成功、Worker新尝试、原任务terminal和最终可见回复各有时间戳。前两个事件很快不代表后两者也达到SLO；恢复时间报告应列出对应事件，而不是只写一个“HA耗时”。
 
-**判据**：
-- 对每条 `(tenant, delivery_key, segment_no)`，至多一行 `state='sent'`（幂等约束 + `client_request_id` 去重）。
-- `outbox` 中 `kind='reply'` 的 `idempotency_key` 唯一（`outbox_tenant_id_kind_idempotency_key_key` 唯一约束）。
-- 故障切换期间，下游按 `client_request_id`（由 `StableDeliveryRequestID(tenant_id, delivery_key, segment_no)` 稳定推导）去重；若下游无法去重且查询超时，ledger 诚实置 `ambiguous` 并进入对账，而非双发。
-- 用户侧：同一输入不应收到两条内容相同的最终回复。
+## 失败后的处理边界
 
-**可执行检查**：
-```sql
--- 查找同 delivery_key + segment 出现多次 sent 的反常（正常应为 1）
-SELECT delivery_key, segment_no, count(*) AS sent_cnt
-FROM delivery_ledger WHERE state='sent'
-GROUP BY delivery_key, segment_no HAVING count(*) > 1;
--- 期望：0 行
+如果peer仍ready但原任务未完成，保留环境并查durable链路；不要重发消息后覆盖原证据。如果节点重加入后健康震荡，先排查共享依赖/超时/资源与配置一致性；不要为了本轮通过临时改阈值。
 
--- 对账中/未知状态占比（应趋近于 0）
-SELECT state, count(*) FROM delivery_ledger GROUP BY state;
-```
-
-### 7.4 负载演练编排建议
-
-1. 启动后用客户端以固定速率（如 1–5 msg/s，两 Bot 混合）持续向 `58087/callbacks/wecom` 发带唯一 `external_message_id` 的消息。
-2. 同时运行 7.1/7.2/7.3 的采集循环（后台）。
-3. 在负载进行中执行 N1 强杀 → 重加入 → 反向强杀，全程不停止注入。
-4. 结束后比对：每一条输入是否恰有一条 `sent` 回复（按 `external_message_id` → `inbox` → `session_commit` → `delivery_ledger` 关联）；是否有 `sent_cnt>1`；积压曲线是否在故障后回落。
-5. 采样间隔 `DELTA_POLL` 必须随结论记录，不得宣称比采样更精确的 RTO（见本包 `release-and-operations.md` 的观测口径）。
-
-> 注意：模型调用次数（`P2` 可 >1）与任务尝试次数（`park_attempt`/`attempt` 可增长）**不**等于最终回复次数。验收最终回复唯一性只看 `delivery_ledger` 的 `sent` 段，不限制上游重试。
-
-## 八、负载注入示例（让持续负载可复现）
-
-为验证第七节的连接稳定性/积压/重复回复，可用一个最小客户端持续向入口 `58087/callbacks/wecom` 发带唯一 `external_message_id` 的消息（真实 Bot 凭据由 `wecom.env` 提供，路由 key 走 `local-wecom`）。示例骨架（bash + curl，仅示意结构，凭据/签名按真实 Bot 协议补充）：
-
-```bash
-# 每 200ms 发一条唯一标记消息，持续 10 分钟，记录每条的 external_message_id
-END=$((SECONDS+600))
-seq=0
-while (( SECONDS < END )); do
-  seq=$((seq+1))
-  mid="loadtest-$(date +%s)-${seq}"
-  # 真实场景需按企业微信回调签名规范构造 body；此处仅表达"唯一标记"语义
-  curl -s -o /dev/null -w "%{http_code} $mid\n" \
-    --max-time 5 -X POST "http://127.0.0.1:58087/callbacks/wecom" \
-    -d "external_message_id=$mid&text=ping-$seq" >> inject.log
-  sleep 0.2
-done
-```
-
-采集端（后台并行）：
-
-```bash
-# 入口 ready 轨迹
-while true; do
-  echo "$(date +%T) $(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:58087/readyz)" >> entry-ready.log
-  sleep 1
-done &
-
-# 积压计数（见 7.2 的 SQL），每 5s 一次
-while true; do
-  psql "$DSN" -t -A -c "SELECT count(*) FROM inbox WHERE state<>'terminal';" >> backlog.log
-  sleep 5
-done &
-```
-
-演练期间执行 `docker kill --signal=KILL` 并 `compose start`，全程注入不中断。结束后比对：`inject.log` 每 `mid` 应恰有一条最终 `sent` 回复（经 `external_message_id → inbox → session_commit → delivery_ledger` 关联），且 `delivery_ledger` 无 `sent_cnt>1`。
-
-## 九、录制真实验收（TRPC_WECOM_REAL_ACCEPTANCE=recorded）
-
-默认 `assumed` 表示"真实 Bot 原会话与最终投递验收作为前置已通过"，演练只证明实例生命周期与入口接管。若需**显式录制**，设：
-
-```bash
-TRPC_WECOM_REAL_ACCEPTANCE=recorded \
-TRPC_SINGLE_HOST_KEEP_ENVIRONMENT=true \
-bash scripts/e2e/single-host-multicontainer.sh
-```
-
-录制内容（运维侧，不在脚本内自动完成）：
-
-1. 在强杀 N1 前，通过主/次 Bot 在原会话各发一条带唯一标记消息，记录消息 ID 与期望回复特征。
-2. N1 强杀后，确认两 Bot 仍收到唯一且正确的回复（tenant 正确、历史代号连贯、无重复）。
-3. N1 重加入并反向强杀 N2 后，重复步骤 2。
-4. 将对话截图/导出与 `delivery_ledger` 的 `sent` 行关联归档，作为 `recorded` 证据。
-
-注意：录制的是"业务最终结果"，脚本的 HTTP 断言（P1–P7）仍独立成立；两者互补，不互相替代。
-
-## 十、指标采集与判读示例
-
-任意现有观测系统可采集以下语义指标：
-
-- 入口健康后端数：`count(entry_backends_healthy == 1)`。
-- 节点 `/readyz` 成功率：`probe_success{job="node-a"}`。
-- 积压：`inbox_nonterminal`、`outbox_active`、`delivery_active`（由 7.2 SQL 暴露为 gauge）。
-- 重复回复：由 7.3 SQL 暴露 `delivery_segment_duplicate` gauge（正常恒为 0）。
-
-判读示例（积压曲线）：
-
-```text
-t=0s     backlog=3    (正常波动)
-t=60s    backlog=3    (N1 强杀)
-t=75s    backlog=1    (N2 reclaim 后下降 ← 健康信号)
-t=300s   backlog=2    (稳定负载常态)
-t=360s   backlog=2    (N2 强杀，N1 重加入后接管)
-t=375s   backlog=0    (回落)
-```
-
-若 `backlog` 在故障后持续单调上升不回落，说明 reclaim 失效或容量不足，属 `release-and-operations.md` 6.5 的处置范围。
-
-## 十一、完整演练痕迹示例（端到端）
-
-```text
-$ bash scripts/e2e/single-host-multicontainer.sh
-[wait] node A readiness                ✓ (200)
-[wait] node B readiness                ✓ (200)
-[wait] stable entry readiness          ✓ (200)
-[entry] node-a healthy=true, node-b healthy=true
-[baseline] node-a process_start_id=9f3c1a2b4d5e6f07
-[SIGKILL] wecom-ha-node-a
-[entry] node-a healthy=false, node-b healthy=true   ✓ P2
-[assert] node-a State.Running=false (x2)            ✓ P3
-[start] wecom-ha-node-a
-[entry] node-a healthy=true (rejoined)              ✓ P5
-[rejoin] process_start_id=1b2c3d4e5f6a7b8c != baseline  ✓ P4
-[stability] sleep 5s
-[SIGKILL] wecom-ha-node-b
-[entry] node-a healthy=true, node-b healthy=false   ✓ P6
-[assert] node-b State.Running=false                 ✓ P7
-real WeCom two-Bot conversation acceptance: assumed
-single-host multi-container drill completed; diagnostics retained at /tmp/trpc-single-host.XXXX
-```
-
-退出码 0 表示 P1–P7 全部通过；非 0 时诊断目录保留，按 `release-and-operations.md` 排查。
-
-## 十二、与更早在途接管 smoke 的关系
-
-`scripts/e2e/wecom-ha-failover.sh`（可选核对：`scripts/e2e/wecom-ha-failover.sh`）是更早的、聚焦"入口在 SIGKILL 后仍可用、容器不被自动重启"的 smoke。它**不验证**重加入与反向故障。本包主演练 `single-host-multicontainer.sh` 是其超集：在 smoke 基础上增加了 `process_start_id` 前后对比（重加入新身份）与反向强杀。两者都依赖 `TRPC_WECOM_REAL_ACCEPTANCE=assumed` 作为真实会话的外部前置。
+共享数据库或Redis被误停，应结束应用接管子用例并单独记录依赖故障。恢复依赖后的成功不能回填为“单实例强杀自动接管通过”。

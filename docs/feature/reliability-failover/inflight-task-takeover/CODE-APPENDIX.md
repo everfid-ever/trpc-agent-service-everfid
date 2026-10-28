@@ -1,432 +1,553 @@
 # 在途任务接管与幂等投递 — 实现代码附录
 
-> 本文直接摘录 P1–P4 测试控制面和关键生产链路，并逐段解释状态变化与故障语义。所有标识符与真实实现逐字一致（仓库对应位置，可选核对：`path`）。完整接口、DDL、CAS SQL、配置表见 [REFERENCE-IMPLEMENTATION.md](./REFERENCE-IMPLEMENTATION.md)。
+本篇代码从当前工作区源码逐字提取；省略的文件 import/其他函数以明确的节选说明表示。每段均给出状态变化与故障含义。示例身份、测试时延与状态不是运行结果。
 
----
+## 普通与确认工具统一持久化
 
-## 1. barrier 的边界和最小接口
-
-```go
-// 仓库对应位置，可选核对：trpcservice/reliability/inflight/barrier.go:15
-type Point string
-const (
-    PointP1BeforeExecution        Point = "p1_persisted_before_execution"
-    PointP2BeforeTerminalCommit   Point = "p2_executed_before_commit"
-    PointP3BeforeReplyPublish     Point = "p3_result_committed_before_reply_publish"
-    PointP4BeforeProviderDelivery Point = "p4_delivery_claimed_before_provider_send"
-)
-type Barrier interface { Wait(context.Context, Point) error }
-type Snapshot struct { Point Point; Armed, Hit, Released bool }
-```
-
-**语义：** 业务组件只依赖 `Barrier`，不依赖 HTTP、Docker 或测试框架。正常运行时不注入它，生产任务不会暂停。`Snapshot` 只说明某个 point 是否 arm/hit/released，不含 tenant、request 或正文。
+来源：`trpcservice/tool/durable.go`；operation ID、恢复策略、工具 lease 和成功结果复用适用于 allow+ask；grant 不二次消费。
 
 ```go
-// trpcservice/reliability/inflight/barrier.go
-func (c *Controller) Arm(point Point) <-chan struct{}
-func (c *Controller) Wait(context.Context, Point) error
-func (c *Controller) Release(point Point) bool
-func (c *Controller) Snapshot(point Point) Snapshot
-```
-
----
-
-## 2. Controller 不会替系统重试或修改状态
-
-```go
-// trpcservice/reliability/inflight/barrier.go
-func (c *Controller) Wait(ctx context.Context, point Point) error {
-    c.mu.Lock(); g := c.gates[point]; c.mu.Unlock()
-    if g == nil { return nil }             // only explicitly armed points pause
-    g.hitOnce.Do(func() { close(g.hit) })
-    select { case <-ctx.Done(): return ctx.Err(); case <-g.release: return nil }
+func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed bool, results toolexecution.DurableResults) (any, error) {
+	execution, _ := runtime.ExecutionContextFrom(ctx)
+	if !confirmed && len(args) == 0 {
+		args = []byte(`{}`)
+	}
+	canonical, digest, err := governance.CanonicalArguments(args)
+	if err != nil {
+		return nil, err
+	}
+	if execution.PayloadKeyVersion < 1 {
+		return nil, runtime.ErrCapabilityUnsupported
+	}
+	if confirmed {
+		if execution.ToolCallID == "" || execution.ArgsDigest != digest || execution.GrantID == "" || execution.GrantVersion < 1 || g.Grants == nil || g.Results == nil {
+			return nil, runtime.ErrCapabilityUnsupported
+		}
+	} else {
+		// Model-generated call IDs change on retry. One ordinary operation is
+		// identified by tenant/request/tool version/canonical arguments, not a
+		// regenerated provider call ID. Intentional distinct effects must carry
+		// distinct business arguments/keys.
+		identity, _ := json.Marshal([]string{execution.TenantID, execution.RequestID, g.Tool.ID, strconv.FormatInt(g.Tool.Version, 10), digest})
+		sum := sha256.Sum256(identity)
+		execution.ToolCallID = "op_" + hex.EncodeToString(sum[:])
+		execution.ArgsDigest = digest
+		ctx = runtime.WithExecutionContext(ctx, execution)
+	}
+	policy, key := RecoveryManual, ""
+	if descriptor, ok := g.Inner.(RecoveryDescriptor); ok {
+		policy = descriptor.RecoveryPolicy()
+		key, err = descriptor.RecoveryKey(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	switch policy {
+	case RecoveryManual, RecoveryReplaySafe, RecoveryIdempotentKey, RecoveryQueryable:
+	default:
+		return nil, runtime.ErrCapabilityUnsupported
+	}
+	if (policy == RecoveryIdempotentKey || policy == RecoveryQueryable) && key == "" {
+		return nil, runtime.ErrCapabilityUnsupported
+	}
+	if key == "" {
+		key = execution.TenantID + ":" + execution.RequestID + ":" + execution.ToolCallID
+	}
+	in := toolexecution.Record{Key: toolexecution.Key{TenantID: execution.TenantID, RequestID: execution.RequestID, ToolCallID: execution.ToolCallID}, ToolID: g.Tool.ID, ToolVersion: g.Tool.Version, ArgsDigest: digest, Policy: string(policy), IdempotencyKey: key}
+	match := func(record toolexecution.Record) bool {
+		return record.ToolID == in.ToolID && record.ToolVersion == in.ToolVersion && record.ArgsDigest == in.ArgsDigest && record.Policy == in.Policy && record.IdempotencyKey == in.IdempotencyKey
+	}
+	reuse := func(record toolexecution.Record) (any, error) {
+		content, err := results.LoadResult(ctx, in.Key)
+		if err != nil {
+			return nil, err
+		}
+		if confirmed {
+			if err = g.mirrorConfirmedResult(ctx, execution, content, record.ResultRef); err != nil {
+				return nil, err
+			}
+		}
+		var value any
+		err = json.Unmarshal(content, &value)
+		return value, err
+	}
+	existing, err := g.Executions.Get(ctx, in.Key)
+	if err == nil {
+		if !match(existing) {
+			return nil, runtime.ErrVersionMismatch
+		}
+		if existing.State == toolexecution.Succeeded {
+			return reuse(existing)
+		}
+		if existing.State == toolexecution.Failed {
+			return nil, runtime.ErrEffectUnknown
+		}
+	} else if !errors.Is(err, runtime.ErrNotFound) {
+		return nil, err
+	}
+	owner := make([]byte, 16)
+	if _, err = rand.Read(owner); err != nil {
+		return nil, err
+	}
+	ttl, renewInterval := g.LeaseTTL, g.RenewInterval
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+	if renewInterval <= 0 {
+		renewInterval = ttl / 3
+	}
+	if renewInterval <= 0 || renewInterval >= ttl {
+		return nil, runtime.ErrInvariantViolation
+	}
+	running, claimed, err := g.Executions.Claim(ctx, in, toolexecution.Claim{Owner: "tool-" + hex.EncodeToString(owner), TTL: ttl})
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return nil, runtime.ErrVersionConflict
+	}
+	if !match(running) {
+		return nil, runtime.ErrVersionMismatch
+	}
+	callCtx, stop := context.WithCancelCause(ctx)
+	renewCtx, stopRenew := context.WithCancel(callCtx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(renewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewCtx.Done():
+				return
+			case <-ticker.C:
+				if _, err := g.Executions.Renew(renewCtx, running, ttl); err != nil {
+					if renewCtx.Err() != nil {
+						return
+					}
+					stop(runtime.ErrLeaseLost)
+					return
+				}
+			}
+		}
+	}()
+	defer func() { stopRenew(); stop(context.Canceled); <-done }()
+	resumingConsumed := false
+	if confirmed {
+		_, err = g.Grants.ConsumeGrant(callCtx, governance.GrantClaim{TenantID: execution.TenantID, GrantID: execution.GrantID, RequestID: execution.RequestID, SubjectID: execution.SubjectID, Tool: g.Tool, ToolCallID: execution.ToolCallID, ArgsDigest: digest, PolicyVersion: execution.PolicyVersion, ExpectedVersion: execution.GrantVersion})
+		if err != nil {
+			attempt, readErr := g.Grants.GetToolAttempt(callCtx, execution.TenantID, execution.GrantID)
+			if !errors.Is(err, runtime.ErrVersionConflict) || readErr != nil || attempt.RequestID != execution.RequestID || attempt.ToolCallID != execution.ToolCallID || attempt.State != governance.ToolAttemptEffectUnknown {
+				return nil, err
+			}
+			resumingConsumed = true
+		}
+	}
+	if (running.Attempt > 1 || resumingConsumed) && policy == RecoveryManual {
+		_, err = g.Executions.Finish(callCtx, running, toolexecution.EffectUnknown, "", "manual recovery required")
+		return nil, errors.Join(runtime.ErrEffectUnknown, err)
+	}
+	var value any
+	completed := false
+	if policy == RecoveryQueryable {
+		querier, ok := g.Inner.(RecoveryQuerier)
+		if !ok {
+			return nil, runtime.ErrCapabilityUnsupported
+		}
+		value, completed, err = querier.QueryRecovery(callCtx, key)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !completed {
+		value, err = g.Inner.Call(callCtx, canonical)
+	}
+	if cause := context.Cause(callCtx); cause != nil {
+		return nil, cause
+	}
+	if err != nil {
+		_, finishErr := g.Executions.Finish(callCtx, running, toolexecution.EffectUnknown, "", "tool call outcome unknown")
+		return nil, errors.Join(err, finishErr)
+	}
+	if err = inflight.Wait(inflight.WithScope(callCtx, execution.TenantID, execution.RequestID, "tool_call:"+execution.ToolCallID), inflight.PointToolEffectBeforeCommit); err != nil {
+		return nil, err
+	}
+	content, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	// Stop renewal before the atomic success transition: a renewal observing
+	// our own 'succeeded' row must not cancel the confirmation-result mirror.
+	stopRenew()
+	<-done
+	if cause := context.Cause(callCtx); cause != nil {
+		return nil, cause
+	}
+	running, err = results.Complete(callCtx, running, content, execution.PayloadKeyVersion)
+	if err != nil {
+		return nil, err
+	}
+	if confirmed {
+		err = g.mirrorConfirmedResult(callCtx, execution, content, running.ResultRef)
+	}
+	return value, err
 }
-```
 
-**故障语义：** 只有被 arm 的 point 停住。脚本轮询 point-scoped `status`，命中后强杀 node-a；controller 连同内存消失，但 `inbox`、任务 pending、lease、ledger 都未被它改变。`Release(point)` 只用于局部调试，**不重新入队、不删租约、不补发回复、不变更 ledger**。
-
----
-
-## 3. P1：持久化 job 在 dispatch 前暂停
-
-```go
-// trpcservice/preprocess/worker.go: RunOnce
-for _, job := range jobs {
-    if w.Barrier != nil {
-        if err := w.Barrier.Wait(ctx, inflight.PointP1BeforeExecution); err != nil { return processed, err }
-    }
-    // process(job) performs preprocess -> dispatch -> MarkDispatched
-}
-func (w Worker) dispatch(ctx context.Context, job Job) error {
-    payloadRef := job.PayloadRef
-    if job.PreparedPayloadRef != "" { payloadRef = job.PreparedPayloadRef }
-    _, err := w.Dispatcher.Dispatch(ctx, gateway.DispatchRequest{
-        Tenant: tenant.Context{TenantID: job.TenantID, TenantVersion: job.TenantVersion,
-            AgentAppID: job.AgentAppID, SubjectID: job.UserID, Channel: job.Channel,
-            TrustedSource: "channel_binding:" + job.ChannelBindingID},
-        RequestID: job.RequestID, SessionID: job.SessionID, UserID: job.UserID,
-        PayloadRef: payloadRef, ConfigVersion: job.ConfigVersion,
-    })
-    if err != nil { return err }
-    _, err = w.Store.MarkDispatched(ctx, job, w.now())
-    return err
-}
-```
-
-**状态变化：** 命中时 `preprocess_job` 已是 `ready`（F1 完成），`execution_record` 尚未创建（F2 未发生）。节点被杀后，另一节点的 `RunOnce → ClaimReadyForDispatch` 扫描 `state='ready' AND dispatched_at IS NULL` 的 job 自动接力。`TrustedSource: "channel_binding:" + job.ChannelBindingID` 保留可信 binding 来源，保证转入异步链路后 tenant 归属不丢失。`MarkDispatched` 把 `dispatched_at` 写回，幂等。`dispatch` 内部 `prepare_dispatch` 对 `dispatch_ready` 返回既有 `input_seq` + `accepted=true`，重复调用收敛。
-
----
-
-## 4. P2：模型/工具执行后、终态提交前暂停
-
-```go
-// 仓库对应位置，可选核对：trpcservice/worker/runner.go:618
-outbound, err := renderOutbound(ctx, w.OutputRenderer, envelope, content)
-if err != nil { return fmt.Errorf("render outbound result: %w", err) }
-if w.Barrier != nil {
-    if err := w.Barrier.Wait(ctx, inflight.PointP2BeforeTerminalCommit); err != nil {
-        return err
-    }
-}
-resultRef, err := encodeResultRef(ctx, w.EncodeResult, envelope, string(outbound.Content))
-if err != nil { return err }
-resultStore.PutResult(ctx, messaging.ResultRecord{TenantID: envelope.TenantID,
-    RequestID: envelope.RequestID, ResultRef: resultRef, ContentDigest: hex.EncodeToString(resultDigest[:]),
-    Content: outbound.Content, ContentType: outbound.ContentType, KeyVersion: payload.KeyVersion})
-if beforeCommit != nil { if err := beforeCommit(ctx); err != nil { return err } }
-replyID, _ := messaging.StableReplyID(messaging.ReplyCoordinate{
-    TenantID: envelope.TenantID, RequestID: envelope.RequestID,
-    InputSeq: envelope.InputSeq, Stage: "terminal", Ordinal: 0})
-_, err = turn.Commit(ctx, sessionstore.CommitTurnRequest{
-    SessionKey: sessionKey, RequestID: envelope.RequestID,
-    CommitID: envelope.RequestID + ":terminal:0", Stage: "terminal",
-    InputSeq: envelope.InputSeq, Fence: fence, ExpectedVersion: head.Version,
-    Outcome: runtime.OutcomeSucceeded, ResultRef: resultRef,
-    ReplyCursor: envelope.RequestID + ":1",
-    Outbox: []sessionstore.OutboxEvent{
-        {Kind: "reply", IdempotencyKey: replyID, PayloadRef: resultRef, EventSeq: 1,
-            TraceParent: telemetry.EffectiveTraceParent(ctx, envelope.TraceParent)},
-        terminalAuditOutbox(ctx, envelope, runtime.OutcomeSucceeded),
-    },
-})
-if errors.Is(err, runtime.ErrAlreadyTerminal) { return nil }
-```
-
-**状态变化：** 命中时 `result_payload` 已写、`renderOutbound` 已生成终态内容，但 `commit_turn`（F3）尚未执行，`execution_record.outcome` 仍是 `running`。节点被杀后，存活 worker `Reclaim` 同 entry、取更高 fence、`ExecuteWithLease` 重新跑模型（**模型调用次数 +1 是允许的**），再 `commit_turn`。若旧 owner 晚到提交，`commit_turn` 中 `p_fence < v_head.last_fence` → `stale fence`（40001）→ `ErrVersionConflict`，不改变任何状态。`ErrAlreadyTerminal` 视为成功返回（已终态）。
-
-**broker/ACK（consumer.go:300）：**
-
-```go
-// 仓库对应位置，可选核对：trpcservice/worker/consumer.go:300
-if executeErr != nil { return executeErr }     // 不 ACK，保留 pending 供 reclaim
-return w.Broker.Ack(ctx, delivery)            // 仅在 executeErr==nil 时 ACK
-```
-
-这是不变量 I5：`ACK 必须在 terminal commit 之后`。
-
----
-
-## 5. P3：Reply Relay 发布前；P4：Delivery Ledger 的发送与不确定状态
-
-P3 不在 Delivery Ledger。`trpcservice/relay/reply.go` 在从 durable result 和冻结 `ReplyRoute` 构造完 `ReplyEvent` 后执行 `r.Barrier.Wait(ctx, inflight.PointP3BeforeReplyPublish)`，再调用 `r.Replies.PublishReply(...)`。因此 P3 被杀只会留下可重领的 reply outbox claim；接管者重发同一 reply event，既不运行模型，也不调用 provider。
-
-```go
-// 仓库对应位置，可选核对：trpcservice/channels/delivery/service.go:109
-record, acquired, err := s.Ledger.ClaimDelivery(ctx, key, plan,
-    messaging.DeliveryClaim{Owner: s.Owner, TTL: claimTTL})
-if err != nil { return err }
-if !acquired {
-    switch record.State {
-    case messaging.DeliverySent, messaging.DeliveryFailed:
-        return nil
-    case messaging.DeliveryAmbiguous:
-        return s.reconcile(ctx, event, record)
-    case messaging.DeliveryPending, messaging.DeliverySending, messaging.DeliveryRetryWait:
-        return DeferredError{NotBefore: record.NotBefore}
-    }
-}
-if s.Barrier != nil {
-    if err := s.Barrier.Wait(ctx, inflight.PointP4BeforeProviderDelivery); err != nil {
-        return err
-    }
-}
-record, resultDelivery, deliverErr := s.deliverWithClaimRenewal(ctx, adapter,
-    channel.DeliveryRequest{Event: event, ClientRequestID: record.ClientRequestID,
-        Target: event.Target, Content: append([]byte(nil), content...),
-        ContentDigest: contentDigest, ContentType: contentType}, record, claimTTL)
-if deliverErr != nil {
-    var ambiguous AmbiguousError
-    if errors.As(deliverErr, &ambiguous) {
-        record.State, record.LastErrorClass = messaging.DeliveryAmbiguous, "response_lost"
-        _, finishErr := s.Ledger.FinishDelivery(ctx, record, record.Version)
-        return errors.Join(deliverErr, finishErr)
-    }
-    var permanent PermanentError
-    if errors.As(deliverErr, &permanent) {
-        return s.finishFailed(ctx, record, deliverErr, permanent.Class, false)
-    }
-    var retryAfter RetryAfterError
-    if errors.As(deliverErr, &retryAfter) {
-        return s.finishRetry(ctx, record, deliverErr, retryAfter.RetryAfter)
-    }
-    return s.finishRetry(ctx, record, deliverErr, 0)
-}
-if !resultDelivery.Delivered {
-    return s.finishRetry(ctx, record, runtime.ErrBackendUnavailable, 0)
-}
-if resultDelivery.ProviderMessageID == "" {
-    record.State, record.LastErrorClass = messaging.DeliveryAmbiguous, "missing_provider_message_id"
-    _, finishErr := s.Ledger.FinishDelivery(ctx, record, record.Version)
-    return errors.Join(AmbiguousError{Err: runtime.ErrInvariantViolation}, finishErr)
-}
-record.State = messaging.DeliverySent
-record.ProviderMessageID = resultDelivery.ProviderMessageID
-record.LastErrorClass = ""
-_, err = s.Ledger.FinishDelivery(ctx, record, record.Version)
-return err
-```
-
-**状态变化（P4）：** `ClaimDelivery` 成功后 `delivery_ledger.state='sending'`，`attempt` 递增，但 provider 尚未调用；节点若在此刻被杀，claim 到期后存活节点重新处理同一稳定 `client_request_id`。provider 调用后的网络中断仍可能形成 `ambiguous`：此时按 `client_request_id` 去重/对账收敛；下游不支持时保留 `ambiguous`，绝不伪造 receipt。
-
----
-
-## 6. Ledger 状态分派（finish 家族）
-
-```go
-// 仓库对应位置，可选核对：trpcservice/channels/delivery/service.go:287
-func (s Service) finishRetry(ctx context.Context, record messaging.DeliveryRecord, cause error, delay time.Duration) error {
-    if record.Attempt >= s.maxAttempts() {           // 默认 MaxAttempts=8
-        return s.finishFailed(ctx, record, cause, "retry_exhausted", false)
-    }
-    delay = s.backoff(record.Attempt, delay)
-    record.State = messaging.DeliveryRetryWait
-    record.NotBefore = time.Now().Add(delay)
-    record.LastErrorClass = "retryable"
-    _, finishErr := s.Ledger.FinishDelivery(ctx, record, record.Version)
-    return errors.Join(cause, finishErr)
+func (g GuardedCallable) mirrorConfirmedResult(ctx context.Context, execution runtime.ExecutionContext, content []byte, ref string) error {
+	sum := sha256.Sum256(content)
+	if err := g.Results.PutToolResult(ctx, messaging.ToolResultRecord{TenantID: execution.TenantID, GrantID: execution.GrantID, RequestID: execution.RequestID, ResultRef: ref, ContentDigest: hex.EncodeToString(sum[:]), Content: content, KeyVersion: execution.PayloadKeyVersion}); err != nil {
+		return err
+	}
+	_, err := g.Grants.FinishToolAttempt(ctx, governance.FinishToolAttemptRequest{TenantID: execution.TenantID, GrantID: execution.GrantID, State: governance.ToolAttemptSucceeded, ResultRef: ref})
+	return err
 }
 ```
 
-`backoff`：指数退避 `1<<(attempt-1)`（上限 `MaxRetryDelay` 默认 1min），`DefaultRetryDelay` 默认 1s。
+## 工具 claim/renew 的强制条件
 
-`reconcile`：
+来源：`trpcservice/tool/execution/postgres/store.go`；只有可恢复状态、不可变字段一致和有效租期的 owner 可推进；每次领取提高 fence/attempt。
 
 ```go
-// 仓库对应位置，可选核对：trpcservice/channels/delivery/service.go:243
+func (s *Store) Claim(ctx context.Context, in execution.Record, claim execution.Claim) (execution.Record, bool, error) {
+	if s == nil || s.db == nil || in.TenantID == "" || in.RequestID == "" || in.ToolCallID == "" || in.ToolID == "" || in.ToolVersion < 1 || in.ArgsDigest == "" || in.IdempotencyKey == "" || claim.Owner == "" || claim.TTL <= 0 {
+		return execution.Record{}, false, runtime.ErrInvariantViolation
+	}
+	var r execution.Record
+	var fence int64
+	var lease sql.NullTime
+	err := s.db.QueryRowContext(ctx, `INSERT INTO tool_execution(tenant_id,request_id,tool_call_id,tool_id,tool_version,args_digest,recovery_policy,idempotency_key,state,attempt,fence,lease_owner,lease_until)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,'running',1,1,$9,now()+$10::interval)
+ON CONFLICT (tenant_id,request_id,tool_call_id) DO UPDATE SET state='running',attempt=tool_execution.attempt+1,fence=tool_execution.fence+1,lease_owner=EXCLUDED.lease_owner,lease_until=EXCLUDED.lease_until,updated_at=now()
+WHERE (tool_execution.state IN ('pending','effect_unknown') OR (tool_execution.state='running' AND tool_execution.lease_until<now()))
+AND tool_execution.tool_id=EXCLUDED.tool_id AND tool_execution.tool_version=EXCLUDED.tool_version
+AND tool_execution.args_digest=EXCLUDED.args_digest AND tool_execution.recovery_policy=EXCLUDED.recovery_policy
+AND tool_execution.idempotency_key=EXCLUDED.idempotency_key
+RETURNING tenant_id,request_id,tool_call_id,tool_id,tool_version,args_digest,recovery_policy,idempotency_key,state,attempt,fence,lease_owner,lease_until,COALESCE(external_handle,''),COALESCE(result_ref,''),COALESCE(last_error,'')`,
+		in.TenantID, in.RequestID, in.ToolCallID, in.ToolID, in.ToolVersion, in.ArgsDigest, in.Policy, in.IdempotencyKey, claim.Owner, claim.TTL.String()).Scan(&r.TenantID, &r.RequestID, &r.ToolCallID, &r.ToolID, &r.ToolVersion, &r.ArgsDigest, &r.Policy, &r.IdempotencyKey, &r.State, &r.Attempt, &fence, &r.LeaseOwner, &lease, &r.ExternalHandle, &r.ResultRef, &r.LastError)
+	if err == sql.ErrNoRows {
+		return in, false, nil
+	}
+	if err != nil {
+		return execution.Record{}, false, err
+	}
+	r.Fence = uint64(fence)
+	if lease.Valid {
+		r.LeaseUntil = lease.Time
+	}
+	return r, true, nil
+}
+
+func (s *Store) Renew(ctx context.Context, in execution.Record, ttl time.Duration) (execution.Record, error) {
+	if s == nil || s.db == nil || in.LeaseOwner == "" || in.Fence == 0 || ttl <= 0 {
+		return execution.Record{}, runtime.ErrInvariantViolation
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tool_execution SET lease_until=now()+$1::interval,updated_at=now() WHERE tenant_id=$2 AND request_id=$3 AND tool_call_id=$4 AND state='running' AND lease_owner=$5 AND fence=$6 AND lease_until>now()`, ttl.String(), in.TenantID, in.RequestID, in.ToolCallID, in.LeaseOwner, int64(in.Fence))
+	if err != nil {
+		return execution.Record{}, err
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return execution.Record{}, runtime.ErrVersionConflict
+	}
+	return s.Get(ctx, in.Key)
+}
+```
+
+## 结果与 succeeded 同事务
+
+来源：`trpcservice/tool/execution/postgres/results.go`；Complete 验证 owner/fence/lease；密文插入和成功状态要么一起提交，要么一起回滚。
+
+```go
+func (s *Store) Complete(ctx context.Context, in execution.Record, content []byte, version int64) (execution.Record, error) {
+	if len(content) == 0 || version < 1 || in.Fence == 0 || in.LeaseOwner == "" {
+		return in, runtime.ErrInvalidEnvelope
+	}
+	sum := sha256.Sum256(content)
+	digest := hex.EncodeToString(sum[:])
+	ref := "tool-result://sha256/" + digest
+	aead, err := s.aead(ctx, in.TenantID, version)
+	if err != nil {
+		return in, err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		return in, err
+	}
+	encrypted := aead.Seal(nil, nonce, content, resultAAD(in.Key, digest, version))
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return in, err
+	}
+	defer tx.Rollback()
+	var fence int64
+	err = tx.QueryRowContext(ctx, `UPDATE tool_execution SET state='succeeded',result_ref=$6,last_error=NULL,lease_owner=NULL,lease_until=NULL,updated_at=now()
+WHERE tenant_id=$1 AND request_id=$2 AND tool_call_id=$3 AND state='running' AND lease_owner=$4 AND fence=$5 AND lease_until>now() RETURNING fence`, in.TenantID, in.RequestID, in.ToolCallID, in.LeaseOwner, int64(in.Fence), ref).Scan(&fence)
+	if errors.Is(err, sql.ErrNoRows) {
+		return in, runtime.ErrLeaseLost
+	}
+	if err != nil {
+		return in, err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO tool_execution_result(tenant_id,request_id,tool_call_id,result_ref,content_digest,ciphertext,nonce,key_version) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, in.TenantID, in.RequestID, in.ToolCallID, ref, digest, encrypted, nonce, version)
+	if err != nil {
+		return in, err
+	}
+	if err = tx.Commit(); err != nil {
+		return in, err
+	}
+	in.State, in.ResultRef, in.LeaseOwner = execution.Succeeded, ref, ""
+	return in, nil
+}
+
+func (s *Store) LoadResult(ctx context.Context, key execution.Key) ([]byte, error) {
+	var digest string
+	var encrypted, nonce []byte
+	var version int64
+	err := s.db.QueryRowContext(ctx, `SELECT r.content_digest,r.ciphertext,r.nonce,r.key_version FROM tool_execution_result r JOIN tool_execution e USING(tenant_id,request_id,tool_call_id) WHERE r.tenant_id=$1 AND r.request_id=$2 AND r.tool_call_id=$3 AND e.state='succeeded' AND e.result_ref=r.result_ref`, key.TenantID, key.RequestID, key.ToolCallID).Scan(&digest, &encrypted, &nonce, &version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, runtime.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	aead, err := s.aead(ctx, key.TenantID, version)
+	if err != nil {
+		return nil, err
+	}
+	if len(nonce) != aead.NonceSize() {
+		return nil, runtime.ErrInvariantViolation
+	}
+	content, err := aead.Open(nil, nonce, encrypted, resultAAD(key, digest, version))
+	if err != nil {
+		return nil, runtime.ErrInvariantViolation
+	}
+	sum := sha256.Sum256(content)
+	if hex.EncodeToString(sum[:]) != digest {
+		clear(content)
+		return nil, runtime.ErrVersionMismatch
+	}
+	return content, nil
+}
+```
+
+## Worker 尝试独立记录
+
+来源：`trpcservice/gateway/postgres/attempts.go`；request 行锁串行化日志；HTTP 请求计数不同于上游接受。
+
+```go
+func (s *TaskStore) BeginExecutionAttempt(ctx context.Context, key gateway.ExecutionKey, worker string, fence uint64) (gateway.ExecutionAttempt, error) {
+	a := gateway.ExecutionAttempt{ExecutionKey: key, WorkerID: worker, Fence: fence}
+	if key.TenantID == "" || key.RequestID == "" || worker == "" || fence == 0 || fence > math.MaxInt64 {
+		return a, runtime.ErrInvalidEnvelope
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return a, err
+	}
+	defer tx.Rollback()
+	var request string
+	if err = tx.QueryRowContext(ctx, `SELECT request_id FROM execution_record WHERE tenant_id=$1 AND request_id=$2 FOR UPDATE`, key.TenantID, key.RequestID).Scan(&request); err != nil {
+		return a, err
+	}
+	var maximum int64
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(max(fence),0) FROM execution_attempt WHERE tenant_id=$1 AND request_id=$2`, key.TenantID, key.RequestID).Scan(&maximum); err != nil {
+		return a, err
+	}
+	if uint64(maximum) > fence {
+		return a, runtime.ErrStaleFence
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE execution_attempt SET state='superseded',finished_at=now() WHERE tenant_id=$1 AND request_id=$2 AND state='running'`, key.TenantID, key.RequestID); err != nil {
+		return a, err
+	}
+	err = tx.QueryRowContext(ctx, `INSERT INTO execution_attempt(tenant_id,request_id,attempt_no,worker_id,fence,state)
+SELECT $1,$2,COALESCE(max(attempt_no),0)+1,$3,$4,'running' FROM execution_attempt WHERE tenant_id=$1 AND request_id=$2 RETURNING attempt_no`, key.TenantID, key.RequestID, worker, int64(fence)).Scan(&a.Number)
+	if err != nil {
+		return a, err
+	}
+	return a, tx.Commit()
+}
+
+func (s *TaskStore) FinishExecutionAttempt(ctx context.Context, a gateway.ExecutionAttempt, completed bool) error {
+	state := "retryable"
+	if completed {
+		state = "completed"
+	}
+	var version int64
+	err := s.db.QueryRowContext(ctx, `UPDATE execution_attempt SET state=$6,finished_at=now() WHERE tenant_id=$1 AND request_id=$2 AND attempt_no=$3 AND worker_id=$4 AND fence=$5 AND state='running' RETURNING attempt_no`, a.TenantID, a.RequestID, a.Number, a.WorkerID, int64(a.Fence), state).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return runtime.ErrVersionConflict
+	}
+	return err
+}
+
+func (s *TaskStore) RecordModelRequest(ctx context.Context, key gateway.ExecutionKey) error {
+	if key.TenantID == "" || key.RequestID == "" {
+		return runtime.ErrTenantScope
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE execution_record SET model_request_count=model_request_count+1 WHERE tenant_id=$1 AND request_id=$2`, key.TenantID, key.RequestID)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return runtime.ErrNotFound
+	}
+	return nil
+}
+```
+
+## 发送接受后的确认及不确定核对
+
+来源：`trpcservice/channels/delivery/service.go`；只有可信查询结果允许重试；unknown 有界核对后进入 failed/reconcile_exhausted。
+
+```go
 func (s Service) reconcile(ctx context.Context, event channel.ReplyEvent, record messaging.DeliveryRecord) error {
-    if record.NotBefore.After(time.Now()) { return DeferredError{NotBefore: record.NotBefore} }
-    adapter, err := s.resolveAdapter(ctx, event)
-    if err != nil { return s.deferReconciliation(ctx, record, err) }
-    reconciler, ok := adapter.(channel.DeliveryReconciler)
-    if !ok { return s.deferReconciliation(ctx, record, runtime.ErrCapabilityUnsupported) }
-    result, err := reconciler.ReconcileDelivery(ctx, channel.ReconciliationRequest{
-        Event: event, ClientRequestID: record.ClientRequestID})
-    if err != nil { return s.deferReconciliation(ctx, record, err) }
-    switch result.Status {
-    case channel.ReconciliationDelivered:            // 下游确认已接受
-        record.State, record.ProviderMessageID, record.LastErrorClass =
-            messaging.DeliverySent, result.ProviderMessageID, ""
-        _, err = s.Ledger.ReconcileDelivery(ctx, record, record.Version); return err
-    case channel.ReconciliationNotDelivered:        // 下游确认未接受
-        record.State, record.NotBefore, record.LastErrorClass =
-            messaging.DeliveryRetryWait, time.Now().UTC(), "reconciled_not_delivered"
-        if _, err = s.Ledger.ReconcileDelivery(ctx, record, record.Version); err != nil { return err }
-        return DeferredError{NotBefore: record.NotBefore}
-    case channel.ReconciliationUnknown:             // 下游无法确定
-        return s.deferReconciliation(ctx, record, runtime.ErrCommitConflict)
-    default:
-        return s.deferReconciliation(ctx, record, runtime.ErrInvariantViolation)
-    }
+	if record.NotBefore.After(time.Now()) {
+		return DeferredError{NotBefore: record.NotBefore}
+	}
+	adapter, err := s.resolveAdapter(ctx, event)
+	if err != nil {
+		return s.deferReconciliation(ctx, record, err)
+	}
+	reconciler, ok := adapter.(channel.DeliveryReconciler)
+	if !ok {
+		return s.deferReconciliation(ctx, record, runtime.ErrCapabilityUnsupported)
+	}
+	result, err := reconciler.ReconcileDelivery(ctx, channel.ReconciliationRequest{Event: event, ClientRequestID: record.ClientRequestID})
+	if err != nil {
+		return s.deferReconciliation(ctx, record, err)
+	}
+	switch result.Status {
+	case channel.ReconciliationDelivered:
+		if result.ProviderMessageID == "" {
+			return s.deferReconciliation(ctx, record, runtime.ErrInvariantViolation)
+		}
+		record.State, record.ProviderMessageID, record.LastErrorClass = messaging.DeliverySent, result.ProviderMessageID, ""
+		_, err = s.Ledger.ReconcileDelivery(ctx, record, record.Version)
+		return err
+	case channel.ReconciliationNotDelivered:
+		record.State, record.NotBefore, record.LastErrorClass = messaging.DeliveryRetryWait, time.Now().UTC(), "reconciled_not_delivered"
+		if _, err = s.Ledger.ReconcileDelivery(ctx, record, record.Version); err != nil {
+			return err
+		}
+		return DeferredError{NotBefore: record.NotBefore}
+	case channel.ReconciliationUnknown:
+		return s.deferReconciliation(ctx, record, runtime.ErrCommitConflict)
+	default:
+		return s.deferReconciliation(ctx, record, runtime.ErrInvariantViolation)
+	}
 }
-```
 
-`deferReconciliation`：超过 `MaxReconcileAttempts`(默认 8) → `finishFailed(..., 'reconcile_exhausted', reconcile=true)`；否则 `reconcile_attempt+1` + 退避 + `last_error_class='reconcile_retryable'`，返回 `DeferredError`。
-
----
-
-## 7. retry 分类与错误类型
-
-```go
-// 仓库对应位置，可选核对：trpcservice/channels/delivery/service.go:31
-type AmbiguousError = channel.AmbiguousDeliveryError
-type RetryAfterError = channel.RetryableDeliveryError
-type PermanentError = channel.PermanentDeliveryError
-type DeferredError struct{ NotBefore time.Time }   // 让 account-queue 保持 pending
-type TerminalError struct{ Err error }             // 已持久化 failed，可 ACK
-```
-
-| 错误 | 处理 | ledger 终态 | 是否可 ACK |
-|---|---|---|---|
-| `AmbiguousError` | `FinishDelivery` + 进入 reconcile | `ambiguous`/`response_lost` | 否（待对账） |
-| `PermanentError` | `finishFailed` | `failed` | 是（TerminalError） |
-| `RetryAfterError` | `finishRetry(delay)` | `retry_wait` | 否 |
-| 其它 | `finishRetry(0)` | `retry_wait` | 否 |
-| `Delivered=false` | `finishRetry(ErrBackendUnavailable)` | `retry_wait` | 否 |
-| `ProviderMessageID==""` | `ambiguous` | `ambiguous`/`missing_provider_message_id` | 否 |
-
----
-
-## 8. 启用契约（测试控制面开关）
-
-```text
-TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED=true       # 仅 webui-multinode 演练 profile
-```
-
-未启用 `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED` 时 controller 不创建。启用后，以带 `X-TRPC-Local-Token` 的 `/test/failover/{p1|p2|p3|p4}/{arm,status,release}` 控制**单个 point**；状态只含 `point/armed/hit/released`，不含 tenant/request。标准 E2E arm node-a、命中后杀死 node-a，不向 survivor release。
-
-**代码结论（四个断言）：**
-- P1 证明可靠接收（F1 已 durable，未成为 execution）；
-- P2 证明可接管执行（新 fence owner 完成原 request，旧 fence 被拒）；
-- P3 证明已提交结果的 reply event 在发布前崩溃时由 relay 重放，模型不重跑；
-- P4 证明 delivery claim 后、provider 调用前崩溃时由 ledger 接管；provider 调用结果不确定时仍以去重/对账收敛，否则 `ambiguous`。
-
----
-
-## 9. worker consumer 的 handle 全貌
-
-```go
-// 仓库对应位置，可选核对：trpcservice/worker/consumer.go:181
-func (w Consumer) handle(ctx context.Context, delivery broker.Delivery) error {
-    key := coordination.SessionKey{TenantID: delivery.Envelope.TenantID,
-        AgentAppID: delivery.Envelope.AgentAppID, SessionID: delivery.Envelope.SessionID}
-    persistedFence, err := w.Sessions.ReadLastFence(ctx, sessionstore.SessionKey(key))
-    if err != nil { return err }
-    if err := w.Leases.EnsureFenceAtLeast(ctx, key, persistedFence); err != nil { return err }
-    lease, err := w.acquire(ctx, key)                 // 冲突按 RetryWait 重试
-    if err != nil { return err }
-    defer func() { releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second); defer cancel(); _ = w.Leases.Release(releaseCtx, lease) }()
-    executionCtx, cancelExecution := context.WithCancel(ctx)
-    leaseLost := make(chan struct{})
-    markLeaseLost := func() { leaseLostOnce.Do(func() { close(leaseLost); cancelExecution() }) }
-    go func() { /* 续租 ticker: Renew 失败 → markLeaseLost */ }()
-    beforeCommit := func(commitCtx context.Context) error {
-        select { case <-leaseLost: return runtime.ErrLeaseLost; default: }
-        if _, renewErr := w.Leases.Renew(commitCtx, lease, w.LeaseTTL); renewErr != nil {
-            markLeaseLost(); return runtime.ErrLeaseLost
-        }
-        return nil
-    }
-    for {
-        executeErr = w.Executor.ExecuteWithLease(executionCtx, delivery.Envelope, lease.Fence, beforeCommit)
-        if !errors.Is(executeErr, runtime.ErrInputNotReady) { break }
-        parked, parkErr := w.Parker.ParkInput(executionCtx, gateway.ParkRequest{...})
-        switch parked.Disposition {
-        case gateway.ParkInputReady: continue
-        case gateway.ParkedInput, gateway.ParkInputTerminal: executeErr = nil
-        case gateway.ParkInputBlocked: w.report(...); executeErr = nil
-        default: executeErr = runtime.ErrInvariantViolation
-        }
-        break
-    }
-    if executeErr != nil { return executeErr }          // 不 ACK
-    return w.Broker.Ack(ctx, delivery)                 // 仅 executeErr==nil
-}
-```
-
-**故障语义：** 续租失败即 `markLeaseLost` 取消执行 context；`executeErr != nil` 时直接 return，原 stream entry 保持 pending，由存活节点 `Reclaim` 接管。这正是 I5（ACK 必在 terminal commit 后）的代码落点。
-
----
-
-## 10. preprocess worker 的扫描与 dispatch 入口
-
-```go
-// 仓库对应位置，可选核对：trpcservice/preprocess/worker.go:76
-func (w Worker) RunOnce(ctx context.Context, limit int) (int, error) {
-    if w.LeaseTTL <= 0 { ttl = 30 * time.Second }
-    jobs, err := w.Store.ClaimJobs(ctx, ClaimOptions{Owner: w.Owner, Now: now, TTL: ttl, Limit: limit})
-    for _, job := range jobs { w.preprocess(ctx, job) }      // 校验 payload / 媒体预处理
-    ready, err := w.Store.ClaimReadyForDispatch(ctx, ClaimOptions{...})
-    for _, job := range ready { w.dispatch(ctx, job) }        // ← P1 挂点位于此
-    return processed, nil
-}
-```
-
-**状态变化：** `ClaimJobs` 取 `state='pending'` job 做 `preprocess`（产出 `ready` 或 `rejected`）；`ClaimReadyForDispatch` 取 `state='ready' AND dispatched_at IS NULL` 的 job 进入 `dispatch`。节点在 P1 被强杀后，`RunOnce` 周期扫描自然接力，无需人工入队。
-
----
-
-## 11. delivery 的 reconcile / defer 实现
-
-```go
-// 仓库对应位置，可选核对：trpcservice/channels/delivery/service.go:348
 func (s Service) deferReconciliation(ctx context.Context, record messaging.DeliveryRecord, cause error) error {
-    nextAttempt := record.ReconcileAttempt + 1
-    if nextAttempt >= s.maxReconcileAttempts() {           // 默认 8
-        return s.finishFailed(ctx, record, cause, "reconcile_exhausted", true)
-    }
-    record.ReconcileAttempt = nextAttempt
-    record.NotBefore = time.Now().Add(s.backoff(nextAttempt, 0))
-    record.LastErrorClass = "reconcile_retryable"
-    updated, err := s.Ledger.DeferDeliveryReconciliation(ctx, record, record.Version)
-    if err != nil { return errors.Join(cause, err) }
-    return DeferredError{NotBefore: updated.NotBefore}
+	nextAttempt := record.ReconcileAttempt + 1
+	if nextAttempt >= s.maxReconcileAttempts() {
+		return s.finishFailed(ctx, record, cause, "reconcile_exhausted", true)
+	}
+	record.ReconcileAttempt = nextAttempt
+	record.NotBefore = time.Now().Add(s.backoff(nextAttempt, 0))
+	record.LastErrorClass = "reconcile_retryable"
+	updated, err := s.Ledger.DeferDeliveryReconciliation(ctx, record, record.Version)
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	return DeferredError{NotBefore: updated.NotBefore}
+}
+
+func (s Service) finishFailed(ctx context.Context, record messaging.DeliveryRecord, cause error, class string, reconcile bool) error {
+	record.State = messaging.DeliveryFailed
+	record.LastErrorClass = normalizeErrorClass(class)
+	var err error
+	if reconcile {
+		_, err = s.Ledger.ReconcileDelivery(ctx, record, record.Version)
+	} else {
+		_, err = s.Ledger.FinishDelivery(ctx, record, record.Version)
+	}
+	if err != nil {
+		return errors.Join(cause, err)
+	}
+	return TerminalError{Err: cause}
 }
 ```
 
-`DeferDeliveryReconciliation` 的 SQL `WHERE ... AND state='ambiguous' AND client_request_id=$8 AND reconcile_attempt=$4-1` 用版本 + 重试计数双重 CAS，避免并发重入对账。`finishFailed(..., reconcile=true)` 走 `ReconcileDelivery` 而非 `FinishDelivery`。
+## 人工处置不重跑任务
 
----
-
-## 12. 会话存储的 SQLSTATE → 错误映射
+来源：`trpcservice/storage/messaging/postgres/operations.go`；expected_version 与状态限制防并发冲突，审计和 Outbox 重调度同事务。
 
 ```go
-// 仓库对应位置，可选核对：trpcservice/storage/session/postgres/store.go（translate）
-// 40001 且消息含 "stale fence" → ErrStaleFence，否则 ErrVersionConflict
-// 23505 → ErrCommitConflict（idempotency collision）
-// XX001 → ErrInvariantViolation（terminal invariant missing）
-// 55000 → ErrInputNotReady
-// P0902 → ErrCancelRequested
-// 42501 → ErrTenantScope
-// sql.ErrNoRows → ErrNotFound
+func (s *Store) ResolveUncertainDelivery(ctx context.Context, in DeliveryResolution) error {
+	if err := in.Validate(); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	state, class := "sent", "operator_confirmed_delivered"
+	if in.Decision == "not_delivered" {
+		state, class = "failed", "operator_confirmed_not_delivered"
+	}
+	if in.Decision == "retry_not_delivered" {
+		state, class = "retry_wait", "operator_confirmed_not_delivered"
+	}
+	var version int64
+	err = tx.QueryRowContext(ctx, `UPDATE delivery_ledger
+SET state=$5,provider_message_id=NULLIF($6,''),last_error_class=$7,not_before=now(),version=version+1,updated_at=now()
+WHERE tenant_id=$1 AND delivery_key=$2 AND segment_no=$3 AND version=$4
+AND (state='ambiguous' OR (state='failed' AND last_error_class='reconcile_exhausted'))
+RETURNING version`, in.TenantID, in.DeliveryKey, in.SegmentNo, in.ExpectedVersion, state, in.ProviderMessageID, class).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return runtime.ErrVersionConflict
+	}
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO delivery_resolution
+(tenant_id,delivery_key,segment_no,expected_version,actor,evidence_ref,decision,provider_message_id)
+VALUES($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''))`, in.TenantID, in.DeliveryKey, in.SegmentNo, in.ExpectedVersion, in.Actor, in.EvidenceRef, in.Decision, in.ProviderMessageID)
+	if err != nil {
+		return err
+	}
+	if in.Decision != "not_delivered" {
+		// The Redis entry may already have been ACKed on reconcile exhaustion.
+		// Republish the original frozen reply with its original delivery key;
+		// sent segments remain ACK-only, including the externally confirmed one.
+		var outboxID string
+		err = tx.QueryRowContext(ctx, `UPDATE outbox SET state='pending',claim_owner=NULL,claim_until=NULL,
+published_at=NULL,next_attempt_at=now(),version=version+1
+WHERE tenant_id=$1 AND kind='reply' AND idempotency_key=$2 AND state<>'claimed'
+RETURNING outbox_id`, in.TenantID, in.DeliveryKey).Scan(&outboxID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return runtime.ErrVersionConflict
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
 ```
 
-`OpenForRun` 的关键判断：`input_seq < next_input_seq` → `ErrAlreadyTerminal`；`>` → `ErrInputNotReady`；`fence < last_fence` → `ErrStaleFence`。这三条是 P2 接管「旧 owner 迟到提交被拒」与「前序未终态不得提交」的数据库层断言。
+## 结论与证据回查
 
----
+字段及约束见 [design.md](design.md)，故障判定见 [testing-and-acceptance.md](testing-and-acceptance.md)。代码只能证明条件更新和恢复分支存在，真实渠道可见次数仍需客户端证据，不能从 Ledger 一行推断下游接收次数。
 
-## 13. 租约 Redis Lua 的精确语义（摘录）
+## 把代码条件翻译成恢复判据
 
-```lua
--- acquire：仅当 lease 不存在才成功，并 INCR fence
-if redis.call('EXISTS', KEYS[1]) == 1 then return {0, '0'} end
-redis.call('INCR', KEYS[2])
-local fence = redis.call('GET', KEYS[2])
-redis.call('PSETEX', KEYS[1], ARGV[3], ARGV[1]..'|'..ARGV[2]..'|'..fence)
-return {1, fence}
-
--- ensureFence：current < minimum 时 SET minimum（十进制字符串比较）
-local function decimal_less(left, right)
-  left = normalize(left); right = normalize(right)
-  if string.len(left) ~= string.len(right) then return string.len(left) < string.len(right) end
-  return left < right
-end
-local current = redis.call('GET', KEYS[1]) or '0'
-if decimal_less(current, ARGV[1]) then redis.call('SET', KEYS[1], ARGV[1]) end
-return 1
-```
-
-**故障语义：** `acquire` 冲突返回 `runtime.ErrVersionConflict`；`EnsureFenceAtLeast` 拒绝 `minimum >= math.MaxInt64`（Redis INCR 是 signed 64-bit，须留一个可用值）→ `ErrInvariantViolation`。`workerID` 不得为空、不得含 `|`；`ttl` 必须 >0 且 ≥1ms。`Renew`/`Release` 必须三者（owner、leaseID、fence）整体比对（值串比较），防止误删他人 lease。
-
----
-
-## 14. 错误的语义分类（delivery 内）
-
-```go
-type AmbiguousError = channel.AmbiguousDeliveryError   // 下游接受状态未知
-type RetryAfterError = channel.RetryableDeliveryError  // 可重试（带 delay）
-type PermanentError  = channel.PermanentDeliveryError  // 永久失败
-type DeferredError   struct{ NotBefore time.Time }     // 保持 account-queue pending
-type TerminalError   struct{ Err error }                // 已持久化 failed，可 ACK
-```
-
-`TerminalError` 表示已持久化 `failed`，account-queue entry 可 ACK；`DeferredError` 让 entry 保持 pending，等另一 delivery 尝试或 `not_before` 到期。两者都不能被误判为「成功」，也不能被误判为「需立即重发」。
-
-## 当前实现增量：代码证据索引
-
-| 证据 | 位置 | 说明 |
+| 代码条件 | 状态含义 | 审查时的反问 |
 |---|---|---|
-| 恢复契约 | `trpcservice/tool/recovery.go` | 四种 recovery policy 与 queryable 接口 |
-| 工具 lease | `trpcservice/tool/execution/postgres/store.go` | Claim/Renew/Finish 的 owner+fence CAS |
-| Guard | `trpcservice/tool/guard.go` | 先 Claim、一次 Grant 消费、恢复已消费的不确定 attempt |
-| 续办 | `trpcservice/worker/runner.go` | consumed confirmation 先复用结果，再进入受保护恢复 |
-| 数据迁移 | `migrations/000002_tool_execution_recovery.up.sql` | `tool_execution` 表、索引和约束 |
+| tool执行不可变字段match | 同逻辑操作的工具版本/参数/恢复键不漂移 | 如果模型新call ID不同，是否仍能命中普通operation？ |
+| Claim只选可恢复状态 | 有效running owner不被抢占 | 两个进程能否同时得到claimed=true？ |
+| Complete验证有效租期 | 过期owner不写平台成功结果 | 外部已生效时如何通过业务键恢复？ |
+| LoadResult解密并校验摘要 | 结果不能跨tenant/request/call替换 | 旧密钥不可读时是否错误地重跑？ |
+| Ledger对ambiguous调用核对 | 未知不当未送达 | adapter没有查询能力时是否盲重发？ |
+| Resolve事务带expected_version | 管理员与自动核对不能互相覆盖 | Outbox被领取时是否完整回滚？ |
+
+## 从成功到确认之间的四个失败点
+
+工具Complete之前失败，依靠工具恢复策略；Complete后镜像失败，复用主结果；最终PutResult后terminal失败，复用冻结答案；provider接受后Ledger失败，进入P4核对。它们不能由一个“重试整个函数”策略覆盖。
+
+代码中的错误返回也有不同含义：ErrVersionConflict可能是并发推进，ErrLeaseLost表示已无执行资格，ErrEffectUnknown表示外部效果无法安全确定，TerminalError表示发送失败已durable可确认队列。读代码时应同时看调用方如何处理，而不是把非nil都当成同一种重试。

@@ -1,56 +1,13 @@
-# 单主机多容器实例可用性 — 自足复现参考实现
+# 单主机多容器实例可用性 — 参考实现
 
-> **本文是自足复现材料**：无需阅读仓库源码，仅照抄本章即可搭出等价拓扑并通过同等验收。所有标识符、端口、环境变量、HTTP 路径、状态码均与实现代码一致（可选核对：`cmd/trpc-service/wecom_ha_entry_role.go`、`cmd/trpc-service/webui_local_role.go`、`deploy/compose/docker-compose.local.yml`、`scripts/e2e/single-host-multicontainer.sh`）。
->
-> **唯一对外端口**：`wecom-ha-entry` 默认宿主 `58087`。两个 Bot 回调 URL 都填这个 origin，靠 route key（`local-wecom` / `local-wecom-secondary`）区分。**node-a `58088` / node-b `58089` 仅本地观测，不得登记为微信回调。**
+## 复刻范围和共享契约
 
----
+本能力不新建节点本地业务表。会话、执行、Outbox、Ledger、工具与处置表的逐字段设计分别见 [会话设计](../conversation-continuity/design.md)、[在途设计](../inflight-task-takeover/design.md)；原文DDL与Redis协议见相应参考实现。两个容器必须共享这些事实，不能部署两套独立环境来模拟接管。
 
-## 0.5 先看共享与隔离：两个容器如何接管同一份数据
+## 当前入口完整源代码
 
-这里没有“每容器一套表”。两个实例共享同一份 PostgreSQL/Redis 权威状态；隔离的是进程身份、端口和短暂内存。下面的图先回答数据放在哪里、故障后谁能继续写。
+以下为 `cmd/trpc-service/wecom_ha_entry_role.go`，使用真实 wecomHAEntry 标识符，含配置、并行probe、epoch、恢复窗口、错误切换和HTTP生命周期。
 
-```mermaid
-flowchart LR
-  E["稳定入口 :58087\n只转发 ready 节点"] --> A["node-a :58088\ninstance_id + process_start_id"]
-  E --> B["node-b :58089\ninstance_id + process_start_id"]
-  A --> PG["PostgreSQL · 业务事实\ninbox / session_* / execution_record\noutbox / delivery_ledger / tool_execution"]
-  B --> PG
-  A --> R["Redis · 协调与队列\nWork/Reply Stream · lease · fence"]
-  B --> R
-  PG --> N["接管判据\n唯一键 + CAS + fence"]
-  R --> N
-```
-
-| 数据类别 | 是否共享 | 关键字段/键 | 节点死亡后的含义 |
-|---|---|---|---|
-| 输入、会话、结果、待发回复 | 是，PostgreSQL | `tenant_id`、`request_id`、`session_id`、`fence`、`state` | 对端从最后一个 durable state 恢复。 |
-| 工作/回复队列、会话执行权 | 是，Redis | stream pending、lease、递增 fence | 旧 owner 停止续租，TTL 后对端 reclaim。 |
-| provider 投递权 | 是，PostgreSQL | `delivery_ledger.claim_owner`、`claim_until`、`client_request_id` | 过期 claim 才能被新节点接管。 |
-| HTTP 端口、goroutine、连接、屏障 | 否，节点本地 | `instance_id`、`process_start_id` | 随故障节点消失，不能作为恢复依据。 |
-
----
-
-## 0.6 共享 DDL 的表格版：HA 到底共用什么
-
-多容器 HA 不另建一套业务表；它复用前两项能力的表，并要求两个节点以相同 schema 读写。下表把 HA 关注的字段摘成运维可读视图；逐字 DDL 在会话连续性和在途接管包中保留。
-
-| 共享记录 | 唯一身份 / 主键 | HA 必看字段 | node-a 被杀后 node-b 如何使用 |
-|---|---|---|---|
-| `inbox` | `(tenant_id, channel, external_account_id, external_message_id)` | `request_id`, `session_id`, `state`, `input_seq`, `payload_ref` | 用同一输入事实继续，不把重传当新消息。 |
-| `preprocess_job` | `(tenant_id, job_id)` | `state`, `lease_owner`, `lease_until`, `attempt`, `dispatched_at` | 领取未完成 job，再做同一 dispatch。 |
-| `session_head` | `(tenant_id, agent_app_id, session_id)` | `last_fence`, `version`, `next_input_seq` | 先校准 Redis fence，再取得更高执行权。 |
-| `session_commit` | `(tenant, app, session, commit_id)` + terminal unique index | `input_seq`, `fence`, `outcome`, `result_ref` | 识别已经提交的结果，拒绝旧进程迟到提交。 |
-| `outbox` | `(tenant_id, outbox_id)` + `(tenant_id, kind, idempotency_key)` | `state`, `claim_owner`, `claim_until`, `attempt`, `payload_ref` | relay claim 过期后重发同一个事件。 |
-| `delivery_ledger` | `(tenant_id, delivery_key, segment_no)` | `state`, `claim_owner`, `claim_until`, `client_request_id`, `provider_message_id` | 只接管过期 claim；以稳定请求 ID 避免重复可见回复。 |
-| `tool_execution` | `(tenant_id, request_id, tool_call_id)` | `recovery_policy`, `fence`, `lease_*`, `result_ref`, `state` | 根据工具契约查询、同键重试、重放或安全停止。 |
-| Redis lease / fence / Streams | `tenant_id + agent_app_id + session_id` 派生 key；stream entry id | owner、lease TTL、单调 fence、pending entry | owner TTL 到期，consumer reclaim 原 entry；PG `last_fence` 防止 Redis fence 回退。 |
-
----
-
-## 1. 完整入口参考实现（Go）
-
-下面是 `wecom-ha-entry` 的**完整可落地**参考实现，覆盖全部 HTTP 路径与状态码语义。其结构与仓库 `wecom_ha_entry_role.go` 一致。
 
 ```go
 package main
@@ -64,396 +21,519 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
-type weComHAEntryConfig struct {
-	ListenAddress string
-	Backends      []*url.URL
-	ProbeInterval time.Duration
-	RequestLimit  int64
+// wecomHAEntryConfig describes the small, stable callback entrypoint used by
+// the local multi-container drill. Backends are private Compose addresses; no
+// node address is exposed to the callback provider.
+type wecomHAEntryConfig struct {
+	ListenAddress     string
+	Backends          []*url.URL
+	ProbeInterval     time.Duration
+	ProbeTimeout      time.Duration
+	RequestTimeout    time.Duration
+	HealthTTL         time.Duration
+	RecoverySuccesses int
 }
 
-type weComHAEntryBackend struct {
-	URL     *url.URL
-	healthy atomic.Bool
-}
-
-type weComHAEntryPool struct {
-	backends []*weComHAEntryBackend
-	client   *http.Client
-	next     atomic.Uint64
-	limit    int64
-}
-
-type weComHAEntryStatus struct {
-	Backends []weComHAEntryBackendStatus `json:"backends"`
-}
-
-type weComHAEntryBackendStatus struct {
-	URL     string `json:"url"`
-	Healthy bool   `json:"healthy"`
-}
-
-// 配置加载：TRPC_LISTEN_ADDRESS 默认 :8080；
-// TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL 默认 1s，范围 [100ms,1m]；
-// TRPC_WECOM_HA_ENTRY_BACKENDS 必须 >=2、http、无 user/query/fragment、去重。
-func loadWeComHAEntryConfig(getenv func(string) string) (weComHAEntryConfig, error) {
+func loadWeComHAEntryConfig(getenv func(string) string) (wecomHAEntryConfig, error) {
 	if getenv == nil {
-		return weComHAEntryConfig{}, errors.New("entry environment is unavailable")
+		return wecomHAEntryConfig{}, errors.New("missing environment reader")
 	}
-	value := weComHAEntryConfig{
-		ListenAddress: valueOr(getenv("TRPC_LISTEN_ADDRESS"), ":8080"),
-		ProbeInterval: time.Second,
-		RequestLimit:  2 << 20, // 2 MiB
-	}
-	if strings.TrimSpace(value.ListenAddress) != value.ListenAddress || value.ListenAddress == "" {
-		return weComHAEntryConfig{}, errors.New("entry listen address is invalid")
-	}
-	if raw := strings.TrimSpace(getenv("TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL")); raw != "" {
-		interval, err := time.ParseDuration(raw)
-		if err != nil || interval < 100*time.Millisecond || interval > time.Minute {
-			return weComHAEntryConfig{}, errors.New("entry probe interval is invalid")
+	interval := time.Second
+	if value := strings.TrimSpace(getenv("TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL")); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil || parsed < 100*time.Millisecond || parsed > time.Minute {
+			return wecomHAEntryConfig{}, errors.New("invalid WeCom HA entry probe interval")
 		}
-		value.ProbeInterval = interval
+		interval = parsed
 	}
-	seen := map[string]struct{}{}
-	for _, raw := range strings.Split(getenv("TRPC_WECOM_HA_ENTRY_BACKENDS"), ",") {
-		parsed, err := url.Parse(strings.TrimSpace(raw))
-		if err != nil || parsed.Scheme != "http" || parsed.Host == "" ||
-			parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-			return weComHAEntryConfig{}, errors.New("entry backend is invalid")
+	parts := strings.Split(strings.TrimSpace(getenv("TRPC_WECOM_HA_ENTRY_BACKENDS")), ",")
+	if len(parts) < 2 {
+		return wecomHAEntryConfig{}, errors.New("at least two WeCom HA entry backends are required")
+	}
+	backends := make([]*url.URL, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		parsed, err := url.Parse(strings.TrimSpace(part))
+		if err != nil || parsed.Scheme != "http" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "" {
+			return wecomHAEntryConfig{}, errors.New("invalid WeCom HA entry backend")
 		}
-		parsed.Path = strings.TrimSuffix(parsed.Path, "/")
-		key := parsed.String()
-		if _, ok := seen[key]; ok {
-			return weComHAEntryConfig{}, errors.New("entry backend is duplicated")
+		if _, exists := seen[parsed.String()]; exists {
+			return wecomHAEntryConfig{}, errors.New("duplicate WeCom HA entry backend")
 		}
-		seen[key] = struct{}{}
-		value.Backends = append(value.Backends, parsed)
+		seen[parsed.String()] = struct{}{}
+		backends = append(backends, parsed)
 	}
-	if len(value.Backends) < 2 {
-		return weComHAEntryConfig{}, errors.New("entry requires at least two backends")
+	listenAddress := valueOr(getenv("TRPC_LISTEN_ADDRESS"), ":8080")
+	if strings.TrimSpace(listenAddress) != listenAddress || listenAddress == "" {
+		return wecomHAEntryConfig{}, errors.New("invalid WeCom HA entry listen address")
 	}
-	return value, nil
+	config := wecomHAEntryConfig{ListenAddress: listenAddress, Backends: backends, ProbeInterval: interval, ProbeTimeout: time.Second, RequestTimeout: 2 * time.Second, RecoverySuccesses: 2}
+	for _, setting := range []struct {
+		name   string
+		target *time.Duration
+	}{
+		{"TRPC_WECOM_HA_ENTRY_PROBE_TIMEOUT", &config.ProbeTimeout}, {"TRPC_WECOM_HA_ENTRY_REQUEST_TIMEOUT", &config.RequestTimeout},
+	} {
+		if raw := strings.TrimSpace(getenv(setting.name)); raw != "" {
+			duration, err := time.ParseDuration(raw)
+			if err != nil || duration < 100*time.Millisecond || duration > 30*time.Second {
+				return config, errors.New("invalid WeCom HA entry timeout")
+			}
+			*setting.target = duration
+		}
+	}
+	config.HealthTTL = 3 * (interval + config.ProbeTimeout)
+	if raw := strings.TrimSpace(getenv("TRPC_WECOM_HA_ENTRY_RECOVERY_SUCCESSES")); raw != "" {
+		count, err := strconv.Atoi(raw)
+		if err != nil || count < 1 || count > 10 {
+			return config, errors.New("invalid entry recovery threshold")
+		}
+		config.RecoverySuccesses = count
+	}
+	return config, nil
 }
 
-func newWeComHAEntryPool(config weComHAEntryConfig, client *http.Client) (*weComHAEntryPool, error) {
-	if len(config.Backends) < 2 || config.RequestLimit < 1 {
-		return nil, errors.New("entry pool configuration is invalid")
+type wecomHAEntryBackend struct {
+	URL                  string    `json:"url"`
+	Healthy              bool      `json:"healthy"`
+	CheckedAt            time.Time `json:"checked_at,omitempty"`
+	HealthySince         time.Time `json:"healthy_since,omitempty"`
+	Failures             uint64    `json:"failures"`
+	LastFailure          string    `json:"last_failure,omitempty"`
+	ConsecutiveSuccesses int       `json:"consecutive_successes"`
+}
+
+type wecomHAEntry struct {
+	backends                                []wecomHAEntryBackend
+	health                                  []atomic.Bool
+	next                                    atomic.Uint64
+	client                                  *http.Client
+	mu                                      sync.Mutex
+	epoch                                   []uint64
+	probeTimeout, requestTimeout, healthTTL time.Duration
+	recoverySuccesses                       int
+}
+
+func newWeComHAEntry(backends []*url.URL, client *http.Client) (*wecomHAEntry, error) {
+	if len(backends) < 2 {
+		return nil, errors.New("at least two backends are required")
 	}
 	if client == nil {
-		client = &http.Client{
-			Timeout:         10 * time.Second,
-			CheckRedirect:   func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		}
+		client = &http.Client{Timeout: 10 * time.Second}
 	}
-	pool := &weComHAEntryPool{
-		client:   client,
-		limit:    config.RequestLimit,
-		backends: make([]*weComHAEntryBackend, 0, len(config.Backends)),
-	}
-	for _, backend := range config.Backends {
+	clientCopy := *client
+	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	entry := &wecomHAEntry{backends: make([]wecomHAEntryBackend, len(backends)), health: make([]atomic.Bool, len(backends)), client: client}
+	entry.client = &clientCopy
+	entry.epoch = make([]uint64, len(backends))
+	entry.probeTimeout, entry.requestTimeout, entry.healthTTL, entry.recoverySuccesses = time.Second, 2*time.Second, 6*time.Second, 2
+	for index, backend := range backends {
 		if backend == nil {
-			return nil, errors.New("entry backend is invalid")
+			return nil, errors.New("nil backend")
 		}
-		copyURL := *backend
-		pool.backends = append(pool.backends, &weComHAEntryBackend{URL: &copyURL})
+		entry.backends[index] = wecomHAEntryBackend{URL: backend.String()}
 	}
-	return pool, nil
+	return entry, nil
 }
 
-// probe：对每个 backend 请求 <backend>/readyz；HTTP 200 → healthy。
-func (p *weComHAEntryPool) probe(ctx context.Context) {
-	if p == nil || p.client == nil {
+func (entry *wecomHAEntry) probe(ctx context.Context) {
+	var pending sync.WaitGroup
+	for index := range entry.backends {
+		pending.Add(1)
+		go func(index int) {
+			defer pending.Done()
+			entry.mu.Lock()
+			epoch := entry.epoch[index]
+			entry.mu.Unlock()
+			probeCtx, cancel := context.WithTimeout(ctx, entry.probeTimeout)
+			defer cancel()
+			request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, entry.backends[index].URL+"/readyz", nil)
+			if err != nil {
+				entry.recordProbe(index, epoch, false)
+				return
+			}
+			response, err := entry.client.Do(request)
+			if err == nil && response != nil && response.Body != nil {
+				_, bodyErr := io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
+				if bodyErr != nil {
+					err = bodyErr
+				}
+				response.Body.Close()
+			}
+			entry.recordProbe(index, epoch, err == nil && probeCtx.Err() == nil && response != nil && response.Body != nil && response.StatusCode == http.StatusOK)
+		}(index)
+	}
+	pending.Wait()
+}
+
+func (entry *wecomHAEntry) recordProbe(index int, epoch uint64, healthy bool) {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.epoch[index] != epoch {
 		return
 	}
-	for _, backend := range p.backends {
-		probeURL := *backend.URL
-		probeURL.Path = strings.TrimSuffix(probeURL.Path, "/") + "/readyz"
-		probeURL.RawQuery = ""
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL.String(), nil)
-		if err != nil {
-			backend.healthy.Store(false)
-			continue
-		}
-		response, err := p.client.Do(request)
-		if err != nil {
-			backend.healthy.Store(false)
-			continue
-		}
-		_, _ = io.Copy(io.Discard, response.Body)
-		_ = response.Body.Close()
-		backend.healthy.Store(response.StatusCode == http.StatusOK)
+	backend := &entry.backends[index]
+	if !backend.CheckedAt.IsZero() && time.Since(backend.CheckedAt) > entry.healthTTL {
+		backend.Failures++
+		backend.LastFailure = "health_expired"
+		backend.ConsecutiveSuccesses = 0
+		backend.HealthySince = time.Time{}
+		entry.health[index].Store(false)
 	}
-}
-
-// healthyBackends：从原子轮转下标开始按序返回健康后端（round-robin 起点）。
-func (p *weComHAEntryPool) healthyBackends() []*weComHAEntryBackend {
-	if p == nil || len(p.backends) == 0 {
-		return nil
-	}
-	ordered := make([]*weComHAEntryBackend, 0, len(p.backends))
-	start := int(p.next.Add(1)-1) % len(p.backends)
-	for offset := range p.backends {
-		candidate := p.backends[(start+offset)%len(p.backends)]
-		if candidate.healthy.Load() {
-			ordered = append(ordered, candidate)
-		}
-	}
-	return ordered
-}
-
-func (p *weComHAEntryPool) status() weComHAEntryStatus {
-	status := weComHAEntryStatus{Backends: make([]weComHAEntryBackendStatus, 0, len(p.backends))}
-	for _, backend := range p.backends {
-		status.Backends = append(status.Backends, weComHAEntryBackendStatus{
-			URL:     backend.URL.String(),
-			Healthy: backend.healthy.Load(),
-		})
-	}
-	return status
-}
-
-// serveCallback：仅 GET/POST；MaxBytesReader 超限 413；遍历健康后端转发；
-// forward 出错或返回 502/503/504 → 标 unhealthy 试下一个；全失败 → 503。
-func (p *weComHAEntryPool) serveCallback(writer http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodGet && request.Method != http.MethodPost {
-		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+	backend.CheckedAt = time.Now().UTC()
+	if !healthy {
+		entry.epoch[index]++
+		backend.Failures++
+		backend.LastFailure = "probe_failed"
+		backend.ConsecutiveSuccesses = 0
+		backend.HealthySince = time.Time{}
+		entry.health[index].Store(false)
 		return
 	}
-	if request.Body == nil {
-		request.Body = http.NoBody
+	backend.ConsecutiveSuccesses++
+	if backend.Failures == 0 || backend.ConsecutiveSuccesses >= entry.recoverySuccesses {
+		if !entry.health[index].Load() {
+			backend.HealthySince = time.Now().UTC()
+		}
+		entry.health[index].Store(true)
+		backend.LastFailure = ""
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, p.limit))
+}
+func (entry *wecomHAEntry) failBackend(index int, reason string) {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	entry.epoch[index]++
+	backend := &entry.backends[index]
+	backend.Failures++
+	backend.LastFailure = reason
+	backend.ConsecutiveSuccesses = 0
+	backend.HealthySince = time.Time{}
+	entry.health[index].Store(false)
+}
+func (entry *wecomHAEntry) healthy(index int) bool {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	return entry.health[index].Load() && !entry.backends[index].CheckedAt.IsZero() && time.Since(entry.backends[index].CheckedAt) <= entry.healthTTL
+}
+
+func (entry *wecomHAEntry) anyHealthy() bool {
+	for index := range entry.backends {
+		if entry.healthy(index) {
+			return true
+		}
+	}
+	return false
+}
+
+func (entry *wecomHAEntry) nextHealthy(excluded map[int]struct{}) (int, bool) {
+	start := int((entry.next.Add(1) - 1) % uint64(len(entry.backends)))
+	for offset := range entry.backends {
+		index := (start + offset) % len(entry.backends)
+		if entry.healthy(index) {
+			if _, skip := excluded[index]; !skip {
+				return index, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func (entry *wecomHAEntry) serveHTTP(writer http.ResponseWriter, request *http.Request) {
+	switch request.URL.Path {
+	case "/livez":
+		writer.WriteHeader(http.StatusOK)
+		return
+	case "/readyz":
+		if !entry.anyHealthy() {
+			http.Error(writer, "no healthy callback backend", http.StatusServiceUnavailable)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		return
+	case "/statusz":
+		entry.mu.Lock()
+		status := make([]wecomHAEntryBackend, len(entry.backends))
+		copy(status, entry.backends)
+		for index := range status {
+			status[index].Healthy = entry.health[index].Load() && !status[index].CheckedAt.IsZero() && time.Since(status[index].CheckedAt) <= entry.healthTTL
+		}
+		entry.mu.Unlock()
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(map[string]any{"backends": status})
+		return
+	}
+	if request.URL.Path != "/callbacks/wecom" {
+		http.NotFound(writer, request)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, 2<<20))
 	if err != nil {
-		http.Error(writer, "request body too large", http.StatusRequestEntityTooLarge)
+		http.Error(writer, "callback body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	for _, backend := range p.healthyBackends() {
-		response, forwardErr := p.forward(request, body, backend)
+	excluded := make(map[int]struct{}, len(entry.backends))
+	for range entry.backends {
+		index, ok := entry.nextHealthy(excluded)
+		if !ok {
+			break
+		}
+		excluded[index] = struct{}{}
+		forwardCtx, cancel := context.WithTimeout(request.Context(), entry.requestTimeout)
+		response, forwardErr := entry.forward(request.WithContext(forwardCtx), body, entry.backends[index].URL)
 		if forwardErr != nil {
-			backend.healthy.Store(false)
+			cancel()
+			if request.Context().Err() != nil {
+				return
+			}
+			entry.failBackend(index, "transport_failed")
 			continue
 		}
-		if response.StatusCode == http.StatusBadGateway ||
-			response.StatusCode == http.StatusServiceUnavailable ||
-			response.StatusCode == http.StatusGatewayTimeout {
-			_, _ = io.Copy(io.Discard, response.Body)
-			_ = response.Body.Close()
-			backend.healthy.Store(false)
+		if response == nil || response.Body == nil {
+			cancel()
+			entry.failBackend(index, "invalid_response")
 			continue
 		}
-		copyResponse(writer, response)
+		if response.StatusCode == http.StatusBadGateway || response.StatusCode == http.StatusServiceUnavailable || response.StatusCode == http.StatusGatewayTimeout {
+			response.Body.Close()
+			cancel()
+			entry.failBackend(index, "backend_unavailable")
+			continue
+		}
+		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
+		response.Body.Close()
+		cancel()
+		if request.Context().Err() != nil {
+			return
+		}
+		if readErr != nil || len(responseBody) > 2<<20 {
+			if response.StatusCode >= 400 && response.StatusCode < 500 {
+				http.Error(writer, "callback rejected", response.StatusCode)
+				return
+			}
+			entry.failBackend(index, "response_incomplete")
+			continue
+		}
+		copyHeaders(writer.Header(), response.Header)
+		writer.WriteHeader(response.StatusCode)
+		_, _ = writer.Write(responseBody)
 		return
 	}
-	http.Error(writer, "no ready callback backend", http.StatusServiceUnavailable)
+	http.Error(writer, "no healthy callback backend", http.StatusServiceUnavailable)
 }
 
-func (p *weComHAEntryPool) forward(request *http.Request, body []byte, backend *weComHAEntryBackend) (*http.Response, error) {
-	target := *backend.URL
-	target.Path = strings.TrimSuffix(target.Path, "/") + request.URL.Path
-	target.RawQuery = request.URL.RawQuery
-	forwarded, err := http.NewRequestWithContext(request.Context(), request.Method, target.String(), bytes.NewReader(body))
+func (entry *wecomHAEntry) forward(inbound *http.Request, body []byte, backend string) (*http.Response, error) {
+	target := backend + inbound.URL.RequestURI()
+	request, err := http.NewRequestWithContext(inbound.Context(), inbound.Method, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	forwarded.Header = request.Header.Clone()
-	forwarded.Header.Del("Connection")
-	forwarded.Header.Del("Proxy-Connection")
-	forwarded.Header.Del("Transfer-Encoding")
-	forwarded.Header.Set("X-Forwarded-For", request.RemoteAddr)
-	forwarded.Header.Set("X-Forwarded-Proto", "http")
-	forwarded.ContentLength = int64(len(body))
-	return p.client.Do(forwarded)
+	copyHeaders(request.Header, inbound.Header)
+	request.Host = ""
+	return entry.client.Do(request)
 }
 
-func copyResponse(writer http.ResponseWriter, response *http.Response) {
-	defer response.Body.Close()
-	for key, values := range response.Header {
-		if strings.EqualFold(key, "Connection") || strings.EqualFold(key, "Transfer-Encoding") {
+func copyHeaders(destination, source http.Header) {
+	hop := map[string]bool{"Connection": true, "Keep-Alive": true, "Proxy-Authenticate": true, "Proxy-Authorization": true, "Te": true, "Trailer": true, "Transfer-Encoding": true, "Upgrade": true}
+	for _, token := range strings.Split(source.Get("Connection"), ",") {
+		hop[http.CanonicalHeaderKey(strings.TrimSpace(token))] = true
+	}
+	for key, values := range source {
+		if hop[http.CanonicalHeaderKey(key)] {
 			continue
 		}
+		destination.Del(key)
 		for _, value := range values {
-			writer.Header().Add(key, value)
+			destination.Add(key, value)
 		}
 	}
-	writer.WriteHeader(response.StatusCode)
-	_, _ = io.Copy(writer, response.Body)
 }
 
-func valueOr(value, fallback string) string {
-	if strings.TrimSpace(value) == "" {
-		return fallback
-	}
-	return value
-}
-
-// runWeComHAEntryRole：启动探测循环并注册路由。
-func runWeComHAEntryRole(parent context.Context, getenv func(string) string, logger interface{ Printf(string, ...any) }) error {
+func runWeComHAEntryRole(parent context.Context, getenv func(string) string, logger *roleLogger) error {
 	config, err := loadWeComHAEntryConfig(getenv)
 	if err != nil {
 		return fmt.Errorf("configuration rejected: %w", err)
 	}
-	pool, err := newWeComHAEntryPool(config, nil)
+	entry, err := newWeComHAEntry(config.Backends, nil)
 	if err != nil {
 		return err
 	}
-	probeCtx, cancelProbe := context.WithTimeout(parent, 3*time.Second)
-	pool.probe(probeCtx)
-	cancelProbe()
+	entry.probeTimeout, entry.requestTimeout, entry.healthTTL, entry.recoverySuccesses = config.ProbeTimeout, config.RequestTimeout, config.HealthTTL, config.RecoverySuccesses
+	entry.probe(parent)
+	processCtx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	go func() {
 		ticker := time.NewTicker(config.ProbeInterval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-parent.Done():
+			case <-processCtx.Done():
 				return
 			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(parent, 3*time.Second)
-				pool.probe(ctx)
-				cancel()
+				entry.probe(processCtx)
 			}
 		}
 	}()
-	mux := http.NewServeMux()
-	mux.HandleFunc("/livez", func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusOK) })
-	mux.HandleFunc("/readyz", func(writer http.ResponseWriter, _ *http.Request) {
-		if len(pool.healthyBackends()) == 0 {
-			http.Error(writer, "no ready callback backend", http.StatusServiceUnavailable)
-			return
+	server := &http.Server{Addr: config.ListenAddress, Handler: http.HandlerFunc(entry.serveHTTP), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.ListenAndServe() }()
+	select {
+	case runErr := <-errCh:
+		if errors.Is(runErr, http.ErrServerClosed) {
+			return nil
 		}
-		writer.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/statusz", func(writer http.ResponseWriter, _ *http.Request) {
-		writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-		_ = json.NewEncoder(writer).Encode(pool.status())
-	})
-	mux.HandleFunc("/callbacks/wecom", pool.serveCallback)
-	server := &http.Server{
-		Addr: config.ListenAddress, Handler: mux,
-		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
-		WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10,
+		return runErr
+	case <-processCtx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return server.Shutdown(shutdownCtx)
 	}
-	go func() { _ = server.ListenAndServe() }()
-	<-parent.Done()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = server.Shutdown(shutdownCtx)
-	return nil
 }
 ```
 
-### 1.1 入口 HTTP 路径与状态码语义
 
-| 路径 | 方法 | 行为 | 状态码 |
-|---|---|---|---|
-| `/livez` | any | 恒活 | 200 |
-| `/readyz` | GET | 仅当存在健康后端 | 200 / 503 `no ready callback backend` |
-| `/statusz` | GET | 输出 `{"backends":[{"url","healthy"}]}` | 200 JSON |
-| `/callbacks/wecom` | GET/POST | 按健康后端轮转转发 | 405（方法不符）/ 413（超限）/ 503（无健康后端或后端 502/503/504）/ 后端原始码 |
+| 配置 | 默认值 | 校验 / 行为 |
+|---|---|---|
+| TRPC_LISTEN_ADDRESS | :8080 | 非空，无首尾空白。 |
+| TRPC_WECOM_HA_ENTRY_BACKENDS | 必填 | 至少两个不同 http origin；拒绝 user/query/fragment/path，含尾斜杠路径也拒绝。 |
+| TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL | 1s | 100ms–1m。 |
+| TRPC_WECOM_HA_ENTRY_PROBE_TIMEOUT | 1s | 100ms–30s。 |
+| TRPC_WECOM_HA_ENTRY_REQUEST_TIMEOUT | 2s | 100ms–30s，每后端一次转发。 |
+| TRPC_WECOM_HA_ENTRY_RECOVERY_SUCCESSES | 2 | 1–10，仅恢复阶段要求连续成功。 |
+| HealthTTL | 派生值 | 3×(interval+probe timeout)，没有单独环境变量。 |
 
-> 入口重试**不替代业务幂等**：只在本次 callback 尚未返回响应前换后端；真正去重靠后端 durable Inbox（`claim_inbox` / `prepare_dispatch` 唯一键收敛）。
+## 多实例 Compose 服务原文
 
----
+下列片段逐字来自当前配置，包含应用/入口服务。它们依赖的 postgres、redis、qdrant、clamav、telemetry、卷初始化、named volumes与secrets由完整 `deploy/compose/docker-compose.local.yml` 提供；独立复刻时须建立等价依赖、镜像和卷权限，不能把片段当独立完整文件。
 
-## 2. 节点侧 `/statusz` 契约（复现时需保证同形输出）
-
-节点（`wecom-local`）暴露：
-
-| 路径 | 方法 | 行为 | 状态码 |
-|---|---|---|---|
-| `/livez` | any | 恒活 | 200 |
-| `/readyz` | GET | `db.PingContext` + `redis.Ping` + `malware.Probe` 全成功 | 200 / 503 `not ready` |
-| `/statusz` | GET | 实例身份 + 7 组件 owner + barrier 状态 | 200 JSON |
-| `/callbacks/wecom` | POST | WeCom 回调入口（存在 endpoint 时） | 业务码 |
-| `/test/failover/{p1|p2|p3|p4}/{arm,status,release}` | POST / GET / POST | 仅 failover-test 启用；须 `X-TRPC-Local-Token` 匹配 | 200 JSON / 403 |
-
-`/statusz` 固定 JSON 形状：
-
-```json
-{
-  "instance_id": "wecom-ha-node-a",
-  "process_start_id": "9f3c1a2b4d5e6f07"
-}
-```
-
-复现要点：
-
-- `instance_id` 必须等于该节点 `TRPC_WEBUI_LOCAL_INSTANCE_ID`。
-- `process_start_id` 每次进程启动必须**重新随机**（8 字节 → 16 hex），这是"重新加入 ≠ 旧 owner 复活"的判定依据。
-- Worker、Relay 与 Delivery 在内部使用 `webui-local-<component>-<instance_id>-<process_start_id>` owner；这些 owner 不经 status endpoint 暴露。
-- P1–P4 test endpoint 只有 `webui-multinode` 显式启用 failover-test 时注册，且状态需按 point 查询。
-
----
-
-## 3. 完整 Compose 服务定义（可直接照抄）
-
-以下是从 `deploy/compose/docker-compose.local.yml`（`wecom-ha-local` profile）抽取并补全的服务定义。**只需把本段放入你的 Compose 文件并启用 profile `wecom-ha-local` 即可。**
 
 ```yaml
 services:
-  postgres:
-    image: postgres:16
+  webui-bootstrap:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    profiles: ["webui-multinode"]
+    command: ["webui-local-bootstrap"]
+    env_file:
+      - path: .env.local
+        required: false
     environment:
-      POSTGRES_USER: ${TRPC_LOCAL_POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${TRPC_LOCAL_POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${TRPC_LOCAL_POSTGRES_DB:-trpc_agent_service_test}
-    ports: ["${TRPC_LOCAL_POSTGRES_PORT:-55432}:5432"]
-    volumes: [local-postgres:/var/lib/postgresql/data]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 3s; timeout: 3s; retries: 20
+      TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY: "false"
+      TRPC_POSTGRES_DSN: postgres://${TRPC_LOCAL_POSTGRES_USER:-postgres}:${TRPC_LOCAL_POSTGRES_PASSWORD:-postgres}@postgres:5432/${TRPC_LOCAL_POSTGRES_DB:-trpc_agent_service_test}?sslmode=disable
+      TRPC_REDIS_ADDRESS: redis:6379
+      TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
+      TRPC_WEBUI_LOCAL_INSTANCE_ID: bootstrap
+      TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
+    secrets:
+      - deepseek_api_key
+    volumes:
+      - webui-local-skills:/var/lib/trpc-webui-local/skills
+    depends_on:
+      webui-local-skills-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
 
-  redis:
-    image: redis:7
-    ports: ["${TRPC_LOCAL_REDIS_PORT:-56379}:6379"]
-    volumes: [local-redis:/data]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 3s; timeout: 3s; retries: 20
+  webui-node-a:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    profiles: ["webui-multinode"]
+    command: ["webui-local"]
+    read_only: true
+    stop_grace_period: ${TRPC_LOCAL_APP_STOP_GRACE_PERIOD:-45s}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m,mode=1777
+    env_file:
+      - path: .env.local
+        required: false
+    environment:
+      TRPC_POSTGRES_DSN: postgres://${TRPC_LOCAL_POSTGRES_USER:-postgres}:${TRPC_LOCAL_POSTGRES_PASSWORD:-postgres}@postgres:5432/${TRPC_LOCAL_POSTGRES_DB:-trpc_agent_service_test}?sslmode=disable
+      TRPC_REDIS_ADDRESS: redis:6379
+      TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS: clamav:3310
+      TRPC_LISTEN_ADDRESS: ":8080"
+      TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
+      TRPC_WEBUI_LOCAL_INSTANCE_ID: node-a
+      TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY: "true"
+      TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED: "true"
+      TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
+      TRPC_OTEL_ENDPOINT: http://otel-collector:4318
+      TRPC_OTEL_ALLOW_INSECURE: "true"
+      TRPC_SERVICE_VERSION: ${TRPC_LOCAL_SERVICE_VERSION:-development}
+    secrets:
+      - deepseek_api_key
+    volumes:
+      - webui-local-skills:/var/lib/trpc-webui-local/skills:ro
+    ports:
+      - "${TRPC_LOCAL_MULTINODE_NODE_A_PORT:-58083}:8080"
+    depends_on:
+      webui-bootstrap:
+        condition: service_completed_successfully
+      clamav:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
 
-  qdrant:
-    image: qdrant/qdrant:v1.13.6
-    profiles: ["wecom-ha-local"]
-    volumes: [local-qdrant:/qdrant/storage]
-    healthcheck:
-      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/6333; printf \"GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3; IFS= read -r line <&3; [[ \"$$line\" == *\" 200 \"* ]]'"]
-      interval: 2s; timeout: 3s; retries: 30
+  webui-node-b:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    profiles: ["webui-multinode"]
+    command: ["webui-local"]
+    read_only: true
+    stop_grace_period: ${TRPC_LOCAL_APP_STOP_GRACE_PERIOD:-45s}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m,mode=1777
+    env_file:
+      - path: .env.local
+        required: false
+    environment:
+      TRPC_POSTGRES_DSN: postgres://${TRPC_LOCAL_POSTGRES_USER:-postgres}:${TRPC_LOCAL_POSTGRES_PASSWORD:-postgres}@postgres:5432/${TRPC_LOCAL_POSTGRES_DB:-trpc_agent_service_test}?sslmode=disable
+      TRPC_REDIS_ADDRESS: redis:6379
+      TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS: clamav:3310
+      TRPC_LISTEN_ADDRESS: ":8080"
+      TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
+      TRPC_WEBUI_LOCAL_INSTANCE_ID: node-b
+      TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY: "true"
+      TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED: "true"
+      TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
+      TRPC_OTEL_ENDPOINT: http://otel-collector:4318
+      TRPC_OTEL_ALLOW_INSECURE: "true"
+      TRPC_SERVICE_VERSION: ${TRPC_LOCAL_SERVICE_VERSION:-development}
+    secrets:
+      - deepseek_api_key
+    volumes:
+      - webui-local-skills:/var/lib/trpc-webui-local/skills:ro
+    ports:
+      - "${TRPC_LOCAL_MULTINODE_NODE_B_PORT:-58084}:8080"
+    depends_on:
+      webui-bootstrap:
+        condition: service_completed_successfully
+      clamav:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
 
-  clamav:
-    image: clamav/clamav:1.4.6-debian13-slim
-    profiles: ["wecom-ha-local"]
-    healthcheck:
-      test: ["CMD-SHELL", "clamdscan --ping=1 >/dev/null 2>&1"]
-      interval: 5s; timeout: 5s; retries: 36
-
-  otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.108.0
-    profiles: ["wecom-ha-local"]
-    command: ["--config=/etc/otelcol-contrib/config.yml"]
-    volumes: [./otel-collector.yml:/etc/otelcol-contrib/config.yml:ro]
-    ports: ["${TRPC_LOCAL_OTEL_HTTP_PORT:-54318}:4318", "${TRPC_LOCAL_OTEL_PROMETHEUS_PORT:-59464}:9464"]
-    depends_on: { jaeger: { condition: service_started } }
-
-  jaeger:
-    image: jaegertracing/all-in-one:1.60
-    profiles: ["wecom-ha-local"]
-    environment: { COLLECTOR_OTLP_ENABLED: "true" }
-    ports: ["${TRPC_LOCAL_JAEGER_PORT:-56686}:16686"]
-
-  webui-local-skills-init:
-    image: busybox:1.36.1
-    profiles: ["wecom-ha-local"]
-    user: "0:0"
-    command: ["sh", "-ec", "chown 65532:65532 /var/lib/trpc-webui-local/skills && chmod 0700 /var/lib/trpc-webui-local/skills"]
-    volumes: [webui-local-skills:/var/lib/trpc-webui-local/skills]
-
-  # 一次性初始化共享 tenant/config fixture
+  # The HA profile keeps the WeCom callback URL stable at wecom-ha-entry while
+  # two independently identified nodes share the durable authorities.
   wecom-ha-bootstrap:
-    build: { context: ../.., dockerfile: deploy/compose/Dockerfile }
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
     profiles: ["wecom-ha-local"]
     command: ["webui-local-bootstrap"]
     env_file:
@@ -462,37 +542,52 @@ services:
       - path: secrets/wecom.env
         required: true
     environment:
+      TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY: "false"
       TRPC_POSTGRES_DSN: postgres://${TRPC_LOCAL_POSTGRES_USER:-postgres}:${TRPC_LOCAL_POSTGRES_PASSWORD:-postgres}@postgres:5432/${TRPC_LOCAL_POSTGRES_DB:-trpc_agent_service_test}?sslmode=disable
       TRPC_REDIS_ADDRESS: redis:6379
+      TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-bootstrap
       TRPC_WECOM_LOCAL_ENABLED: "true"
       TRPC_WECOM_SECONDARY_LOCAL_ENABLED: "true"
       TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
-      TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-bootstrap
       TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
-    secrets: [deepseek_api_key]
-    volumes: [webui-local-skills:/var/lib/trpc-webui-local/skills]
+    secrets:
+      - deepseek_api_key
+    volumes:
+      - webui-local-skills:/var/lib/trpc-webui-local/skills
     depends_on:
-      webui-local-skills-init: { condition: service_completed_successfully }
-      postgres: { condition: service_healthy }
-      redis: { condition: service_healthy }
-      qdrant: { condition: service_healthy }
+      webui-local-skills-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
 
-  # N1
   wecom-ha-node-a:
-    build: { context: ../.., dockerfile: deploy/compose/Dockerfile }
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
     profiles: ["wecom-ha-local"]
     command: ["wecom-local"]
     restart: "no"
+    read_only: true
+    stop_grace_period: ${TRPC_LOCAL_APP_STOP_GRACE_PERIOD:-45s}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m,mode=1777
     env_file:
       - path: .env.local
         required: false
       - path: secrets/wecom.env
         required: true
-    environment: &wecom-ha-runtime-environment
+    environment:
       TRPC_POSTGRES_DSN: postgres://${TRPC_LOCAL_POSTGRES_USER:-postgres}:${TRPC_LOCAL_POSTGRES_PASSWORD:-postgres}@postgres:5432/${TRPC_LOCAL_POSTGRES_DB:-trpc_agent_service_test}?sslmode=disable
       TRPC_REDIS_ADDRESS: redis:6379
       TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS: clamav:3310
       TRPC_LISTEN_ADDRESS: ":8080"
+      TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-node-a
+      TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY: "true"
+      TRPC_WEBUI_LOCAL_STATUS_ENABLED: "true"
       TRPC_WECOM_LOCAL_ENABLED: "true"
       TRPC_WECOM_SECONDARY_LOCAL_ENABLED: "true"
       TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
@@ -500,40 +595,69 @@ services:
       TRPC_OTEL_ENDPOINT: http://otel-collector:4318
       TRPC_OTEL_ALLOW_INSECURE: "true"
       TRPC_SERVICE_VERSION: ${TRPC_LOCAL_SERVICE_VERSION:-development}
-      TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-node-a
-    secrets: [deepseek_api_key]
-    volumes: [webui-local-skills:/var/lib/trpc-webui-local/skills]
-    ports: ["${TRPC_LOCAL_WECOM_HA_NODE_A_PORT:-58088}:8080"]
+    secrets:
+      - deepseek_api_key
+    volumes:
+      - webui-local-skills:/var/lib/trpc-webui-local/skills:ro
+    ports:
+      - "${TRPC_LOCAL_WECOM_HA_NODE_A_PORT:-58088}:8080"
     depends_on:
-      wecom-ha-bootstrap: { condition: service_completed_successfully }
-      clamav: { condition: service_healthy }
-      otel-collector: { condition: service_started }
+      wecom-ha-bootstrap:
+        condition: service_completed_successfully
+      clamav:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
 
-  # N2（继承 &wecom-ha-runtime-environment，仅改 INSTANCE_ID）
   wecom-ha-node-b:
-    build: { context: ../.., dockerfile: deploy/compose/Dockerfile }
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
     profiles: ["wecom-ha-local"]
     command: ["wecom-local"]
     restart: "no"
+    read_only: true
+    stop_grace_period: ${TRPC_LOCAL_APP_STOP_GRACE_PERIOD:-45s}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m,mode=1777
     env_file:
       - path: .env.local
         required: false
       - path: secrets/wecom.env
         required: true
     environment:
-      <<: *wecom-ha-runtime-environment
+      TRPC_POSTGRES_DSN: postgres://${TRPC_LOCAL_POSTGRES_USER:-postgres}:${TRPC_LOCAL_POSTGRES_PASSWORD:-postgres}@postgres:5432/${TRPC_LOCAL_POSTGRES_DB:-trpc_agent_service_test}?sslmode=disable
+      TRPC_REDIS_ADDRESS: redis:6379
+      TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS: clamav:3310
+      TRPC_LISTEN_ADDRESS: ":8080"
       TRPC_WEBUI_LOCAL_INSTANCE_ID: wecom-ha-node-b
-    secrets: [deepseek_api_key]
-    volumes: [webui-local-skills:/var/lib/trpc-webui-local/skills]
-    ports: ["${TRPC_LOCAL_WECOM_HA_NODE_B_PORT:-58089}:8080"]
+      TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY: "true"
+      TRPC_WEBUI_LOCAL_STATUS_ENABLED: "true"
+      TRPC_WECOM_LOCAL_ENABLED: "true"
+      TRPC_WECOM_SECONDARY_LOCAL_ENABLED: "true"
+      TRPC_WEBUI_DEEPSEEK_KEY_FILE: /run/secrets/deepseek_api_key
+      TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT: /var/lib/trpc-webui-local/skills
+      TRPC_OTEL_ENDPOINT: http://otel-collector:4318
+      TRPC_OTEL_ALLOW_INSECURE: "true"
+      TRPC_SERVICE_VERSION: ${TRPC_LOCAL_SERVICE_VERSION:-development}
+    secrets:
+      - deepseek_api_key
+    volumes:
+      - webui-local-skills:/var/lib/trpc-webui-local/skills:ro
+    ports:
+      - "${TRPC_LOCAL_WECOM_HA_NODE_B_PORT:-58089}:8080"
     depends_on:
-      wecom-ha-bootstrap: { condition: service_completed_successfully }
-      clamav: { condition: service_healthy }
-      otel-collector: { condition: service_started }
+      wecom-ha-bootstrap:
+        condition: service_completed_successfully
+      clamav:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
 
-  # 唯一对外端口
   wecom-ha-entry:
-    build: { context: ../.., dockerfile: deploy/compose/Dockerfile }
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
     profiles: ["wecom-ha-local"]
     command: ["wecom-ha-entry"]
     restart: "no"
@@ -541,129 +665,328 @@ services:
       TRPC_LISTEN_ADDRESS: ":8080"
       TRPC_WECOM_HA_ENTRY_BACKENDS: http://wecom-ha-node-a:8080,http://wecom-ha-node-b:8080
       TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL: 1s
-    ports: ["${TRPC_LOCAL_WECOM_HA_ENTRY_PORT:-58087}:8080"]
+    ports:
+      - "${TRPC_LOCAL_WECOM_HA_ENTRY_PORT:-58087}:8080"
     depends_on:
-      wecom-ha-node-a: { condition: service_started }
-      wecom-ha-node-b: { condition: service_started }
+      wecom-ha-node-a:
+        condition: service_started
+      wecom-ha-node-b:
+        condition: service_started
 
 volumes:
-  local-postgres:
-  local-redis:
-  local-qdrant:
-  webui-local-skills:
-
-secrets:
-  deepseek_api_key:
-    file: ./secrets/deepseek-api-key
 ```
 
-> 说明：节点 `env_file: secrets/wecom.env` 提供两个 Bot 的凭据（`WECOM_*` / `WECOM_SECONDARY_*`）。入口**不**需要该文件，仅依赖 `TRPC_WECOM_HA_ENTRY_*` 环境变量。两者都依赖 `webui-local-skills` 卷与 `deepseek_api_key` secret。
 
----
+## 运行时排空和文件契约
 
-## 4. 全部环境变量与默认值（本子系统实际使用的）
+## SIGTERM 排空顺序
 
-| 变量 | 作用 | 默认/约束 |
+`signalCtx` 接收 SIGTERM/父 context 取消；活动工作使用独立 `processCtx`。主运行时先 `health.beginDrain()`，再 `drainGate.Begin()`，同时调用 HTTP Shutdown 并等待参与排空的角色退出。业务 HTTP 在排空期间返回 503，live/ready/status 路径可检查；ready 不会被迟到的成功轮询恢复成 true。
+
+Worker、Delivery 和 Wakeup 的读取 context 先取消，活动工作 context 保留。预处理和 Relay 通过 drainPoll 停止下一批；Delivery Supervisor 停止 refresh/新建消费者，runUntilDrained 不重启已排空的消费者。活动进度发布在最终 processCtx 取消时退出。
+
+默认排空 30 秒；Worker/Delivery 的局部超时装配为应用时限加 1 秒，让主运行时先控制全局期限。正常结束后取消 processCtx；超时则报告排空超时、取消工作并退出。未完成的 durable 工作留给存活节点。排空不是共享队列清零，也不会人工删除 lease。SIGKILL 完全跳过本流程。
+
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"time"
+
+	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/drain"
+)
+
+var errRuntimeDrained = errors.New("runtime admissions stopped")
+
+func drainPoll(gate *drain.Gate, operation func(context.Context, int) (int, error)) func(context.Context, int) (int, error) {
+	return func(ctx context.Context, limit int) (int, error) {
+		leave, ok := gate.Enter()
+		if !ok {
+			return 0, errRuntimeDrained
+		}
+		defer leave()
+		return operation(ctx, limit)
+	}
+}
+
+// Keep retrying failed consumers while serving. A completed drain is final:
+// do not resurrect the consumer after it has stopped admitting work.
+func runUntilDrained(ctx context.Context, signal <-chan struct{}, name string, operation func(context.Context) error, logger *roleLogger) error {
+	retryCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	err := runRecoverableLoop(retryCtx, name, func(runCtx context.Context) error {
+		err := operation(runCtx)
+		if drain.Signaled(signal) {
+			cancel()
+		}
+		return err
+	}, 250*time.Millisecond, logger)
+	if ctx.Err() == nil && drain.Signaled(signal) {
+		return nil
+	}
+	return err
+}
+
+func drainingHTTP(next http.Handler, gate *drain.Gate) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if gate.Draining() && r.URL.Path != "/livez" && r.URL.Path != "/readyz" && r.URL.Path != "/statusz" {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "instance draining", http.StatusServiceUnavailable)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+
+```go
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+func ensureSkillDirectory(path string, readOnly bool) error {
+	if readOnly {
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("shared skill directory unavailable: %w", err)
+		}
+		if !info.IsDir() {
+			return errors.New("shared skill path is not a directory")
+		}
+		return nil
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o700)
+}
+
+// Only the bootstrap writer may publish immutable package content. Publication
+// is atomic and never overwrites an existing version, even across processes.
+func ensureSkillFile(stagingRoot, path string, content []byte, readOnly bool) error {
+	check := func() error {
+		existing, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(existing, content) {
+			return errors.New("published skill content does not match this binary")
+		}
+		return nil
+	}
+	if err := check(); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if readOnly {
+		return errors.New("shared skill package is missing; run bootstrap before starting readers")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	// Keep unfinished files outside every published package's digest root.
+	publishing := filepath.Join(stagingRoot, ".publishing")
+	if err := os.MkdirAll(publishing, 0o700); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(publishing, ".skill-publish-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if _, err = file.Write(content); err != nil {
+		file.Close()
+		return err
+	}
+	if err = file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err = file.Close(); err != nil {
+		return err
+	}
+	if err = os.Link(file.Name(), path); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	return check()
+}
+```
+
+
+## 配置契约
+
+| 参数 | 当前值/要求 |
+|---|---|
+| TRPC_POSTGRES_DSN / TRPC_REDIS_ADDRESS | 共享数据库与 Redis，两个实例须相同。 |
+| TRPC_REDIS_ENVIRONMENT | 默认 local-runtime；同一部署协调命名空间相同，各环境不得误共用。 |
+| TRPC_WEBUI_LOCAL_INSTANCE_ID | standalone 默认；Compose 每节点不同。 |
+| TRPC_WEBUI_LOCAL_STATUS_ENABLED | true 才注册 status；owner 启动身份始终生成。 |
+| TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT | 默认 /tmp/trpc-webui-skills；多实例 /var/lib/trpc-webui-local/skills。 |
+| TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY | 节点 true；bootstrap false。 |
+| TRPC_WEBUI_LOCAL_SECRET_ROOT | 默认 /tmp/trpc-webui-secrets，每容器私有。 |
+| TRPC_RUNTIME_DRAIN_TIMEOUT | 默认30s，允许1s–5m。 |
+| TRPC_RUNTIME_OPERATIONS_TOKEN | 独立管理 token，至少32字符，不复用 WebUI token；为空不注册 ops。 |
+| TRPC_WECOM_LOCAL_ENABLED | 主 Bot 渠道开关。 |
+| TRPC_WECOM_SECONDARY_LOCAL_ENABLED | 次 Bot 渠道开关；需要独立 Corp/Agent 组合与全套凭据。 |
+| TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED | 仅隔离演练环境 true；默认不开故障控制面。 |
+
+Bot 凭据通过 Compose secrets/wecom.env 注入，模型 key 通过 secrets/deepseek-api-key。配置名和鉴权严格以组合根为准；不要把脚本的 assumed 当成运行时配置或业务成功状态。
+
+## 启动与端口
+
+先建共享依赖并应用全部迁移，再运行bootstrap；bootstrap成功后节点启动并真实轮询就绪，最后入口纳入后端。外部Bot只登记入口58087，A58088/B58089为本地观测端口；容器内均8080。WebUI multinode使用58083/58084，与WeCom拓扑区分。
+
+| 参数 | 当前本地组合根装配 | 意义 |
 |---|---|---|
-| `TRPC_WEBUI_LOCAL_INSTANCE_ID` | 部署槽位身份 | N1=`wecom-ha-node-a`，N2=`wecom-ha-node-b`，必须不同 |
-| `ProcessStartID`（进程内） | 每次启动随机 8 字节 hex | 不可配置，自动生成 |
-| `TRPC_POSTGRES_DSN` | 业务权威库 | 两节点必须相同 |
-| `TRPC_REDIS_ADDRESS` | 队列与协调 | 两节点必须相同（`redis:6379`） |
-| `TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS` | 媒体安全 | `clamav:3310` |
-| `TRPC_LISTEN_ADDRESS` | 监听地址 | 默认 `:8080` |
-| `TRPC_WECOM_LOCAL_ENABLED` | 主 Bot | `true` |
-| `TRPC_WECOM_SECONDARY_LOCAL_ENABLED` | 次 Bot | `true` 且 (Corp ID, Agent ID) 必须与主 Bot 不同 |
-| 主 Bot：`WECOM_CORP_ID`、`WECOM_AGENT_ID`、`WECOM_APP_SECRET`、`WECOM_CALLBACK_TOKEN`、`WECOM_ENCODING_AES_KEY` | 主 Bot 凭据 | 缺失即启动失败；`WECOM_AGENT_ID` 必须可解析为正整数 |
-| 次 Bot：`WECOM_SECONDARY_CORP_ID`、`WECOM_SECONDARY_AGENT_ID`、`WECOM_SECONDARY_APP_SECRET`、`WECOM_SECONDARY_CALLBACK_TOKEN`、`WECOM_SECONDARY_ENCODING_AES_KEY` | 第二 Bot 凭据 | 任一缺失 → `secondary WeCom local configuration is incomplete`；`(Corp ID, Agent ID)` 与主 Bot 相同 → `... is incompatible` |
-| `TRPC_WECOM_HA_ENTRY_BACKENDS` | 入口后端 | `http://wecom-ha-node-a:8080,http://wecom-ha-node-b:8080`，≥2，http，去重 |
-| `TRPC_WECOM_HA_ENTRY_PROBE_INTERVAL` | 探测周期 | 默认 `1s`，范围 `[100ms, 1m]` |
-| `TRPC_LISTEN_ADDRESS`（入口） | 入口监听 | `:8080` |
-| `TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED` | 注册 P1–P4 测试控制面 | 仅 `webui-multinode` profile 设为 `true` |
-| `TRPC_WEBUI_LOCAL_TOKEN` / `X-TRPC-Local-Token` | 控制面鉴权 | 仅本地演练 |
-| `TRPC_WECOM_REAL_ACCEPTANCE` | 真实 WeCom 验收状态 | `assumed`（默认）/ `recorded` |
-| `TRPC_LOCAL_WECOM_HA_ENTRY_PORT` | 入口宿主端口 | `58087` |
-| `TRPC_LOCAL_WECOM_HA_NODE_A_PORT` | N1 宿主端口 | `58088` |
-| `TRPC_LOCAL_WECOM_HA_NODE_B_PORT` | N2 宿主端口 | `58089` |
+| Worker lease / renew | 30s / 10s | 失权取消执行；lease 到期才可换 owner。 |
+| Worker reclaim / limit | 5s / 100 | 扫描 pending；不代表 5 秒内必完成恢复。 |
+| Relay claim / renew / poll | 30s / 10s / 100ms | 先发布，再标记 published；发布后崩溃可重发同一事件。 |
+| Delivery claim / renew | 30s / 10s | 每分段发送权。 |
+| Delivery reclaim / limit | 5s / 100 | 回收账号回复队列 pending。 |
+| Delivery retry | 初始 1s，最大 1m，最多 8 次 | 明确可重试错误的有界退避。 |
+| Delivery reconcile | 最多 8 次 | 无查询能力或核对失败最终保留 failed/reconcile_exhausted 事件。 |
+| 工具 lease / renew | 默认 30s / TTL÷3 | PostgreSQL 工具 lease，与会话 lease 是两套执行权。 |
+| 应用排空 | 默认 30s，可配置 1s–5m | 停止新领取，保留已接纳工作，超时再取消。 |
+| Compose 停止宽限 | 默认 45s | 必须比应用排空更长并留退出余量。 |
 
----
+这些值是当前 `webui-local`/`wecom-local` 装配值，不能与 Consumer 未配置时的包级兜底值混用。恢复耗时还包含排队、上游延迟、退避和采样误差，不能把 TTL 相加写成已验证的 RTO。
 
-## 5. 端口分配与网络规则
+## 脚本接口
 
-| 端口（宿主） | 服务 | 容器端口 | 网络语义 | 登记为微信回调 |
-|---|---|---|---|---|
-| `58087` | `wecom-ha-entry` | `:8080` | **唯一对外**：HTTPS tunnel / 企业微信控制台指向此处 | ✅ 唯一允许 |
-| `58088` | `wecom-ha-node-a` | `:8080` | 仅本地观测（`/statusz`/`/readyz` 调试） | ❌ 否 |
-| `58089` | `wecom-ha-node-b` | `:8080` | 仅本地观测 | ❌ 否 |
-| `55432` | `postgres` | `5432` | 共享权威态 | ❌ 否 |
-| `56379` | `redis` | `6379` | 共享队列/协调 | ❌ 否 |
+生命周期脚本 `bash scripts/e2e/single-host-multicontainer.sh`，需要Docker Compose v2、curl和真实密钥文件。wecom-ha-failover.sh直接exec同脚本。
 
-网络规则：
+| 脚本参数 | 默认 |
+|---|---|
+| TRPC_SINGLE_HOST_PROJECT | 随机项目名 |
+| TRPC_LOCAL_WECOM_HA_ENTRY_PORT / NODE_A_PORT / NODE_B_PORT | 58087 / 58088 / 58089 |
+| TRPC_SINGLE_HOST_TIMEOUT_SECONDS | 120 |
+| TRPC_SINGLE_HOST_STABILITY_SECONDS | 5 |
+| TRPC_SINGLE_HOST_KEEP_ENVIRONMENT | false |
+| TRPC_WECOM_REAL_ACCEPTANCE | assumed；recorded仅声明外部已存真实证据 |
 
-1. 企业微信控制台将两个 Bot 回调 URL 都设为 `https://<tunnel>/callbacks/wecom`（同一 public origin = 入口 `58087`）。
-2. 同一 origin 下，主/次 Bot 靠 durable route key（`local-wecom` / `local-wecom-secondary`）区分，不依赖不同端口。
-3. 入口与两节点在同一 Docker 用户自定义网络内，使用服务名 `wecom-ha-node-a:8080` / `wecom-ha-node-b:8080` 互访。
-4. 节点宿主机端口只在本机 `127.0.0.1` 观测用；不要在防火墙/NAT 上将其暴露为企业微信可达地址。
+这些是脚本环境变量，不是运行时“已通过”开关。脚本按轮询等待，timeout_seconds是尝试次数口径，包含curl时长后不等于精确秒数RTO。执行完成或失败均保留独立诊断目录；未keep时会清理脚本创建的测试项目及卷。
 
----
+## 管理接口与不确定投递处置
 
-## 6. 健康判定矩阵
+设置独立的 `TRPC_RUNTIME_OPERATIONS_TOKEN`（至少 32 字符、不得复用 WebUI token）才注册管理接口。使用请求头 `X-TRPC-Local-Token`，直接访问节点；稳定 WeCom 入口不转发 `/ops/*`。响应 `Cache-Control: no-store`，查询显式带 tenant，不返回正文或密钥。
 
-| 探测方 | 探测目标 | 成功条件 | 失败后果 |
-|---|---|---|---|
-| 入口 `probe` | `<backend>/readyz` | HTTP 200 | `healthy=false`，从轮转集合摘除 |
-| 入口 `/readyz` | `len(healthyBackends())>0` | 至少 1 健康后端 | 503 |
-| 入口 `/livez` | 进程存活 | 恒 200 | — |
-| 节点 `/readyz` | `db.PingContext` && `redis.Ping` && `malware.Probe` | 三者全成功 | 503 `not ready` |
-| 节点 `/livez` | 进程存活 | 恒 200 | — |
-| 脚本 `assert_stopped` | `docker inspect .State.Running` | `false` | 失败=受害被重启（违反接管前提） |
-| 脚本 `wait_entry_backend` | 入口 `/statusz` 含 `"url":"http://<node>:8080","healthy":<bool>` | 子串匹配 | 超时失败 |
+| 接口 | 参数 / 作用 |
+|---|---|
+| GET /ops/reliability | tenant_id；单条 SQL 一致快照，含 Inbox/执行/Outbox/Ledger/工具计数、最近执行尝试和异常/处置；明细各最多 100 条。 |
+| GET /ops/session/lease | tenant_id、agent_app_id、session_id；原子读 owner/fence/剩余租期，不返回 LeaseID。 |
+| POST /ops/delivery/resolve | 外部证据核实后的版本化处置；冲突 409、输入错误 400、未授权 401、成功 204。 |
 
----
+处置输入为 `tenant_id, delivery_key, segment_no, expected_version, actor, evidence_ref, decision`。decision=delivered 必须带 provider_message_id；另外两种 decision 必须不带。actor 是管理调用方声明的操作人。
 
-## 7. 从零搭建的分步命令
+| decision | 状态与调度 |
+|---|---|
+| delivered | 分段置 sent；重调度原 reply Outbox 以继续剩余段，当前段只跳过发送。 |
+| not_delivered | 分段置 failed，关闭事件，不补发。 |
+| retry_not_delivered | 有未送达证据后置 retry_wait，重调度原 reply，沿用 DeliveryKey/ClientRequestID/内容与累计尝试数。 |
 
-```bash
-# 0) 进入仓库（或准备等价目录结构与上面第 3 节的 Compose）
-cd /path/to/trpc-agent-service
+只能处置 ambiguous 或 failed/reconcile_exhausted。Ledger CAS、delivery_resolution 审计和必要的原 Outbox 重调度同事务提交；Outbox 正被领取时返回冲突，不能手改状态绕过。超时不能证明未送达。
 
-# 1) 准备本地密钥（非空）
-mkdir -p deploy/compose/secrets
-printf 'your-deepseek-key' > deploy/compose/secrets/deepseek-api-key
-# wecom.env 需包含两组 Bot 凭据（主 Bot）：
-#   WECOM_CORP_ID / WECOM_AGENT_ID / WECOM_APP_SECRET / WECOM_CALLBACK_TOKEN / WECOM_ENCODING_AES_KEY
-test -s deploy/compose/secrets/wecom.env || { echo "wecom.env required"; exit 2; }
+## 组合根完整配置校验原文
 
-# 2) 构建并拉起（profile wecom-ha-local）
-export TRPC_LOCAL_WECOM_HA_ENTRY_PORT=58087
-export TRPC_LOCAL_WECOM_HA_NODE_A_PORT=58088
-export TRPC_LOCAL_WECOM_HA_NODE_B_PORT=58089
-docker compose --profile wecom-ha-local up --detach --build
+以下为当前 loadWebUILocalConfig；它给出全部本地运行时环境变量、默认值、开关、密钥路径及合法组合，不包含运行环境注入的实际密钥值。
 
-# 3) 等依赖与两节点 ready
-for p in 58088 58089 58087; do
-  until curl --fail --silent --show-error --max-time 3 "http://127.0.0.1:$p/readyz" >/dev/null; do sleep 1; done
-done
-
-# 4) 确认入口两后端健康
-curl --silent "http://127.0.0.1:58087/statusz"
-# 期望：{"backends":[{"url":"http://wecom-ha-node-a:8080","healthy":true},{"url":"http://wecom-ha-node-b:8080","healthy":true}]}
-
-# 5) 在企业微信控制台把两个 Bot 回调设为 https://<你的tunnel>/callbacks/wecom
-
-# 6) 故障演练见 testing-and-acceptance.md；或一键：
-#    bash scripts/e2e/single-host-multicontainer.sh
+```go
+func loadWebUILocalConfig(getenv func(string) string) (webUILocalConfig, error) {
+	if strings.EqualFold(strings.TrimSpace(getenv("TRPC_FEISHU_LOCAL_ENABLED")), "true") {
+		return webUILocalConfig{}, errors.New("Feishu local runtime is no longer supported")
+	}
+	value := webUILocalConfig{PostgresDSN: strings.TrimSpace(getenv("TRPC_POSTGRES_DSN")),
+		DrainTimeout:    30 * time.Second,
+		ReadOnlySkills:  strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_SKILLS_READ_ONLY")), "true"),
+		OperationsToken: getenv("TRPC_RUNTIME_OPERATIONS_TOKEN"),
+		RedisAddress:    strings.TrimSpace(getenv("TRPC_REDIS_ADDRESS")), ListenAddress: valueOr(getenv("TRPC_LISTEN_ADDRESS"), ":8080"),
+		RedisEnvironment:             valueOr(getenv("TRPC_REDIS_ENVIRONMENT"), "local-runtime"),
+		SecretRoot:                   valueOr(getenv("TRPC_WEBUI_LOCAL_SECRET_ROOT"), "/tmp/trpc-webui-secrets"),
+		SkillStagingRoot:             valueOr(getenv("TRPC_WEBUI_LOCAL_SKILL_STAGING_ROOT"), "/tmp/trpc-webui-skills"),
+		QdrantEndpoint:               valueOr(getenv("TRPC_WEBUI_LOCAL_QDRANT_ENDPOINT"), "http://qdrant:6333"),
+		APIKeyFile:                   valueOr(getenv("TRPC_WEBUI_DEEPSEEK_KEY_FILE"), "/run/secrets/deepseek_api_key"),
+		RouteKey:                     valueOr(getenv("TRPC_WEBUI_LOCAL_ROUTE_KEY"), webUILocalRouteKey),
+		Token:                        valueOr(getenv("TRPC_WEBUI_LOCAL_TOKEN"), webUILocalToken),
+		InstanceID:                   valueOr(getenv("TRPC_WEBUI_LOCAL_INSTANCE_ID"), "standalone"),
+		ClamAVAddress:                valueOr(getenv("TRPC_WEBUI_LOCAL_CLAMAV_ADDRESS"), "clamav:3310"),
+		ExclusiveRuntime:             strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_EXCLUSIVE_RUNTIME")), "true"),
+		FailoverTestEnabled:          strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_FAILOVER_TEST_ENABLED")), "true"),
+		StatusEnabled:                strings.EqualFold(strings.TrimSpace(getenv("TRPC_WEBUI_LOCAL_STATUS_ENABLED")), "true"),
+		FeishuEnabled:                strings.EqualFold(strings.TrimSpace(getenv("TRPC_FEISHU_LOCAL_ENABLED")), "true"),
+		FeishuAppID:                  strings.TrimSpace(getenv("FEISHU_APP_ID")),
+		FeishuAppSecret:              strings.TrimSpace(getenv("FEISHU_APP_SECRET")),
+		FeishuVerificationToken:      strings.TrimSpace(getenv("FEISHU_VERIFICATION_TOKEN")),
+		FeishuEncryptKey:             strings.TrimSpace(getenv("FEISHU_ENCRYPT_KEY")),
+		FeishuBotOpenID:              strings.TrimSpace(getenv("FEISHU_BOT_OPEN_ID")),
+		WeComEnabled:                 strings.EqualFold(strings.TrimSpace(getenv("TRPC_WECOM_LOCAL_ENABLED")), "true"),
+		WeComSecondaryEnabled:        strings.EqualFold(strings.TrimSpace(getenv("TRPC_WECOM_SECONDARY_LOCAL_ENABLED")), "true"),
+		WeComCorpID:                  strings.TrimSpace(getenv("WECOM_CORP_ID")),
+		WeComAppSecret:               strings.TrimSpace(getenv("WECOM_APP_SECRET")),
+		WeComCallbackToken:           strings.TrimSpace(getenv("WECOM_CALLBACK_TOKEN")),
+		WeComEncodingAESKey:          strings.TrimSpace(getenv("WECOM_ENCODING_AES_KEY")),
+		WeComSecondaryCorpID:         strings.TrimSpace(getenv("WECOM_SECONDARY_CORP_ID")),
+		WeComSecondaryAppSecret:      strings.TrimSpace(getenv("WECOM_SECONDARY_APP_SECRET")),
+		WeComSecondaryCallbackToken:  strings.TrimSpace(getenv("WECOM_SECONDARY_CALLBACK_TOKEN")),
+		WeComSecondaryEncodingAESKey: strings.TrimSpace(getenv("WECOM_SECONDARY_ENCODING_AES_KEY")),
+	}
+	if raw := strings.TrimSpace(getenv("TRPC_RUNTIME_DRAIN_TIMEOUT")); raw != "" {
+		duration, err := time.ParseDuration(raw)
+		if err != nil || duration < time.Second || duration > 5*time.Minute {
+			return webUILocalConfig{}, errors.New("invalid runtime drain timeout")
+		}
+		value.DrainTimeout = duration
+	}
+	if value.OperationsToken != "" && (len(value.OperationsToken) < 32 || strings.TrimSpace(value.OperationsToken) != value.OperationsToken || value.OperationsToken == value.Token) {
+		return webUILocalConfig{}, errors.New("operations token must be independent and contain at least 32 characters")
+	}
+	if value.PostgresDSN == "" || value.RedisAddress == "" || strings.TrimSpace(value.Token) != value.Token || len(value.Token) < 16 ||
+		strings.TrimSpace(value.RouteKey) != value.RouteKey || value.RouteKey == "" || strings.TrimSpace(value.ClamAVAddress) != value.ClamAVAddress || value.ClamAVAddress == "" || !filepath.IsAbs(value.APIKeyFile) || !filepath.IsAbs(value.SecretRoot) ||
+		!filepath.IsAbs(value.SkillStagingRoot) || filepath.Clean(value.SkillStagingRoot) != value.SkillStagingRoot || value.SkillStagingRoot == value.SecretRoot || value.QdrantEndpoint != "http://qdrant:6333" {
+		return webUILocalConfig{}, errors.New("required WebUI local configuration is missing or invalid")
+	}
+	if !validWebUILocalInstanceID(value.InstanceID) {
+		return webUILocalConfig{}, errors.New("WebUI local instance ID is invalid")
+	}
+	if value.FeishuEnabled && (value.FeishuAppID == "" || value.FeishuAppSecret == "" || value.FeishuVerificationToken == "" || value.FeishuEncryptKey == "") {
+		return webUILocalConfig{}, errors.New("Feishu local configuration is incomplete")
+	}
+	if value.WeComEnabled {
+		agentID, agentIDErr := strconv.ParseInt(strings.TrimSpace(getenv("WECOM_AGENT_ID")), 10, 64)
+		if agentIDErr != nil || agentID <= 0 || value.WeComCorpID == "" || value.WeComAppSecret == "" || value.WeComCallbackToken == "" ||
+			value.WeComEncodingAESKey == "" {
+			return webUILocalConfig{}, errors.New("WeCom local configuration is incomplete")
+		}
+		value.WeComAgentID = agentID
+	}
+	secondaryConfigured := value.WeComSecondaryCorpID != "" || strings.TrimSpace(getenv("WECOM_SECONDARY_AGENT_ID")) != "" || value.WeComSecondaryAppSecret != "" ||
+		value.WeComSecondaryCallbackToken != "" || value.WeComSecondaryEncodingAESKey != ""
+	if !value.WeComSecondaryEnabled && secondaryConfigured {
+		return webUILocalConfig{}, errors.New("secondary WeCom credentials require explicit enablement")
+	}
+	if value.WeComSecondaryEnabled {
+		if !value.WeComEnabled {
+			return webUILocalConfig{}, errors.New("secondary WeCom requires the primary WeCom local configuration")
+		}
+		agentID, agentIDErr := strconv.ParseInt(strings.TrimSpace(getenv("WECOM_SECONDARY_AGENT_ID")), 10, 64)
+		if agentIDErr != nil || agentID <= 0 || value.WeComSecondaryCorpID == "" || value.WeComSecondaryAppSecret == "" ||
+			value.WeComSecondaryCallbackToken == "" || value.WeComSecondaryEncodingAESKey == "" ||
+			(value.WeComSecondaryCorpID == value.WeComCorpID && agentID == value.WeComAgentID) {
+			return webUILocalConfig{}, errors.New("secondary WeCom local configuration is incomplete or incompatible")
+		}
+		value.WeComSecondaryAgentID = agentID
+	}
+	return value, nil
+}
 ```
-
----
-
-## 8. 验证清单（最低通过集）
-
-- [ ] `docker compose --profile wecom-ha-local ps` 显示 `wecom-ha-bootstrap` 已完成、`node-a`/`node-b`/`entry` 运行。
-- [ ] `node-a:58088/readyz`、`node-b:58089/readyz`、`entry:58087/readyz` 均 200。
-- [ ] `entry:58087/statusz` 中两后端 `healthy:true`。
-- [ ] `node-a:58088/statusz` 的 `instance_id == "wecom-ha-node-a"`；使用 worker consumer/lease 记录确认其 owner 前缀为 `webui-local-worker-wecom-ha-node-a-`。
-- [ ] 强杀 `node-a` 后，`entry/statusz` 中 `wecom-ha-node-a` 变 `healthy:false`、`wecom-ha-node-b` 仍 `true`；`docker inspect node-a` 的 `State.Running==false` 持续。
-- [ ] 显式 `start node-a` 后，`node-a/statusz` 的 `process_start_id` 与基线**不同**；`entry/statusz` 中 `node-a` 重新 `healthy:true`。
-- [ ] 反向强杀 `node-b` 后，`entry/statusz` 只剩重新加入的 `node-a` 健康；`node-b` `State.Running==false` 持续。
-- [ ] 真实/录制的两个 Bot 原会话最终回复唯一且 tenant 正确（由 `TRPC_WECOM_REAL_ACCEPTANCE` 控制 assumed/recorded）。
-- [ ] 全程未修改任何企业微信回调 URL（公开地址不随实例切换）。
