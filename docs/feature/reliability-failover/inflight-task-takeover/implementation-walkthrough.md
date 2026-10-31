@@ -4,11 +4,11 @@
 
 1. Runner 核对原 envelope、顺序和 payload 后调用 taskflow Store.Open，以原输入 SHA-256、payload key version 和会话 fence 创建或接管计划。Redis 提交前检查也用于计划写入前资格检查。
 2. Recover 遍历已绑定工具步骤，读取同 tenant/request/tool-call 的工具账本。成功结果须通过工具名/版本、参数摘要、密文摘要、必需的步骤断言及适用的服务端可信断言；成功结果存在但检查点尚未提交时补齐步骤成功。不可恢复 failed/manual 未知先保存失败，停止模型重跑。
-3. 有冻结答案时继续已有结果分支；没有时，将 checkpoint 作为数据加入本轮 global instruction，保留原发布 instruction。已完成工具结果小于等于 8192 字节时内联，大结果使用 read_result 按 UTF-8 字节分块读取。原用户输入保持权威。
+3. 有冻结答案时继续已有结果分支；否则先查 execution_completion，存在时恢复原结算并晋升结果，跳过新模型运行。两者都没有时，将 checkpoint 作为数据加入本轮 global instruction，保留原发布 instruction。已完成工具结果小于等于 8192 字节时内联，大结果使用 read_result 按 UTF-8 字节分块读取。原用户输入保持权威。
 4. Factory 添加代码自有 task_checkpoint 工具；Worker 仅对这个精确类型放行控制权限，名称被保留，租户工具不能冒名。工具动作有预算限制、上下文租户检查、长度限制、版本检查和写前资格检查。
 5. 模型通过 define/start/complete_analysis/inspect/read_result 管理步骤。define 只追加；普通工具在实际调用前由 GuardedCallable 将稳定操作与规范参数写入运行步骤，然后才走原工具 claim/恢复/授权协议。
 6. 工具成功结果提交后 RecordTool 再核对并更新计划。此处被杀时，下一 owner 的 Recover 从工具结果修复检查点；工具效果完成但结果未落库时，继续依赖原工具恢复策略。
-7. 模型给出最终答案后，先检查所有已声明义务，再结算治理预算、保存冻结答案；commitFrozenSuccess 验证并 Seal。terminal 数据库触发器最后检查封存状态、引用和 fence。
+7. 模型给出最终答案后，先检查所有已声明义务并渲染输出，再以 PrepareFinalization 审核/计算；把原预约、用量、审核决定、结算参数与输出加密写入 execution_completion。保存成功后才 CommitFinalization、PutResult；commitFrozenSuccess 验证并 Seal。terminal 数据库触发器最后检查封存状态、引用和 fence。
 8. `/ops/reliability` 增加最多 100 条计划元数据及检查点总数，不返回规范参数、笔记、密钥或解密正文。
 
 000006 在读取冻结结果之后、创建新模型运行之前调用 BeginAttempt，持久保存合同、起点和进展/尝试计数；超限直接进入失败收敛。ResumeInstruction 向模型展示非空计划和工具检查的强制要求，但最终判定由代码完成。运行 context 使用固定任务 deadline，模型持续不结束也受时间限制。
@@ -27,7 +27,8 @@
   → 已终结：读取既有结果，不重演本轮
   → 后序输入：交给持久停放协议
   → 有冻结答案：校验、重查意图、继续提交
-  → 无冻结答案：SDK 运行，工具逐个按账本与策略执行
+  → 有完成候选：复用原审核决定与结算参数，晋升结果后继续提交
+  → 无冻结答案或完成候选：SDK 运行，工具逐个按账本与策略执行
   → 冻结最终结果，再提交 terminal + Outbox
   → Relay 发布原 reply，Delivery 按原分段计划发送/核对
 ```
@@ -69,7 +70,7 @@
 | 6 | RunnerExecutor.ExecuteWithLease | session_head / 官方 SDK 历史 / 输入与版本 | 已 terminal 识别完成；输入未就绪则停放/唤醒，不强行越序。 |
 | 7 | frozen result 检查 | tenant/request/key/digest 验证通过的 result_payload | 已冻结时续提交，不再次运行模型。 |
 | 8 | run.Run 与 GuardedCallable | SDK session_events、工具账本/密文 | SDK 事件可能已写；平台 rollback 不撤销；工具按恢复契约。 |
-| 9 | PutResult → commitFrozenSuccess | 冻结答案；beforeCommit；terminal/Outbox 事务 | result 已写未提交时复用；事务提交后不重跑模型。 |
+| 9 | saveCompletion → resumeCompletion → commitFrozenSuccess | 加密候选；原审核/幂等结算；公开结果；terminal/Outbox | 候选已写则不重跑模型；结果已写则直接续提交。 |
 | 10 | Reply Relay.PublishReply | reply Outbox 与账号 reply stream | 先发布后标记，可重复发布同一 DeliveryKey。 |
 | 11 | delivery.Service.Deliver | 分段计划与 Ledger claim | 只有成功 claim 才发送；expired sending 进入不确定路径。 |
 | 12 | adapter.Deliver → FinishDelivery | provider 接受消息 ID、Ledger sent | 接受后确认前为 P4；不得因超时判断未发送。 |
@@ -93,7 +94,7 @@
 
 ## 冻结答案与 terminal 提交
 
-Runner 先加载并校验原输入。若 Results.GetResult 找到同 tenant/request 的冻结结果，要求 result_ref 非空、key version 与 payload 一致、内容摘要匹配，随后进入 commitFrozenSuccess。没有结果才执行模型。生成结束先 PutResult，再在 result-before-commit 暂停点后提交。commitFrozenSuccess 重查取消意图、beforeCommit 与 terminal 条件，原子写 terminal 和 reply Outbox。
+Runner 先加载并校验原输入。若 Results.GetResult 找到同 tenant/request 的冻结结果，要求 result_ref 非空、key version 与 payload 一致、内容摘要匹配，随后进入 commitFrozenSuccess。没有公开结果时先查询私有 execution_completion：候选存在则复用原审核决定、幂等结算并保存公开结果；两者都不存在才执行模型。生成结束先保存候选，再结算、PutResult，最后经过 result-before-commit 暂停点后提交。commitFrozenSuccess 重查取消意图、beforeCommit 与 terminal 条件，原子写 terminal 和 reply Outbox。
 
 SDK 事件已同步持久，续提交不会再运行 SDK。result_payload 独立于 terminal 事务，所以这是专门的恢复分支，不能把它误写成“提交前一律重跑”。
 

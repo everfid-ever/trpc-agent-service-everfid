@@ -19,6 +19,7 @@ type Store struct {
 	payloads     map[string]messaging.PayloadRecord
 	prepared     map[string]messaging.PreparedPayloadRecord
 	results      map[string]messaging.ResultRecord
+	completions  map[string]messaging.CompletionRecord
 	toolResults  map[string]messaging.ToolResultRecord
 	interactions map[string]messaging.InteractionRecord
 	routes       map[string]messaging.ReplyRoute

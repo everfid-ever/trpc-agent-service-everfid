@@ -2,7 +2,9 @@
 
 ## 步骤级恢复升级与排障
 
-先执行 `000005_task_checkpoints`、`000006_task_failure_convergence` 再运行当前应用。旧实例不理解合同版本、失败阶段与写入版本戳，会被新约束拒绝写新合同计划，不能在仍有新计划的环境无条件回滚到旧应用。保留两张新表、旧 payload key version 和原工具结果；新字段 down 迁移不删除失败记录，有 failed 记录时回退旧阶段约束会失败并整体回滚。
+先依次执行至 `000007_execution_completion` 再运行当前应用。旧实例不理解合同版本、失败阶段与完成候选，不能在仍有未完成任务时混用或无条件回滚旧应用。保留计划/检查点/完成候选、旧 payload key version 和原工具结果；000006 的 down 不删除失败记录，有 failed 记录时回退旧阶段约束会失败并整体回滚。000007 的 down 会删除候选表，不能在待恢复候选仍存在时执行；须先完成/处置原请求并保留备份与密钥。
+
+候选存在但无 result_payload 时，核对 envelope/content 摘要、key_version、预约与 output 决策；让 Worker 沿原 request 自动续提交，不手动 Reserve 新预约、删候选或把私有候选直接作为回复。MCP 新恢复契约和 code_exec CompletionContract=1 改变绑定摘要，需发布新工具版本及 Agent revision，不能修改旧版本摘要。历史读取过滤保留原始 SDK 事件，排障应同时比较原始记录和本轮模型输入视图。
 
 `/ops/reliability` 返回 task_plans 的 request/fence/version/phase/final_ref/updated_at、task_checkpoints 总数及 task_failures 原因码/策略版本/时间。明细最多 100 条；状态存在不证明步骤业务正确。需要检查正文时使用授权的受控数据访问，不把解密计划写入普通日志。
 

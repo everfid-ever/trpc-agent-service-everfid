@@ -6,6 +6,8 @@
 
 ## 身份、历史与恢复
 
+当前 Worker 还为 SDK 事件标记可信 root request/Fence；读取副本省略同一原请求的旧尝试、其他请求较低 Fence 的迟到事件及可辨识孤立工具消息，按 Event.ID 去重。确认恢复仅保留原输入和准确批准的 call；持久原始事件仍保留，不能宣称数据库历史原子回滚。治理结算中断则从加密 execution_completion 复用原审核决定与答案，避免关闭预约后重新 Begin 失败。
+
 可信Binding固定tenant/app/account，HMAC派生user/session；Inbox按原渠道消息去重，ReplyRoute冻结。SDK session_events是上下文权威，平台head/commit负责顺序、fence和Outbox。SDK写入与平台terminal事务独立，不能回滚已写SDK事件。Worker校准fence、reclaim原工作，已冻结答案直接续提交，原会话新消息从共享历史继续。
 
 ## 共同计数与投递边界

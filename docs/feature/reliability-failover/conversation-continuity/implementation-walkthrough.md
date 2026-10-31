@@ -40,7 +40,7 @@
 | 6 | RunnerExecutor.ExecuteWithLease | session_head / 官方 SDK 历史 / 输入与版本 | 已 terminal 识别完成；输入未就绪则停放/唤醒，不强行越序。 |
 | 7 | frozen result 检查 | tenant/request/key/digest 验证通过的 result_payload | 已冻结时续提交，不再次运行模型。 |
 | 8 | run.Run 与 GuardedCallable | SDK session_events、工具账本/密文 | SDK 事件可能已写；平台 rollback 不撤销；工具按恢复契约。 |
-| 9 | PutResult → commitFrozenSuccess | 冻结答案；beforeCommit；terminal/Outbox 事务 | result 已写未提交时复用；事务提交后不重跑模型。 |
+| 9 | saveCompletion → resumeCompletion → commitFrozenSuccess | 私有候选；幂等结算；公开结果；terminal/Outbox | 候选或结果已保存则续提交原答案，避免再次生成。 |
 | 10 | Reply Relay.PublishReply | reply Outbox 与账号 reply stream | 先发布后标记，可重复发布同一 DeliveryKey。 |
 | 11 | delivery.Service.Deliver | 分段计划与 Ledger claim | 只有成功 claim 才发送；expired sending 进入不确定路径。 |
 | 12 | adapter.Deliver → FinishDelivery | provider 接受消息 ID、Ledger sent | 接受后确认前为 P4；不得因超时判断未发送。 |
@@ -53,7 +53,7 @@
 
 Mapper 从可信 Binding 取 tenant，单聊以 channel/account/user 派生 session，群聊以 chat 派生。identity/session 使用不同 purpose 的租户密钥。SDK TenantKey 把 tenant/app 编码到 app_name，checked facade 对 app/user/session 任一不匹配拒绝。ReplyRoute 随持久 payload 固定，接管者不能用当前模型输出选择 Bot。
 
-官方会话 service 关闭 async persist，事件同步写入。BufferedTurn.Commit 明确清空平台 Events/StateDelta/SummaryCandidate，避免重复真相源；Rollback 只丢弃进程内协调元数据，不撤销 SDK 写入。故障重跑可能附加第二次同内容输入，因此终态幂等与历史事件去重不能混为一谈。
+官方会话 service 关闭 async persist，事件同步写入。BufferedTurn.Commit 明确清空平台 Events/StateDelta/SummaryCandidate，避免重复真相源；Rollback 只丢弃进程内协调元数据，不撤销 SDK 写入。Worker.ConfigureHistory 为事件标记原 request/Fence，GetSession 返回整理后的读取副本，过滤重试残留及可辨识孤立工具消息；原始事件仍可能包含第二次同内容输入，因此终态幂等、上下文读取整理与原始历史去重不能混为一谈。完整策略及兼容边界见 [设计](design.md#重试历史的读取视图)。
 
 ## 执行恢复分支
 

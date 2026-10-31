@@ -20,6 +20,7 @@ type BufferedTurn struct {
 	userID    string
 	closed    bool
 	committed bool
+	history   historyScope
 	service   *bufferedSessionService
 }
 
@@ -124,7 +125,7 @@ func (s *bufferedSessionService) GetSession(ctx context.Context, key agentsessio
 			return nil, err
 		}
 	}
-	return copy, nil
+	return s.turn.historyView(copy), nil
 }
 
 func (s *bufferedSessionService) ListSessions(ctx context.Context, key agentsession.UserKey, options ...agentsession.Option) ([]*agentsession.Session, error) {
@@ -195,7 +196,7 @@ func (s *bufferedSessionService) AppendEvent(ctx context.Context, session *agent
 	// Append through the official implementation. In particular, do not append
 	// to a platform event table or mutate session.Events/session.State here:
 	// the SDK is their only persistence authority.
-	if err := s.turn.backing.AppendEvent(ctx, session, value, options...); err != nil {
+	if err := s.turn.backing.AppendEvent(ctx, session, s.turn.stampEvent(value), options...); err != nil {
 		return err
 	}
 	return nil

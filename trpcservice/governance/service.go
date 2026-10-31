@@ -46,6 +46,18 @@ type MultiModelRunGuard interface {
 	FinishModels(context.Context, RunPermit, []ModelUsage, []byte) (Decision, error)
 }
 
+// Finalization separates read-only review from ledger mutations. Workers
+// durably save this decision with the output BEFORE committing settlement.
+type Finalization struct {
+	Settlement   SettleRequest
+	Decision     Decision
+	OutputDigest string
+}
+type PreparedRunGuard interface {
+	PrepareFinalization(context.Context, RunPermit, []ModelUsage, []byte) (Finalization, error)
+	CommitFinalization(context.Context, Finalization) (Decision, error)
+}
+
 type Service struct {
 	Repository  Repository
 	Ledger      Ledger
@@ -165,13 +177,30 @@ func (s Service) Finish(ctx context.Context, permit RunPermit, usage Usage, outp
 }
 
 func (s Service) FinishModels(ctx context.Context, permit RunPermit, usages []ModelUsage, output []byte) (Decision, error) {
+	prepared, err := s.PrepareFinalization(ctx, permit, usages, output)
+	if err != nil {
+		return Decision{}, err
+	}
+	return s.CommitFinalization(ctx, prepared)
+}
+
+func (s Service) PrepareFinalization(ctx context.Context, permit RunPermit, usages []ModelUsage, output []byte) (Finalization, error) {
+	decision, settlement, err := s.prepareFinalization(ctx, permit, usages, output)
+	if err != nil {
+		return Finalization{}, err
+	}
+	return Finalization{Settlement: settlement, Decision: decision, OutputDigest: contentDigest(output)}, nil
+}
+
+func (s Service) prepareFinalization(ctx context.Context, permit RunPermit, usages []ModelUsage, output []byte) (Decision, SettleRequest, error) {
+	var empty SettleRequest
 	if permit.Decision.Action != ActionAllow || permit.Reservation.ReservationID == "" {
-		return Decision{}, runtime.ErrInvariantViolation
+		return Decision{}, empty, runtime.ErrInvariantViolation
 	}
 	var aggregate Usage
 	for _, value := range usages {
 		if value.Model.ID == "" || value.Model.Version < 1 || value.Usage.InputTokens < 0 || value.Usage.OutputTokens < 0 || value.Usage.CachedInputTokens < 0 {
-			return Decision{}, runtime.ErrInvariantViolation
+			return Decision{}, empty, runtime.ErrInvariantViolation
 		}
 		aggregate.InputTokens += value.Usage.InputTokens
 		aggregate.OutputTokens += value.Usage.OutputTokens
@@ -179,40 +208,47 @@ func (s Service) FinishModels(ctx context.Context, permit RunPermit, usages []Mo
 	}
 	if len(usages) == 0 || ((permit.Policy.Policy.Budget.MaxInputTokens > 0 || permit.Policy.Policy.Budget.MaxOutputTokens > 0 || permit.Policy.Policy.Budget.MaxCostMicrosPerRun > 0) && aggregate.InputTokens+aggregate.OutputTokens == 0) {
 		s.recordUsageMissing(ctx)
-		return Decision{}, runtime.ErrCapabilityUnsupported
+		return Decision{}, empty, runtime.ErrCapabilityUnsupported
 	}
 	actualCost := int64(0)
 	if permit.Policy.Policy.Budget.MaxCostMicrosPerRun > 0 {
 		pricing, err := s.Repository.GetPricing(ctx, permit.Policy.TenantID, permit.Policy.Policy.PricingVersion)
 		if err != nil {
-			return Decision{}, err
+			return Decision{}, empty, err
 		}
 		for _, value := range usages {
 			cost, priceErr := PriceUsage(pricing, value.Model, value.Usage, s.now())
 			if priceErr != nil {
-				return Decision{}, priceErr
+				return Decision{}, empty, priceErr
 			}
 			if cost > int64(^uint64(0)>>1)-actualCost {
-				return Decision{}, runtime.ErrInvariantViolation
+				return Decision{}, empty, runtime.ErrInvariantViolation
 			}
 			actualCost += cost
 		}
 	}
-	settled, err := s.Ledger.Settle(ctx, SettleRequest{TenantID: permit.Policy.TenantID, ReservationID: permit.Reservation.ReservationID,
-		RequestID: permit.Reservation.RequestID, Stage: "model", UsageKind: "tokens", ExpectedVersion: permit.Reservation.Version, Usage: aggregate, ActualCostMicros: actualCost})
-	if err != nil {
-		return Decision{}, err
-	}
+	settlement := SettleRequest{TenantID: permit.Policy.TenantID, ReservationID: permit.Reservation.ReservationID, RequestID: permit.Reservation.RequestID, Stage: "model", UsageKind: "tokens", ExpectedVersion: permit.Reservation.Version, Usage: aggregate, ActualCostMicros: actualCost}
 	verdict, inspectErr := inspect(ctx, s.OutputGuard, permit.Policy.Policy.OutputDLP, permit.Policy.TenantID, permit.Reservation.RequestID, "output", output)
 	decision := Decision{DecisionID: StableDecisionID(permit.Policy.TenantID, permit.Reservation.RequestID, "output", permit.Policy.Version), TenantID: permit.Policy.TenantID,
-		RequestID: permit.Reservation.RequestID, Stage: "output", Action: ActionAllow, ReasonCode: ReasonAllowed, PolicyVersion: permit.Policy.Version, ReservationID: settled.ReservationID}
+		RequestID: permit.Reservation.RequestID, Stage: "output", Action: ActionAllow, ReasonCode: ReasonAllowed, PolicyVersion: permit.Policy.Version, ReservationID: permit.Reservation.ReservationID}
 	if inspectErr != nil || verdict != DLPVerdictClean {
 		decision.Action, decision.ReasonCode = ActionDeny, ReasonOutputRejected
 	}
-	if err := s.recordDecision(ctx, decision); err != nil {
+	return decision, settlement, nil
+}
+
+func (s Service) CommitFinalization(ctx context.Context, in Finalization) (Decision, error) {
+	d, r := in.Decision, in.Settlement
+	if s.Ledger == nil || s.Decisions == nil || len(in.OutputDigest) != 64 || d.TenantID == "" || d.TenantID != r.TenantID || d.RequestID != r.RequestID || d.ReservationID != r.ReservationID || d.PolicyVersion < 1 || d.Stage != "output" || (d.Action != ActionAllow && d.Action != ActionDeny) || d.DecisionID != StableDecisionID(d.TenantID, d.RequestID, "output", d.PolicyVersion) {
+		return Decision{}, runtime.ErrInvariantViolation
+	}
+	if _, err := s.Ledger.Settle(ctx, r); err != nil {
 		return Decision{}, err
 	}
-	return decision, nil
+	if err := s.recordDecision(ctx, d); err != nil {
+		return Decision{}, err
+	}
+	return d, nil
 }
 
 func (s Service) recordDecision(ctx context.Context, decision Decision) error {

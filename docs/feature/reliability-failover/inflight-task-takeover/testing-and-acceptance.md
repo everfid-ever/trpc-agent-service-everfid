@@ -1,5 +1,22 @@
 # 在途任务接管与幂等投递 — 测试与验收
 
+## 完成候选、工具适配与历史视图回归
+
+| 反例或注入位置 | 代码回归判据 | 证据入口 |
+|---|---|---|
+| 候选已保存、尚未结算 | 原候选续结算并提交，不能进入模型路径 | worker/completion_test.go 的 before_settlement。 |
+| 预约已结算、PutResult 前退出 | 原答案最终 succeeded，不触发 reservation_closed；输出审核只发生一次 | 同文件 after_settlement。 |
+| 旧 lease 资格检查失败 | 无候选插入，预约仍 reserved | 同文件 stale_owner。 |
+| 数据库已登记更高执行 Fence | PutCompletion 拒绝且事务回滚 | messaging/postgres/completion_test.go。 |
+| 审核拒绝 | 私有候选不进入公开成功结果 | worker/completion_test.go 的 output_denied；TaskPlans 失败链另由 taskflow 测试覆盖。 |
+| 候选被换租户/request/摘要/密钥版本 | AES-GCM AAD 认证失败 | messaging/postgres/completion_test.go。 |
+| MCP 同操作重试 | 注入完全相同供应商键，模型不能覆盖；远端声明变化/错误回执拒绝 | tool/mcp/recovery_test.go。 |
+| SDK 参数拒绝、代码执行返回错误 | 不生成 status=completed；空 stdout 的真实成功允许完成 | tool/codeexec/completion_test.go。 |
+| 重试残留、迟到旧 Fence、孤立工具调用 | 读视图省略，保留当前执行中 call；原始事件及 State 不被修改 | storage/session/history_test.go。 |
+| 确认恢复 | 仅原输入与批准的 call 留在旧尝试视图 | 同文件确认恢复用例。 |
+
+以上是代码检查，不等于真实渠道、供应商幂等或数据库部署验收。真实 PG 仍须验证 000007 的约束及候选写入/新执行尝试行锁竞态；供应商须证明配置的业务键确实去重，不能由本地键相同推断外部效果一次。未执行的环境故障演练不记为通过。
+
 ## 步骤检查点的代码回归范围
 
 新增 `trpcservice/taskflow/taskflow_test.go` 检查依赖闸门、伪造成功/回执拒绝、操作参数固定、旧 fence 拒写、工具结果已保存但 checkpoint 未提交后的修复、确定性输出断言及 UTF-8 大结果分页。`postgres/store_test.go` 检查加密租户绑定、原计划保留、版本/fence CAS 和历史写失败回滚。

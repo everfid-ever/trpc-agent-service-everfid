@@ -1,5 +1,22 @@
 # 故障恢复后继续对话 — 设计文档
 
+## 重试历史的读取视图
+
+`storage/session/history.go` 在官方 SDK 历史外提供读取整理，不另建聊天事实表。Worker 调用 ConfigureHistory，把原 request、当前 Fence 和适用的已批准 ToolCallID 绑定到本轮；AppendEvent 用可信扩展 `trpc.execution.v1={request_id,fence}` 覆盖调用者传入的同名元数据，保留原事件 ID。SDK Clone 会生成新 ID，因此整理副本时显式恢复原 ID。
+
+| 读到的事件 | 读取策略 | 为什么 |
+|---|---|---|
+| 当前原请求的旧 Fence | 新运行默认省略 | 原输入由 Worker 重新提供，避免重复输入及旧半成品被当作本次回答。 |
+| 已完成其他请求的多个 Fence | 保留最高已观测 Fence，重复 Event.ID 只取一次 | 迟到的旧 owner 不能覆盖较新尝试；不同 request 即使文本相同也不能合并。 |
+| 其他请求孤立的 tool call/result | 按 request/Fence/invocation/branch/工具 ID 与名称配对后过滤 | 避免模型收到无对应调用的工具消息。 |
+| 本轮正在执行的 call | 保留 | 工具结果可能尚未产生，不能误删正常进行中的调用。 |
+| 确认恢复 | 保留原输入及确切批准的 call，其余旧尝试事件省略 | 继续原授权调用，不能把其他 call 一并恢复。 |
+| 未带扩展的旧历史 | 相同当前 request 视作旧尝试；其他请求保守保留，再检查可辨识工具配对 | 旧事件没有可靠 attempt 标记，不能补造 Fence。 |
+
+整理发生在 Session.Clone 副本上，过滤 Events，清空副本 Tracks/Summaries 避免旧缓存重新注入已省略事件；State 与原始持久事件不删除。此视图改善重试上下文质量，并不构成 SDK 与 terminal 的跨库原子回滚；最高观测 Fence 也不是权威成功终态的语义证明。任务完成仍须依赖持久计划、工具证据与 terminal 门禁。
+
+治理已结算但公开结果尚未保存时，由[完成候选](../inflight-task-takeover/design.md#000007完成候选与治理结算恢复)续办原答案，不重新调用模型。原 Bot Binding、session/request 和 ReplyRoute 继续沿用既有作用域。
+
 ## 数据模型先按用途阅读
 
 字段表适合查精确类型，下表用于先理解数据为什么拆开。表之间用业务身份关联，不通过进程本地对象指针关联。

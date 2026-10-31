@@ -193,10 +193,11 @@ func TestRunnerExecutorUsesUpstreamRunnerAndKeepsRedeliveryIdempotent(t *testing
 		Sessions: sessions, SDKSessions: agentsessionmemory.NewSessionService(), Payloads: payloads,
 		Inputs:   JSONTextInputDecoder{},
 		Progress: ProgressPublisherFunc(func(value ProgressEvent) { progressEvents = append(progressEvents, value) }),
+		Barrier:  &crashBeforeTerminal{},
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt == 0 {
-			if err := executor.ExecuteWithLease(context.Background(), envelope, 1, func(context.Context) error { return runtime.ErrLeaseLost }); !errors.Is(err, runtime.ErrLeaseLost) {
+			if err := executor.ExecuteWithLease(context.Background(), envelope, 1, nil); !errors.Is(err, runtime.ErrLeaseLost) {
 				t.Fatalf("precommit crash=%v", err)
 			}
 			if _, err := payloads.GetResult(context.Background(), envelope.TenantID, envelope.RequestID); err != nil {

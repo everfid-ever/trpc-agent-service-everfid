@@ -1,5 +1,47 @@
 # 在途任务接管与幂等投递 — 设计文档
 
+## 000007：完成候选与治理结算恢复
+
+`execution_completion` 是内部不可变完成日志，不能由 Delivery 当成最终回复读取。原流程在结算之后、PutResult 之前崩溃会留下“预约已关闭、无冻结答案”；新 owner 再 Begin 会被拒绝。现在把已审核的输出和结算意图先持久化，再执行可幂等重放的治理写入。
+
+| 字段 | 类型与约束 | 设计作用 |
+|---|---|---|
+| `tenant_id` | text，非空；联合主键 | 隔离候选读取及解密密钥。 |
+| `request_id` | text，非空；联合主键；与 tenant 外键引用 execution_record | 一个原输入只有一份候选，故障不新建 request。 |
+| `envelope_digest` | text，64 位小写十六进制 | 固定 envelope，防止候选被接到其他版本、会话或路由。 |
+| `content_digest` | text，64 位小写十六进制 | 完整候选 JSON 的 SHA-256，不只是答案文本。 |
+| `ciphertext` | bytea，非空 | 加密的候选内容，不暴露待晋升输出。 |
+| `nonce` | bytea，恰好 12 字节 | AES-GCM 随机 nonce。 |
+| `key_version` | bigint，正数 | 原 payload 租户密钥版本，轮换后仍需可解密。 |
+| `fence` | bigint，正数 | 创建者执行资格；恢复可使用更高 Fence。 |
+| `created_at` | timestamptz，默认数据库 now() | 候选创建时间，不是回复送达时间。 |
+
+密文 AAD 使用 execution-completion-v1、tenant、request、envelope_digest、content_digest 和 key_version；替换作用域或正文摘要不能通过解密。解密后再次校验摘要、原 envelope、输入摘要和内容类型。候选 JSON 包括 SchemaVersion、Envelope、InputDigest、Permit、Prepared、Usage、Output；Prepared 包含 Settlement、Decision、OutputDigest。Usage 为按实际模型分组的数组，避免将结构体键 map 直接 JSON 序列化。
+
+| 操作与窗口 | durable truth | 接管动作 |
+|---|---|---|
+| 输出审核前或候选保存失败 | 原输入、计划、工具结果；预约未被本流程结算 | 按原执行/任务预算重试。 |
+| 候选保存成功、尚未结算 | 私有候选及原审核决定 | 跳过模型与 BeginAttempt，提交候选中的原结算。 |
+| Settle 成功、决策尚未记录 | 候选、已结算预约 | 相同 SettleRequest 幂等重放，再 RecordDecision。 |
+| 治理已提交、PutResult 前 | 候选、原治理决定 | 不重新 Begin、不重新审核或按当前报价重算。 |
+| PutResult 后、terminal 前 | 已批准公开结果 | 原 frozen 分支续提交、Seal、terminal/Outbox。 |
+
+PutCompletion 使用 execution_record 行锁与 BeginExecutionAttempt 串行，并读取已登记最大 Fence，防止被新尝试超越的旧执行者插入候选。插入还检查会话 next_input_seq 与 last_fence；主键冲突不覆盖正文，必须 envelope、内容摘要、密钥版本和解密正文一致才算幂等。Worker 在保存候选、结算和提交前继续检查租约与取消意图。Redis 与 PostgreSQL 不是一个事务，外部取消和已完成效果也不由这张表撤销。
+
+生产 governance.Service 实现 PreparedRunGuard：PrepareFinalization 仅审核和计算，CommitFinalization 执行幂等 Ledger.Settle 与决策记录。自定义旧 RunGuard 若不实现此接口，只能重放其 Finish/FinishModels；它必须自行提供幂等契约，不能据此获得生产服务相同的保证。候选 Store 缺失或已配置 Store 读取失败均不降级为盲目重算。拒绝的输出不会晋升为公开成功结果；TaskPlans 路径提交固定失败文本。
+
+### 工具适配器的可信完成契约
+
+| 适配器 | 允许的恢复 | 可信证据与边界 |
+|---|---|---|
+| local_note | idempotent_key | 本地业务唯一键 + status=created。 |
+| MCP 默认 | manual | CompletionCheck 可由审核代码指定；未配置的写工具不能绕过任务门禁。 |
+| MCP ReadOnly=true | replay_safe | 必须审核远端实际只读语义，不能信任模型或远端 annotation 自报。 |
+| MCP IdempotencyParameter | idempotent_key | 必须配置 CompletionCheck；远端参数必须存在且为 string，模型声明隐藏此参数、拒绝调用者覆盖，由可信执行身份派生固定键注入。供应商须真正按此键去重。 |
+| code_exec | manual | 实际执行成功返回 status=completed；非零退出、超时、执行错误、SDK 参数拒绝均不能生成成功回执。已保存成功结果可复用；执行中断不任意重放。 |
+
+MCP 新契约进入 BindingDigest，修改需发布新的审核绑定；所有新字段为空时保持原 digest。每次 MCP 连接重新验证远端声明摘要，isError 回执不能记成功。代码执行的完成契约也进入 digest（CompletionContract=1），旧发布绑定需要重算并发布，不应静默修改现有不可变版本。
+
 ## 000005：持久计划、步骤检查点与完成证据
 
 实现位于 `trpcservice/taskflow/`，PostgreSQL store 以 AES-GCM 保存整份有界计划；参数、分析笔记和完成条件均在密文中。AAD 绑定 tenant/request、原输入摘要、检查点版本和密钥版本。fence 位于行元数据中，接管可提高 fence 而不重写旧检查点密文。

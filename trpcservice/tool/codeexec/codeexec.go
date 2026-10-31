@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
 	servicetool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	"trpc.group/trpc-go/trpc-agent-go/codeexecutor"
 	"trpc.group/trpc-go/trpc-agent-go/codeexecutor/sandbox"
@@ -82,6 +84,7 @@ func BindingDigest(toolID string, version int64, config Config) (string, error) 
 		return "", runtime.ErrInvariantViolation
 	}
 	payload := struct {
+		CompletionContract                      int
 		ToolID, Isolation, Network, Environment string
 		Version                                 int64
 		TimeoutNanoseconds                      int64
@@ -91,7 +94,8 @@ func BindingDigest(toolID string, version int64, config Config) (string, error) 
 		CPUPercent, MemoryMB, MaxPIDs           int
 		Languages                               []string
 	}{
-		ToolID: toolID, Version: version, Isolation: "trpc-agent-go/sandbox:managed", Network: "restricted",
+		CompletionContract: 1,
+		ToolID:             toolID, Version: version, Isolation: "trpc-agent-go/sandbox:managed", Network: "restricted",
 		Environment: "inherit-none", TimeoutNanoseconds: config.Timeout.Nanoseconds(),
 		MaxBlocks: config.MaxBlocks, MaxCodeBytes: config.MaxCodeBytes, MaxOutputBytes: config.MaxOutputBytes,
 		MaxDiskBytes: config.MaxDiskBytes, CPUPercent: config.CPUPercent, MemoryMB: config.MemoryMB,
@@ -138,7 +142,7 @@ func NewSandboxRegistration(tenantID, toolID string, version int64, expectedDige
 	return servicetool.Registration{
 		TenantID: tenantID, ID: toolID, Version: version, ContentDigest: digest, Status: servicetool.StatusActive,
 		Build: func(context.Context, servicetool.BuildRequest) (agenttool.CallableTool, error) {
-			return upstreamcodeexec.NewTool(executor, upstreamcodeexec.WithName(toolID), upstreamcodeexec.WithLanguages(supportedLanguages...)), nil
+			return checkedTool{name: toolID, executor: executor}, nil
 		},
 	}, nil
 }
@@ -185,17 +189,20 @@ func (e *Executor) ExecuteCode(ctx context.Context, input codeexecutor.CodeExecu
 		return codeexecutor.CodeExecutionResult{}, fmt.Errorf("secure sandbox workspace: %w", err)
 	}
 
+	var failures []error
 	var output limitedOutput
 	output.limit = e.config.MaxOutputBytes
 	for index, block := range input.CodeBlocks {
 		filename, mode, command, arguments, buildErr := codeexecutor.BuildBlockSpec(index, block)
 		if buildErr != nil {
+			failures = append(failures, buildErr)
 			output.writeError(buildErr)
 			continue
 		}
 		if putErr := e.runtime.PutFiles(ctx, workspace, []codeexecutor.PutFile{{
 			Path: filepath.Join(codeexecutor.InlineSourceDir, filename), Content: []byte(block.Code), Mode: mode,
 		}}); putErr != nil {
+			failures = append(failures, putErr)
 			output.writeError(putErr)
 			continue
 		}
@@ -208,9 +215,62 @@ func (e *Executor) ExecuteCode(ctx context.Context, input codeexecutor.CodeExecu
 		output.write(result.Stderr)
 		if runErr != nil {
 			output.writeError(runErr)
+			failures = append(failures, runErr)
+		} else if result.TimedOut || result.ExitCode != 0 {
+			failures = append(failures, fmt.Errorf("code block %d failed: exit=%d timeout=%t", index, result.ExitCode, result.TimedOut))
 		}
 	}
-	return codeexecutor.CodeExecutionResult{Output: output.String()}, nil
+	return codeexecutor.CodeExecutionResult{Output: output.String()}, errors.Join(failures...)
+}
+
+// A fresh delegate per call detects SDK validation replies without interpreting
+// user stdout. Manual recovery is intentional: sandbox network restriction is
+// backend dependent and does not establish external side-effect idempotency.
+type checkedTool struct {
+	name     string
+	executor codeexecutor.CodeExecutor
+}
+type checkedExecutor struct {
+	codeexecutor.CodeExecutor
+	completed bool
+}
+
+func (e *checkedExecutor) ExecuteCode(ctx context.Context, in codeexecutor.CodeExecutionInput) (codeexecutor.CodeExecutionResult, error) {
+	r, err := e.CodeExecutor.ExecuteCode(ctx, in)
+	e.completed = err == nil
+	return r, err
+}
+func (t checkedTool) upstream(e codeexecutor.CodeExecutor) agenttool.CallableTool {
+	return upstreamcodeexec.NewTool(e, upstreamcodeexec.WithName(t.name), upstreamcodeexec.WithLanguages(supportedLanguages...))
+}
+func (t checkedTool) Declaration() *agenttool.Declaration {
+	d := t.upstream(t.executor).Declaration()
+	d.OutputSchema.Properties["status"] = &agenttool.Schema{Type: "string", Enum: []any{"completed"}}
+	d.OutputSchema.Required = append(d.OutputSchema.Required, "status")
+	return d
+}
+func (checkedTool) RecoveryPolicy() servicetool.RecoveryPolicy  { return servicetool.RecoveryManual }
+func (checkedTool) RecoveryKey(context.Context) (string, error) { return "", nil }
+func (checkedTool) TaskEvidenceCheck() *taskflow.ResultCheck {
+	return &taskflow.ResultCheck{Path: []string{"status"}, EqualsJSON: `"completed"`}
+}
+func (t checkedTool) Call(ctx context.Context, args []byte) (any, error) {
+	e := &checkedExecutor{CodeExecutor: t.executor}
+	r, err := t.upstream(e).Call(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	if !e.completed {
+		return nil, runtime.ErrInvariantViolation
+	}
+	result, ok := r.(codeexecutor.CodeExecutionResult)
+	if !ok {
+		return nil, runtime.ErrInvariantViolation
+	}
+	return struct {
+		Status string `json:"status"`
+		codeexecutor.CodeExecutionResult
+	}{Status: "completed", CodeExecutionResult: result}, nil
 }
 
 // prepareWorkspaceRoot makes the deployment-owned parent private before the

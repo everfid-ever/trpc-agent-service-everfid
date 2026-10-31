@@ -4,6 +4,8 @@
 
 ## 当前实现状态
 
+`000007_execution_completion` 补齐治理结算与结果提交之间的恢复窗口：先保存加密的完成候选及已审核决定，再幂等结算、晋升公开结果并提交终态。接管优先复用候选，不重新申请已关闭预约。会话读取视图按原 request/Fence 过滤重试残留；MCP 与代码执行适配器补充明确的恢复/完成证据契约。字段与边界见[完成候选设计](inflight-task-takeover/design.md#000007完成候选与治理结算恢复)。部署迁移需执行至 000007。
+
 步骤级恢复由 `000005_task_checkpoints` 与 `000006_task_failure_convergence` 提供。当前本地 WebUI/WeCom 共享组合根启用加密计划、版本化检查点、强制非空计划准入、工具操作与证据绑定、持久化有界重试，以及成功/失败终态的可靠投递。详见[步骤数据模型](inflight-task-takeover/design.md)与[运行顺序](inflight-task-takeover/implementation-walkthrough.md)。自定义 RunnerExecutor/Factory 调用者需要同时装配对应 Store 和工具开关，不能仅执行迁移就声称所有运行入口启用。启用 TaskPlans 的普通纯文本请求也须创建计划，不能以空计划绕过完成门禁。
 
 ### 按问题定位详细说明

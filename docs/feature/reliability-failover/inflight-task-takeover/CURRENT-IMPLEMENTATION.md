@@ -2,6 +2,10 @@
 
 本文是阅读摘要，详细机制、字段、代码及验收分别在同目录L1–L4文档中展开，所有正文使用同一当前实现口径。
 
+`000007_execution_completion` 将输出审核与治理写入分开：完整 envelope、输入摘要、原预约、分模型用量、确定的结算参数、输出审核决定与最终渲染内容先加密保存。候选不可改写且不是可投递结果；接管者跳过新的模型运行，重放原结算决定，再保存 result_payload 和 terminal/Outbox。即使预约已 settled，也不重新 Begin 而误判为 reservation_closed。读取顺序是已冻结结果 → 完成候选 → 新模型运行。SQL 候选写入还与 execution_attempt 的执行记录锁串行，拒绝已被新 Fence 超越的写入。
+
+MCP 恢复默认 manual；经代码审核的 ReadOnly 才允许重放，经审核的 IdempotencyParameter 配合 CompletionCheck 才开启同业务键重试。参数由可信 tenant/request/工具/稳定调用/参数摘要派生并注入，模型不能覆盖。每次连接重新核对声明摘要，MCP isError 不成为成功证据。代码执行提供 status=completed 可信断言，非零退出、超时及 SDK 参数校验不算完成；执行中断仍采用 manual，因为不能从所有沙箱后端推断外部写操作幂等。
+
 当前新增 `000005_task_checkpoints`：原输入摘要绑定加密计划、只追加步骤修订、依赖闸门、工具操作/参数固定、结果证据核对与封存提交。步骤计划在本地 WebUI/WeCom 组合根启用；原始目标仍取自持久输入，不让模型改写 tenant/request。大结果按原引用分块读取。原 `000004` 的计数、工具结果和恢复机制继续复用。
 
 当前合同由 `000006_task_failure_convergence` 进一步收敛：空计划不能成功，工具检查必需，副作用工具需实现可信输出契约；任务预算默认最多 8 次运行机会、连续 3 次无进展、首次运行后 1800 秒，换节点不重置。失败计划、原因和固定失败结果可跨节点续提交原 failed terminal 与 reply/audit Outbox。部署须具备 000006 新列与约束，明细接口增加 task_failures 原因码。

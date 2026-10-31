@@ -18,6 +18,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/secrets"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
 	servicetool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	agenttool "trpc.group/trpc-go/trpc-agent-go/tool"
 	upstreammcp "trpc.group/trpc-go/trpc-agent-go/tool/mcp"
@@ -44,6 +45,12 @@ type Config struct {
 	Timeout                   time.Duration
 	SecretHeader              string
 	SecretPrefix              string
+
+	// These contracts require review of the provider's actual semantics. MCP
+	// annotations and model arguments never grant replay permission.
+	ReadOnly             bool
+	IdempotencyParameter string
+	CompletionCheck      *taskflow.ResultCheck
 
 	// clientOptions is only an in-package test seam. Production registrations
 	// use the fixed options assembled by newToolSet.
@@ -80,6 +87,10 @@ func NewRegistration(tenantID, localID string, version int64, config Config, sec
 }
 
 func (c Config) validate(localID string, secretRef secrets.SecretRef) error {
+	if !c.CompletionCheck.Valid() || (c.ReadOnly && c.IdempotencyParameter != "") ||
+		(c.IdempotencyParameter != "" && (!validToolID(c.IdempotencyParameter) || c.CompletionCheck == nil)) {
+		return runtime.ErrInvariantViolation
+	}
 	if c.Transport != "streamable" && c.Transport != "streamable_http" && c.Transport != "sse" {
 		return runtime.ErrCapabilityUnsupported
 	}
@@ -129,6 +140,19 @@ func BindingDigest(config Config, secretRef secrets.SecretRef) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Preserve bindings with no newly granted contract. Any explicit contract
+	// changes the pinned digest and requires publishing a reviewed revision.
+	if config.ReadOnly || config.IdempotencyParameter != "" || config.CompletionCheck != nil {
+		contract, err := json.Marshal(struct {
+			ReadOnly             bool
+			IdempotencyParameter string
+			CompletionCheck      *taskflow.ResultCheck
+		}{config.ReadOnly, config.IdempotencyParameter, config.CompletionCheck})
+		if err != nil {
+			return "", err
+		}
+		encoded = append(append(encoded, '\n'), contract...)
+	}
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:]), nil
 }
@@ -150,6 +174,7 @@ func DeclarationDigest(value *agenttool.Declaration) (string, error) {
 
 func (c Config) clone() Config {
 	c.clientOptions = append([]tmcp.ClientOption(nil), c.clientOptions...)
+	c.CompletionCheck = cloneCheck(c.CompletionCheck)
 	return c
 }
 
@@ -182,6 +207,24 @@ func (c callable) Call(ctx context.Context, arguments []byte) (any, error) {
 	if ctx == nil {
 		return nil, runtime.ErrTenantScope
 	}
+	if c.config.IdempotencyParameter != "" {
+		key, err := c.RecoveryKey(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var args map[string]json.RawMessage
+		if err = json.Unmarshal(arguments, &args); err != nil || args == nil {
+			return nil, runtime.ErrInvariantViolation
+		}
+		if _, supplied := args[c.config.IdempotencyParameter]; supplied {
+			return nil, runtime.ErrInvariantViolation
+		}
+		args[c.config.IdempotencyParameter], _ = json.Marshal(key)
+		arguments, err = json.Marshal(args)
+		if err != nil {
+			return nil, err
+		}
+	}
 	// Each call opens a fresh connection (initialize + tools/list + tools/call).
 	// This is deliberately the simplest correct shape for the first version: it
 	// keeps the adapter stateless and avoids sharing a ToolSet across concurrent
@@ -196,6 +239,11 @@ func (c callable) Call(ctx context.Context, arguments []byte) (any, error) {
 	result, err := remote.Call(ctx, arguments)
 	if err != nil {
 		return nil, err
+	}
+	// Upstream MCP error results are structured replies with a nil Go error.
+	// Never persist them as successful tool evidence.
+	if failure, ok := result.(interface{ RetryResultError() bool }); ok && failure.RetryResultError() {
+		return nil, fmt.Errorf("MCP operation failed: %w", runtime.ErrCapabilityUnsupported)
 	}
 	encoded, err := json.Marshal(result)
 	if err != nil || len(encoded) > maxResultBytes {
@@ -218,7 +266,21 @@ func (c callable) discover(ctx context.Context) (*agenttool.Declaration, error) 
 	if err != nil || digest != c.config.ExpectedDeclarationDigest {
 		return nil, runtime.ErrVersionMismatch
 	}
-	copy := *declaration
+	encoded, _ := json.Marshal(declaration)
+	var copy agenttool.Declaration
+	if err := json.Unmarshal(encoded, &copy); err != nil {
+		return nil, err
+	}
+	if p := c.config.IdempotencyParameter; p != "" {
+		delete(copy.InputSchema.Properties, p)
+		required := copy.InputSchema.Required[:0]
+		for _, name := range copy.InputSchema.Required {
+			if name != p {
+				required = append(required, name)
+			}
+		}
+		copy.InputSchema.Required = required
+	}
 	return &copy, nil
 }
 
@@ -244,7 +306,49 @@ func (c callable) openExact(ctx context.Context) (upstreamToolSet, agenttool.Cal
 		_ = set.Close()
 		return nil, nil, runtime.ErrCapabilityUnsupported
 	}
+	d := remote.Declaration()
+	digest, err := DeclarationDigest(d)
+	if err != nil || digest != c.config.ExpectedDeclarationDigest {
+		_ = set.Close()
+		return nil, nil, runtime.ErrVersionMismatch
+	}
+	if p := c.config.IdempotencyParameter; p != "" && (d.InputSchema == nil || d.InputSchema.Properties[p] == nil || d.InputSchema.Properties[p].Type != "string") {
+		_ = set.Close()
+		return nil, nil, runtime.ErrVersionMismatch
+	}
 	return set, remote, nil
+}
+
+func cloneCheck(c *taskflow.ResultCheck) *taskflow.ResultCheck {
+	if c == nil {
+		return nil
+	}
+	v := *c
+	v.Path = append([]string(nil), c.Path...)
+	return &v
+}
+func (c callable) TaskEvidenceCheck() *taskflow.ResultCheck {
+	return cloneCheck(c.config.CompletionCheck)
+}
+func (c callable) RecoveryPolicy() servicetool.RecoveryPolicy {
+	if c.config.ReadOnly {
+		return servicetool.RecoveryReplaySafe
+	}
+	if c.config.IdempotencyParameter != "" {
+		return servicetool.RecoveryIdempotentKey
+	}
+	return servicetool.RecoveryManual
+}
+func (c callable) RecoveryKey(ctx context.Context) (string, error) {
+	if c.config.IdempotencyParameter == "" {
+		return "", nil
+	}
+	e, ok := servicetool.RecoveryContext(ctx)
+	if !ok || e.TenantID != c.request.TenantID || e.RequestID == "" || e.ToolCallID == "" || e.ArgsDigest == "" {
+		return "", runtime.ErrTenantScope
+	}
+	sum := sha256.Sum256([]byte(e.TenantID + "\x00" + e.RequestID + "\x00" + c.localID + "\x00" + e.ToolCallID + "\x00" + e.ArgsDigest))
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func (c callable) clientOptions() []tmcp.ClientOption {

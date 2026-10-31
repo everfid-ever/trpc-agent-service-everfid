@@ -70,6 +70,7 @@ type RunnerExecutor struct {
 	// selects the framework-owned session backend for every turn.
 	SDKSessions       agentsession.Service
 	Payloads          messaging.PayloadStore
+	Completions       messaging.CompletionStore
 	TaskPlans         taskflow.Store
 	ToolExecutions    toolexecution.Store
 	Artifacts         artifact.Store
@@ -241,6 +242,12 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 		}
 	}
 
+	preserveCallID := ""
+	if continuation != nil {
+		preserveCallID = continuation.ToolCallID
+	}
+	turn.ConfigureHistory(envelope.RequestID, fence, preserveCallID)
+
 	payload, err := w.executionPayload(ctx, envelope)
 	if err != nil {
 		return fmt.Errorf("load execution payload: %w", err)
@@ -282,6 +289,19 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 				return runtime.ErrVersionMismatch
 			}
 			err = w.commitFrozenSuccess(ctx, turn, envelope, head, fence, beforeCommit, frozen.ResultRef)
+			if err == nil {
+				committed = true
+			}
+			return err
+		}
+		if !errors.Is(readErr, runtime.ErrNotFound) {
+			return readErr
+		}
+	}
+	if store := w.completionStore(); store != nil {
+		record, readErr := store.GetCompletion(ctx, envelope.TenantID, envelope.RequestID)
+		if readErr == nil {
+			err = w.resumeCompletion(ctx, turn, envelope, head, fence, beforeCommit, payload, record)
 			if err == nil {
 				committed = true
 			}
@@ -724,20 +744,6 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 			return err
 		}
 	}
-	if w.Governance != nil {
-		decision, finishErr := finishGovernanceRun(ctx, w.Governance, permit, runResult, []byte(content))
-		if finishErr != nil {
-			decision = governance.Decision{DecisionID: governance.StableDecisionID(envelope.TenantID, envelope.RequestID, "settlement", envelope.PolicyVersion), TenantID: envelope.TenantID,
-				RequestID: envelope.RequestID, Stage: "settlement", Action: governance.ActionDeny, ReasonCode: governance.ReasonUsageUnavailable, PolicyVersion: envelope.PolicyVersion, ReservationID: permit.Reservation.ReservationID}
-			if recordErr := w.Governance.Record(ctx, decision); recordErr != nil {
-				return recordErr
-			}
-			return w.commitGovernanceTerminal(ctx, turn, envelope, head, fence, beforeCommit, runtime.OutcomeFailed, decision)
-		}
-		if decision.Action != governance.ActionAllow {
-			return w.commitGovernanceTerminal(ctx, turn, envelope, head, fence, beforeCommit, runtime.OutcomeDenied, decision)
-		}
-	}
 	latest, err := w.Tasks.GetExecution(ctx, gateway.ExecutionKey{TenantID: envelope.TenantID, RequestID: envelope.RequestID})
 	if err != nil {
 		return err
@@ -752,29 +758,11 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	if err != nil {
 		return fmt.Errorf("render outbound result: %w", err)
 	}
-	if w.Barrier != nil {
-		if err := w.Barrier.Wait(ctx, inflight.PointP2BeforeTerminalCommit); err != nil {
-			return err
-		}
-	}
-	resultRef, err := encodeResultRef(ctx, w.EncodeResult, envelope, string(outbound.Content))
+	record, err := w.saveCompletion(ctx, envelope, fence, beforeCommit, payload, permit, runResult, outbound)
 	if err != nil {
 		return err
 	}
-	resultStore, ok := w.Payloads.(messaging.ResultStore)
-	if !ok {
-		return runtime.ErrCapabilityUnsupported
-	}
-	resultDigest := sha256.Sum256(outbound.Content)
-	if err := resultStore.PutResult(ctx, messaging.ResultRecord{TenantID: envelope.TenantID, RequestID: envelope.RequestID, ResultRef: resultRef, ContentDigest: hex.EncodeToString(resultDigest[:]), Content: outbound.Content, ContentType: outbound.ContentType, KeyVersion: payload.KeyVersion}); err != nil {
-		return err
-	}
-	if w.Barrier != nil {
-		if err := w.Barrier.Wait(ctx, inflight.PointResultPersistedBeforeCommit); err != nil {
-			return err
-		}
-	}
-	err = w.commitFrozenSuccess(ctx, turn, envelope, head, fence, beforeCommit, resultRef)
+	err = w.resumeCompletion(ctx, turn, envelope, head, fence, beforeCommit, payload, record)
 	if err == nil {
 		committed = true
 	}
@@ -978,13 +966,9 @@ type runnerResult struct {
 	GraphInterrupt    *graphContinuationCoordinate
 }
 
-func finishGovernanceRun(ctx context.Context, guard governance.RunGuard, permit governance.RunPermit, result runnerResult, output []byte) (governance.Decision, error) {
+func runnerModelUsages(primary governance.VersionedRef, result runnerResult) []governance.ModelUsage {
 	if len(result.ModelUsage) == 0 {
-		return guard.Finish(ctx, permit, result.Usage, output)
-	}
-	multi, ok := guard.(governance.MultiModelRunGuard)
-	if !ok {
-		return governance.Decision{}, runtime.ErrCapabilityUnsupported
+		return []governance.ModelUsage{{Model: primary, Usage: result.Usage}}
 	}
 	refs := make([]governance.VersionedRef, 0, len(result.ModelUsage))
 	for ref := range result.ModelUsage {
@@ -1001,9 +985,9 @@ func finishGovernanceRun(ctx context.Context, guard governance.RunGuard, permit 
 		usages = append(usages, governance.ModelUsage{Model: ref, Usage: result.ModelUsage[ref]})
 	}
 	if result.UnattributedUsage.InputTokens != 0 || result.UnattributedUsage.OutputTokens != 0 || result.UnattributedUsage.CachedInputTokens != 0 {
-		usages = append(usages, governance.ModelUsage{Model: permit.Model, Usage: result.UnattributedUsage})
+		usages = append(usages, governance.ModelUsage{Model: primary, Usage: result.UnattributedUsage})
 	}
-	return multi.FinishModels(ctx, permit, usages, output)
+	return usages
 }
 
 type graphContinuationCoordinate struct {

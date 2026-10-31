@@ -17,8 +17,8 @@ type OutboundContent struct {
 	ContentType string
 }
 
-// OutboundRenderer converts an already-governed model result to the exact
-// reply representation that is persisted and delivered. Implementations are
+// OutboundRenderer converts a model result to the exact reply representation
+// which is reviewed, persisted and delivered. Implementations are
 // application code and may, for example, construct a platform card or select
 // an already-scanned image artifact. They must be deterministic for the same
 // execution envelope so worker retries retain their idempotent result.

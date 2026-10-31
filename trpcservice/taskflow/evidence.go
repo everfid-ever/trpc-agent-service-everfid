@@ -17,6 +17,9 @@ type ResultCheck struct {
 	NonEmpty   bool     `json:"non_empty,omitempty"`
 }
 
+// Valid lets reviewed adapters reject malformed evidence contracts at registration.
+func (c *ResultCheck) Valid() bool { return c.valid() }
+
 func (c *ResultCheck) valid() bool {
 	if c == nil {
 		return true

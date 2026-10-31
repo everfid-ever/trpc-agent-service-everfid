@@ -1,8 +1,27 @@
 # 在途任务接管与幂等投递 — 参考实现
 
-## 步骤检查点与失败收敛增量契约（000005–000006）
+## 步骤检查点、失败收敛与完成候选增量契约（000005–000007）
 
-在本文原有 000001–000004 基础上依次应用 `000005_task_checkpoints`、`000006_task_failure_convergence`。新表、合同、计数和数据库写入保护见 [design.md](design.md)；实现入口为 `trpcservice/taskflow/taskflow.go`、`policy.go`、`tool.go`、`evidence.go`、`postgres/store.go` 与 `trpcservice/worker/task_failure.go`。
+在本文原有 000001–000004 基础上依次应用 `000005_task_checkpoints`、`000006_task_failure_convergence`、`000007_execution_completion`。新表、合同、计数和数据库写入保护见 [design.md](design.md)；实现入口还包括 `trpcservice/worker/completion.go`、`storage/messaging/postgres/completion.go` 与 `governance/service.go`。
+
+000007 的完整新增 DDL 如下，字段表及加密/资格条件见 design。候选上限为加密前 2 MiB；同 tenant/request 不可变。GetCompletion 必须按 tenant/request 取密文、按原 key_version 解析租户密钥、AAD 验证解密、核对正文 SHA-256；认证失败不返回可继续生成的新任务。PutCompletion 必须在 execution_record 行锁内比较 execution_attempt 的已登记最大 Fence，然后按原输入顺序插入或核对完全相同候选。
+
+```sql
+CREATE TABLE public.execution_completion (
+ tenant_id text NOT NULL, request_id text NOT NULL,
+ envelope_digest text NOT NULL CHECK(envelope_digest ~ '^[0-9a-f]{64}$'),
+ content_digest text NOT NULL CHECK(content_digest ~ '^[0-9a-f]{64}$'),
+ ciphertext bytea NOT NULL, nonce bytea NOT NULL CHECK(octet_length(nonce)=12),
+ key_version bigint NOT NULL CHECK(key_version>0), fence bigint NOT NULL CHECK(fence>0),
+ created_at timestamptz NOT NULL DEFAULT now(),
+ PRIMARY KEY(tenant_id,request_id),
+ FOREIGN KEY(tenant_id,request_id) REFERENCES public.execution_record(tenant_id,request_id)
+);
+```
+
+PreparedRunGuard 的函数顺序为 PrepareFinalization（只读审核/计算）→ 持久化候选 → CommitFinalization（幂等 Settle + RecordDecision）→ 公开 PutResult → terminal/Outbox。恢复先查公开结果，再查私有候选；候选必须核对 schema、输入摘要、完整 envelope、密钥版本、创建 Fence 不高于当前 Fence、原预约、输出摘要与审核决定的 tenant/request/policy。不得重新申请预约或重新价格计算。拒绝输出不能创建可投递的成功结果。自定义非 PreparedRunGuard 的实现须另行保证 Finish 的幂等性。
+
+MCP Config 新增 ReadOnly、IdempotencyParameter、CompletionCheck（Path/EqualsJSON/NonEmpty）三个代码审核配置：只读与幂等键互斥；幂等键要求合法远端 string 参数及非空有效 CompletionCheck。契约进入绑定摘要，声明验证在每次连接执行；提供商键由可信身份派生，模型输入不得携带保留参数。CompletionCheck 针对实际序列化结果，当前上游 MCP 常以 content 数组序列化，不能假定存在 status 对象字段或自动解析 text 内 JSON。未实现提供商查询协议时不得配置成 queryable。code_exec 使用 manual 恢复，只有真实成功执行可产生 status=completed；CompletionContract=1 进入其绑定摘要。
 
 | 接口 | 必须实现的语义 |
 |---|---|
@@ -20,7 +39,7 @@
 
 ## 复刻前提、迁移与实现范围
 
-本文给出本能力的实际表结构、SQL/Go 算法和配置契约。字段表优先见 design；本篇保留逐字 DDL。SQL 按依赖创建，以下是可靠性子系统摘录，不能作为一段无依赖 SQL 直接执行：tenant、agent_app、版本化配置/策略、授权等被引用的控制面表必须先存在。仓库部署使用完整迁移 000001，再依次执行到 000006；不要把本文摘录再次应用到已迁移库。
+本文给出本能力的实际表结构、SQL/Go 算法和配置契约。字段表优先见 design；本篇保留逐字 DDL。SQL 按依赖创建，以下是可靠性子系统摘录，不能作为一段无依赖 SQL 直接执行：tenant、agent_app、版本化配置/策略、授权等被引用的控制面表必须先存在。仓库部署使用完整迁移 000001，再依次执行到 000007；不要把本文摘录再次应用到已迁移库。
 
 完整服务还需要渠道协议验签、SDK PostgreSQL backend、租户密钥解析器、Redis broker、版本化配置加载和真实模型/provider 适配。SDK 表由迁移创建，SDK WithSkipDBInit(true)、WithEnableAsyncPersist(false)，禁止启动时另造 schema。本文是当前能力的复刻契约；不会把省略的基础设施宣称为“复制一段示例即可启动全部系统”。
 
