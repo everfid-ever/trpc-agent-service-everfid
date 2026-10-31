@@ -14,6 +14,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/profile"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	servicetool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	toolexecution "github.com/liuzengh/trpc-agent-service/trpcservice/tool/execution"
@@ -91,6 +92,7 @@ type Factory struct {
 	Confirmations  governance.ConfirmationCoordinator
 	ToolResults    messaging.ToolResultStore
 	ToolExecutions toolexecution.Store
+	TaskPlans      bool
 	Telemetry      telemetry.Provider
 }
 
@@ -304,6 +306,9 @@ func (f Factory) buildLLM(ctx context.Context, plan RuntimePlan, name string, in
 			return nil, false, err
 		}
 	}
+	if f.TaskPlans {
+		tools = append(append([]tool.Tool(nil), tools...), taskflow.Tool{})
+	}
 	if len(tools) != 0 {
 		options = append(options, llmagent.WithTools(tools))
 	}
@@ -312,7 +317,7 @@ func (f Factory) buildLLM(ctx context.Context, plan RuntimePlan, name string, in
 		// into the model request. WithTools retains the same callables in the
 		// execution surface; WithToolFilter hides their initial declarations and
 		// cannot weaken their policy/budget/telemetry wrappers.
-		options = append(options, llmagent.WithToolFilter(func(context.Context, tool.Tool) bool { return false }))
+		options = append(options, llmagent.WithToolFilter(func(_ context.Context, value tool.Tool) bool { _, ok := value.(taskflow.Tool); return ok }))
 	}
 	if len(snapshot.SkillRefs) != 0 {
 		if f.Skills == nil {
@@ -365,7 +370,7 @@ func revisionSkillFilter(refs []profile.SkillRef) skill.VisibilityFilter {
 
 func rejectReservedToolRefs(refs []profile.VersionedRef) error {
 	for _, ref := range refs {
-		if ref.ID == knowledgeToolRef.ID || ref.ID == agentapp.PluginToolSearch || ref.ID == agentapp.PluginAwaitUserReply || ref.ID == "call_tool" {
+		if ref.ID == knowledgeToolRef.ID || ref.ID == agentapp.PluginToolSearch || ref.ID == agentapp.PluginAwaitUserReply || ref.ID == "call_tool" || ref.ID == taskflow.ToolName {
 			return runtime.ErrCapabilityUnsupported
 		}
 		for _, reserved := range memoryToolRefs {

@@ -1,5 +1,13 @@
 # 在途任务接管与幂等投递 — 测试与验收
 
+## 步骤检查点的代码回归范围
+
+新增 `trpcservice/taskflow/taskflow_test.go` 检查依赖闸门、伪造成功/回执拒绝、操作参数固定、旧 fence 拒写、工具结果已保存但 checkpoint 未提交后的修复、确定性输出断言及 UTF-8 大结果分页。`postgres/store_test.go` 检查加密租户绑定、原计划保留、版本/fence CAS 和历史写失败回滚。
+
+`trpcservice/tool/durable_test.go` 检查无计划不能调用业务工具、实际成功结果才能完成步骤。`trpcservice/worker/taskflow_test.go` 经真实 SDK 的 task_checkpoint 工具构造未完成计划，确认不能提前冻结结果或结算治理预约；随后换 fence 完成步骤，在 result-before-commit 窗口中断，再换 fence 复用冻结结果提交，模型调用不增加。`runner_test.go` 检查工具结果事件会移除已完成调用，未决确认仍保留。
+
+上述为代码层回归；SQL mock 不等于真实 PostgreSQL 故障演练。数据库触发器、真实渠道与外部工具效果的部署验收仍按独立环境证据判定。测试不声称机器已证明分析笔记或任意业务标准语义正确。
+
 ## 每个窗口必须保存的前后状态
 
 | 窗口 | 故障前的必要证据 | 接管后的必要证据 | 常见伪通过 |

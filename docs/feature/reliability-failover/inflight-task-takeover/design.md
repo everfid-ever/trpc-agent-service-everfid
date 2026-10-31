@@ -1,5 +1,56 @@
 # 在途任务接管与幂等投递 — 设计文档
 
+## 000005：持久计划、步骤检查点与完成证据
+
+实现位于 `trpcservice/taskflow/`，PostgreSQL store 以 AES-GCM 保存整份有界计划；参数、分析笔记和完成条件均在密文中。AAD 绑定 tenant/request、原输入摘要、检查点版本和密钥版本。fence 位于行元数据中，接管可提高 fence 而不重写旧检查点密文。
+
+### task_plan：当前权威计划
+
+| 字段 | 类型与约束 | 用途 |
+|---|---|---|
+| tenant_id / request_id | text，联合主键，外键到原 execution_record | 原输入身份；不能转给另一租户或新请求。 |
+| fence | bigint > 0 | 当前会话执行者资格，Open 只允许同等或更高值。 |
+| version | bigint > 0 | 每次计划修改递增，Save 使用 expected version CAS。 |
+| input_digest | text，64 字符 | 固定本轮真实输入内容摘要；目标原文仍由原 payload 保存。 |
+| key_version | bigint > 0 | 租户 payload 密钥版本。 |
+| phase | open / sealed | open 可变；sealed 不再追加、启动或修改步骤。 |
+| final_ref | 可空 text | sealed 时必须绑定最终 result_ref。 |
+| ciphertext / nonce | bytea，nonce 为 12 字节 | 计划的加密 JSON 与 GCM nonce。 |
+| created_at / updated_at | timestamptz，默认数据库 now() | 创建与最后更新时刻。 |
+
+### task_checkpoint：不可变的修改快照
+
+| 字段 | 类型与约束 | 用途 |
+|---|---|---|
+| tenant_id / request_id / version | 联合主键，version > 1；引用 task_plan | 一次成功修改一份快照。 |
+| fence / input_digest / key_version | bigint / text / bigint | 保存当次修改资格与内容作用域。 |
+| phase / final_ref | text / 可空 text | 当次计划阶段与冻结结果关联。 |
+| ciphertext / nonce | bytea，nonce 为 12 字节 | 与当前计划同事务保存的加密快照。 |
+| created_at | timestamptz，默认数据库 now() | 修改时间。 |
+
+创建时 version=1 保存在 task_plan；历史从首次修改 version=2 开始。接管只更新 fence，不是业务计划修订；业务修改才增加 version。没有定时清理或历史恢复写接口，不应人工把旧快照覆盖当前状态。
+
+### 密文中每个步骤保存什么
+
+| 字段 | 谁写入、如何校验 |
+|---|---|
+| id/title/criterion/kind | 模型定义稳定步骤 ID、描述、完成条件与 analysis/tool 类型；服务校验长度、唯一性和类型。 |
+| depends_on | 仅引用已存在或本次之前声明的步骤，禁止环；依赖未成功不能 Start。 |
+| tool_id/tool_version | tool 步骤固定精确工具；实际声明向模型提供 pinned version。 |
+| check | 可选确定性结果断言：对象字段 path，加 equals_json 或 non_empty 二选一。 |
+| state | 服务维护 pending/running/succeeded/effect_unknown/failed；调用方不能直接提交成功。 |
+| tool_call_id/args_digest/arguments | GuardedCallable 在外部调用前固定操作 ID、规范参数摘要与原参数；后续不可换参数冒充续办。 |
+| result_ref/evidence_digest | 从成功工具账本与解密校验后的结果填写，不接受模型自报回执。 |
+| note | analysis 步骤保存实际分析，摘要检查完整性；不是外部效果证明。 |
+
+一期步骤串行接纳，同一时间最多一个 running/effect_unknown 步骤，复用已有会话 lease；工具仍拥有独立工具 lease。计划修订采用追加，不能删掉未完成义务或改写已完成证据。最多 32 步，控制工具参数 64 KiB、单工具规范参数 32 KiB、单条分析 4096 字节、计划加密前 JSON 256 KiB。超限在副作用前拒绝；这不是无限长任务存储。
+
+### 成功门禁与不能推导的结论
+
+Runner 在治理结算与 PutResult 前 ValidateCompletion，避免未完成任务关闭预算预约并冻结假成功。校验所有声明步骤、依赖、分析摘要及工具结果；Seal 再绑定最终引用。`check_task_plan_terminal` 触发器在插入 succeeded session_commit 时锁定计划，检查 sealed、result_ref 和 fence 一致，防止应用遗漏门禁。
+
+分析笔记和可选结果断言不等于通用业务语义证明：未声明的子目标不会自动被发现；无 check 的工具步骤只证明取得真实成功回执。有外部业务完成标准时应声明输出断言，必要时增加真实读回校验步骤。manual/queryable 等原工具策略继续决定未知效果能否自动推进，计划不能授权盲重放。
+
 ## 不变量、写入点与违反后的后果
 
 | 不变量 | 写入/校验点 | 若被破坏 |

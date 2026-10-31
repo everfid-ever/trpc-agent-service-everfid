@@ -6,6 +6,8 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	governancememory "github.com/liuzengh/trpc-agent-service/trpcservice/governance/inmemory"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
+	taskmemory "github.com/liuzengh/trpc-agent-service/trpcservice/taskflow/inmemory"
 	toolexecution "github.com/liuzengh/trpc-agent-service/trpcservice/tool/execution"
 	"sync"
 	"testing"
@@ -68,7 +70,7 @@ func (s *durableMemory) Complete(_ context.Context, in toolexecution.Record, dat
 		return in, runtime.ErrLeaseLost
 	}
 	in.State = toolexecution.Succeeded
-	in.ResultRef = "result"
+	in.ResultRef = "tool-result://sha256/" + taskflow.Digest(data)
 	s.records[in.Key] = in
 	s.outputs[in.Key] = append([]byte(nil), data...)
 	return in, nil
@@ -131,6 +133,39 @@ func TestDurableAllowReusesResultAcrossRegeneratedCallIDs(t *testing.T) {
 	}
 	if inner.calls != 1 || len(store.records) != 1 {
 		t.Fatalf("calls=%d records=%d", inner.calls, len(store.records))
+	}
+}
+
+func TestDurableToolRequiresPlanAndSavesVerifiedStepEvidence(t *testing.T) {
+	store := newDurableMemory()
+	inner := &recoveringTool{policy: RecoveryIdempotentKey}
+	guard, ctx := durableGuard(t, inner, store)
+	plans := taskmemory.New()
+	scope := taskflow.Scope{Key: taskflow.Key{TenantID: "tenant", RequestID: "request"}, Fence: 1}
+	if _, err := plans.Open(ctx, scope, taskflow.Digest([]byte("goal")), 1); err != nil {
+		t.Fatal(err)
+	}
+	task := &taskflow.Session{Store: plans, Tools: store, Results: store, Scope: scope}
+	ctx = taskflow.WithSession(ctx, task)
+	if _, err := guard.Call(ctx, []byte(`{"a":1}`)); !errors.Is(err, taskflow.ErrIncomplete) || inner.calls != 0 {
+		t.Fatalf("unplanned call: %v effects=%d", err, inner.calls)
+	}
+	p, err := task.Define(ctx, 1, []taskflow.Step{{ID: "effect", Title: "create note", Criterion: "saved receipt", Kind: "tool", ToolID: "safe", ToolVersion: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = task.Start(ctx, p.Version, "effect"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = guard.Call(ctx, []byte(`{"a":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	p, err = task.ValidateCompletion(ctx)
+	if err != nil || p.Steps[0].ResultRef == "" || len(p.Steps[0].Arguments) == 0 || inner.calls != 1 {
+		t.Fatalf("checkpoint: %+v %v", p, err)
+	}
+	if _, err = guard.Call(ctx, []byte(`{"a":1}`)); !errors.Is(err, taskflow.ErrIncomplete) || inner.calls != 1 {
+		t.Fatalf("finished step reentered: %v effects=%d", err, inner.calls)
 	}
 }
 func TestDurableAllowManualTakeoverStopsAndQueryableRecovers(t *testing.T) {

@@ -1,5 +1,21 @@
 # 在途任务接管与幂等投递 — 参考实现
 
+## 步骤检查点增量契约（000005）
+
+在本文原有 000001–000004 基础上应用 `migrations/000005_task_checkpoints.up.sql`。新表的直观字段和事务说明见 [design.md](design.md)；实现入口为 `trpcservice/taskflow/taskflow.go`、`tool.go`、`evidence.go` 与 `postgres/store.go`。
+
+| 接口 | 必须实现的语义 |
+|---|---|
+| Store.Open(scope,digest,keyVersion) | 原 execution 必须对应当前会话输入闸门；固定原输入摘要/密钥版本，只允许同等或更高 fence 接管，不能重置原步骤和封存结果。 |
+| Store.Get(key) | 明确 tenant/request；解密时绑定该作用域与版本；密文和行 phase/ref/version 必须一致。 |
+| Store.Save(scope,expected,plan) | 仅当前 fence、当前版本、open 状态可写；版本递增，当前计划与加密历史快照同事务。 |
+| Session.Define/Start/CompleteAnalysis | 计划只追加，步骤依赖先成功，同一时间一个活动步骤；分析完成必须保存非空笔记，不可冒充工具证据。 |
+| Session.BeforeTool/Recover | 调用前绑定稳定工具操作、规范参数；恢复时从原工具账本和密文结果核实，不能凭模型文字修改成功。 |
+| Session.ValidateCompletion/Seal | 全部声明步骤通过证据校验后，绑定唯一最终引用并封存；数据库触发器在成功 terminal 再检查 phase/ref/fence。 |
+| task_checkpoint 控制工具 | inspect/define/start/complete_analysis/read_result；使用可信运行上下文而非模型提交的 tenant/request；每次调用纳入工具预算。 |
+
+步骤复用当前会话租约与工具操作账本，不新增另一套相互冲突的步骤租约。原 P4 渠道协议边界保持不变。计划封存与外部发送不在同一事务；封存后仍依赖原 result/terminal/Outbox/Ledger 链路。
+
 ## 复刻前提、迁移与实现范围
 
 本文给出本能力的实际表结构、SQL/Go 算法和配置契约。字段表优先见 design；本篇保留逐字 DDL。SQL 按依赖创建，以下是可靠性子系统摘录，不能作为一段无依赖 SQL 直接执行：tenant、agent_app、版本化配置/策略、授权等被引用的控制面表必须先存在。仓库部署使用完整迁移 000001，再依次 000002、000003、000004；不要把本文摘录再次应用到已迁移库。

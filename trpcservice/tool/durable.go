@@ -14,6 +14,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/reliability/inflight"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
 	toolexecution "github.com/liuzengh/trpc-agent-service/trpcservice/tool/execution"
 )
 
@@ -64,6 +65,11 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		key = execution.TenantID + ":" + execution.RequestID + ":" + execution.ToolCallID
 	}
 	in := toolexecution.Record{Key: toolexecution.Key{TenantID: execution.TenantID, RequestID: execution.RequestID, ToolCallID: execution.ToolCallID}, ToolID: g.Tool.ID, ToolVersion: g.Tool.Version, ArgsDigest: digest, Policy: string(policy), IdempotencyKey: key}
+	if task := taskflow.FromContext(ctx); task != nil {
+		if err := task.BeforeTool(ctx, in, canonical); err != nil {
+			return nil, err
+		}
+	}
 	match := func(record toolexecution.Record) bool {
 		return record.ToolID == in.ToolID && record.ToolVersion == in.ToolVersion && record.ArgsDigest == in.ArgsDigest && record.Policy == in.Policy && record.IdempotencyKey == in.IdempotencyKey
 	}
@@ -79,6 +85,11 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 		}
 		var value any
 		err = json.Unmarshal(content, &value)
+		if err == nil {
+			if task := taskflow.FromContext(ctx); task != nil {
+				err = task.RecordTool(ctx)
+			}
+		}
 		return value, err
 	}
 	existing, err := g.Executions.Get(ctx, in.Key)
@@ -199,6 +210,11 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 	}
 	if confirmed {
 		err = g.mirrorConfirmedResult(callCtx, execution, content, running.ResultRef)
+	}
+	if err == nil {
+		if task := taskflow.FromContext(ctx); task != nil {
+			err = task.RecordTool(ctx)
+		}
 	}
 	return value, err
 }

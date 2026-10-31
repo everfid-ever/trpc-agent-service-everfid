@@ -67,6 +67,8 @@ func registerRuntimeOperations(mux *http.ServeMux, token string, db *sql.DB, sto
 'model_calls',(SELECT coalesce(sum(model_call_count),0) FROM execution_record WHERE tenant_id=$1),
 'model_request_attempts',(SELECT coalesce(sum(model_request_count),0) FROM execution_record WHERE tenant_id=$1),
 'note_effects',(SELECT count(*) FROM local_note WHERE tenant_id=$1),
+'task_plans',(SELECT coalesce(jsonb_agg(q),'[]') FROM (SELECT request_id,fence,version,phase,final_ref,updated_at FROM task_plan WHERE tenant_id=$1 ORDER BY updated_at DESC LIMIT 100) q),
+'task_checkpoints',(SELECT count(*) FROM task_checkpoint WHERE tenant_id=$1),
 'preprocess_claims',(SELECT coalesce(jsonb_agg(q),'[]') FROM (SELECT request_id,session_id,lease_owner,lease_until,attempt,version FROM preprocess_job WHERE tenant_id=$1 AND lease_owner IS NOT NULL ORDER BY lease_until LIMIT 100) q),
 'outbox',(SELECT coalesce(jsonb_object_agg(kind||':'||state,n),'{}') FROM (SELECT kind,state,count(*) n FROM outbox WHERE tenant_id=$1 GROUP BY kind,state) q),
 'deliveries',(SELECT coalesce(jsonb_object_agg(state,n),'{}') FROM (SELECT state,count(*) n FROM delivery_ledger WHERE tenant_id=$1 GROUP BY state) q),

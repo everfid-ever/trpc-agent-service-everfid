@@ -4,6 +4,8 @@
 
 ## 当前实现状态
 
+步骤级恢复增量由 `000005_task_checkpoints` 提供。当前本地 WebUI/WeCom 共享组合根启用加密 task_plan、版本化 task_checkpoint、代码自有 task_checkpoint 工具、工具操作与证据绑定，以及成功 terminal 的数据库门禁。详见[步骤数据模型](inflight-task-takeover/design.md)与[运行顺序](inflight-task-takeover/implementation-walkthrough.md)。自定义 RunnerExecutor/Factory 调用者需要同时装配对应 Store 和工具开关，不能仅执行迁移就声称所有运行入口启用。
+
 ### 按问题定位详细说明
 
 | 想弄清楚的问题 | 首选文档 | 接着核对 |

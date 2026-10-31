@@ -117,6 +117,18 @@ func TestConsumeRunnerEventsDeduplicatesAndAccumulatesUsage(t *testing.T) {
 	}
 }
 
+func TestConsumeRunnerEventsOnlyRetainsUnresolvedToolCalls(t *testing.T) {
+	events := make(chan *event.Event, 4)
+	events <- &event.Event{Response: &model.Response{Choices: []model.Choice{{Message: model.Message{Role: model.RoleAssistant, ToolCalls: []model.ToolCall{{ID: "done"}, {ID: "ask"}}}}}}}
+	events <- &event.Event{Response: &model.Response{Choices: []model.Choice{{Message: model.NewToolMessage("done", "tool", "receipt")}}}}
+	events <- event.NewResponseEvent("runner", "done", &model.Response{Done: true, Object: model.ObjectTypeRunnerCompletion})
+	close(events)
+	got, err := consumeRunnerEvents(context.Background(), events)
+	if err != nil || len(got.ToolCalls) != 1 || got.ToolCalls[0].ID != "ask" {
+		t.Fatalf("unresolved calls: %+v %v", got.ToolCalls, err)
+	}
+}
+
 type blockingRunner struct{ release chan struct{} }
 
 func (r blockingRunner) Close() error { <-r.release; return nil }

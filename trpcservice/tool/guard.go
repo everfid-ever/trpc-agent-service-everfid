@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
@@ -33,7 +34,13 @@ func (g GuardedCallable) Declaration() *agenttool.Declaration {
 	if g.Inner == nil {
 		return nil
 	}
-	return g.Inner.Declaration()
+	declaration := g.Inner.Declaration()
+	if declaration == nil {
+		return nil
+	}
+	copy := *declaration
+	copy.Description += fmt.Sprintf("\nPinned tool version: %d.", g.Tool.Version)
+	return &copy
 }
 func (g GuardedCallable) GovernanceToolRef() governance.VersionedRef { return g.Tool }
 func (g GuardedCallable) Call(ctx context.Context, args []byte) (any, error) {

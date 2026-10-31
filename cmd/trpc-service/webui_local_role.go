@@ -84,6 +84,7 @@ import (
 	serviceqdrant "github.com/liuzengh/trpc-agent-service/trpcservice/storage/knowledge/qdrant"
 	messagingpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging/postgres"
 	sessionpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/storage/session/postgres"
+	taskflowpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/taskflow/postgres"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
 	tenantpostgres "github.com/liuzengh/trpc-agent-service/trpcservice/tenant/postgres"
 	servicetool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
@@ -328,10 +329,12 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		return errors.New("session service configuration rejected")
 	}
 	defer sdkSessions.Close()
-	agentFactory := serviceagent.Factory{Profiles: profiles, Models: models, Tools: tools, Skills: skills, Knowledge: knowledgeResolver,
+	durableTools := toolexecutionpostgres.NewWithPayloadKeys(db, bootstrap.PayloadKey)
+	taskPlans := taskflowpostgres.New(db, bootstrap.PayloadKey)
+	agentFactory := serviceagent.Factory{Profiles: profiles, Models: models, Tools: tools, Skills: skills, Knowledge: knowledgeResolver, TaskPlans: true,
 		Conditions:  agentcondition.DefaultRegistry(),
 		Checkpoints: graphCheckpoints,
-		Policies:    governanceStore, Confirmations: governanceStore, ToolResults: payloads, ToolExecutions: toolexecutionpostgres.NewWithPayloadKeys(db, bootstrap.PayloadKey), Telemetry: telemetryProvider}
+		Policies:    governanceStore, Confirmations: governanceStore, ToolResults: payloads, ToolExecutions: durableTools, Telemetry: telemetryProvider}
 	bundles := profilememory.NewBundleManager(func(ctx context.Context, key profile.ExecutionProfileKey) (profile.RuntimeBundle, func(context.Context) error, error) {
 		snapshot, resolveErr := profiles.Resolve(ctx, key)
 		if resolveErr != nil {
@@ -373,6 +376,7 @@ func runWebUILocalRole(parent context.Context, getenv func(string) string, logge
 		failoverBarrier = &inflight.Controller{}
 	}
 	executor := worker.RunnerExecutor{Tasks: tasks, Profiles: profiles, Bundles: bundles,
+		TaskPlans: taskPlans, ToolExecutions: durableTools,
 		Sessions: sessionpostgres.NewWithTelemetry(db, telemetryProvider), SDKSessions: sdkSessions, Payloads: payloads, Artifacts: artifacts,
 		Inputs: worker.JSONTextInputDecoder{}, EventDrainTimeout: 30 * time.Second,
 		Progress:   progressPublisher,

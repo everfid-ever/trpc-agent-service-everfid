@@ -26,8 +26,10 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/artifact"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/storage/messaging"
 	sessionstore "github.com/liuzengh/trpc-agent-service/trpcservice/storage/session"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/telemetry"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/tenant"
+	toolexecution "github.com/liuzengh/trpc-agent-service/trpcservice/tool/execution"
 	agentcore "trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/graph"
@@ -68,6 +70,8 @@ type RunnerExecutor struct {
 	// selects the framework-owned session backend for every turn.
 	SDKSessions       agentsession.Service
 	Payloads          messaging.PayloadStore
+	TaskPlans         taskflow.Store
+	ToolExecutions    toolexecution.Store
 	Artifacts         artifact.Store
 	Inputs            InputDecoder
 	EncodeResult      ResultRefEncoder
@@ -244,6 +248,29 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	if payload.PayloadRef != envelope.PayloadRef {
 		return runtime.ErrVersionMismatch
 	}
+	if w.TaskPlans != nil {
+		results, ok := w.ToolExecutions.(toolexecution.DurableResults)
+		if !ok {
+			return runtime.ErrCapabilityUnsupported
+		}
+		scope := taskflow.Scope{Key: taskflow.Key{TenantID: envelope.TenantID, RequestID: envelope.RequestID}, Fence: fence}
+		if beforeCommit != nil {
+			if err := beforeCommit(ctx); err != nil {
+				return err
+			}
+		}
+		if _, err := w.TaskPlans.Open(ctx, scope, taskflow.Digest(payload.Content), payload.KeyVersion); err != nil {
+			return err
+		}
+		task := &taskflow.Session{Store: w.TaskPlans, Tools: w.ToolExecutions, Results: results, Scope: scope, BeforeWrite: beforeCommit}
+		if _, err := task.Recover(ctx); err != nil {
+			if errors.Is(err, taskflow.ErrEvidenceRejected) {
+				return w.commitContinuationFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, "task_evidence_rejected")
+			}
+			return err
+		}
+		ctx = taskflow.WithSession(ctx, task)
+	}
 	// A process can die after freezing its output but before committing the
 	// terminal/outbox transaction. SDK history is already durable at this
 	// stage; reuse the output instead of generating a conflicting second one.
@@ -342,8 +369,18 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	}()
 
 	runOptions := []agentcore.RunOption{agentcore.WithAppName(appName), agentcore.WithRequestID(envelope.RequestID)}
+	if task := taskflow.FromContext(ctx); task != nil {
+		instruction, err := task.ResumeInstruction(ctx)
+		if err != nil {
+			return err
+		}
+		runOptions = append(runOptions, agentcore.WithGlobalInstruction(snapshot.GlobalInstruction+"\n"+instruction))
+	}
 	if w.Governance != nil {
 		toolRule := func(value agenttool.Tool) governance.Decision {
+			if _, ok := value.(taskflow.Tool); ok && taskflow.FromContext(ctx) != nil {
+				return governance.Decision{Action: governance.ActionAllow, ReasonCode: governance.ReasonAllowed}
+			}
 			// await_user_reply is a code-owned control-flow tool injected by
 			// llmagent, rather than a tenant ToolRef compiled by ToolSurfaceCompiler.
 			// Permit only the exact upstream type and only when the immutable
@@ -388,6 +425,19 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 		// visibility. Final execution remains protected by the same RunOptions
 		// and by the guarded callable's exact-policy re-resolution.
 		runCtx = serviceagent.WithToolSearchPolicy(runCtx, permit.Policy)
+	} else if taskflow.FromContext(ctx) != nil {
+		// Isolated callers without governance may use only this exact
+		// code-owned control tool, never broaden business-tool permissions.
+		runOptions = append(runOptions,
+			agentcore.WithToolExecutionFilter(func(_ context.Context, value agenttool.Tool) bool { _, ok := value.(taskflow.Tool); return ok }),
+			agentcore.WithToolPermissionPolicyFunc(func(_ context.Context, request *agenttool.PermissionRequest) (agenttool.PermissionDecision, error) {
+				if request != nil {
+					if _, ok := request.Tool.(taskflow.Tool); ok {
+						return agenttool.AllowPermission(), nil
+					}
+				}
+				return agenttool.DenyPermission(governance.ReasonToolDenied), nil
+			}))
 	}
 	usageOffset := governance.Usage{}
 	if continuation != nil {
@@ -635,6 +685,16 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 		return err
 	}
 	content := runResult.Content
+	// Do not settle the governance reservation or freeze a false success:
+	// the next owner must be able to finish the outstanding obligations.
+	if task := taskflow.FromContext(ctx); task != nil {
+		if _, err := task.ValidateCompletion(ctx); err != nil {
+			if errors.Is(err, taskflow.ErrEvidenceRejected) {
+				return w.commitContinuationFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, "task_evidence_rejected")
+			}
+			return err
+		}
+	}
 	if w.Governance != nil {
 		decision, finishErr := finishGovernanceRun(ctx, w.Governance, permit, runResult, []byte(content))
 		if finishErr != nil {
@@ -705,6 +765,11 @@ func (w RunnerExecutor) commitFrozenSuccess(ctx context.Context, turn *sessionst
 	}
 	if beforeCommit != nil {
 		if err := beforeCommit(ctx); err != nil {
+			return err
+		}
+	}
+	if task := taskflow.FromContext(ctx); task != nil {
+		if err := task.Seal(ctx, resultRef); err != nil {
 			return err
 		}
 	}
@@ -935,6 +1000,7 @@ func consumeRunnerEventsWithProgress(ctx context.Context, events <-chan *event.E
 	modelUsage := make(map[governance.VersionedRef]governance.Usage)
 	var unattributedUsage governance.Usage
 	var toolCalls []model.ToolCall
+	finishedToolCalls := make(map[string]bool)
 	var graphInterrupt *graphContinuationCoordinate
 	usageEvents := make(map[string]struct{})
 	completed := false
@@ -981,7 +1047,24 @@ func consumeRunnerEventsWithProgress(ctx context.Context, events <-chan *event.E
 				}
 				for _, choice := range value.Choices {
 					if len(choice.Message.ToolCalls) != 0 {
-						toolCalls = append([]model.ToolCall(nil), choice.Message.ToolCalls...)
+						toolCalls = nil
+						for _, call := range choice.Message.ToolCalls {
+							if !finishedToolCalls[call.ID] {
+								toolCalls = append(toolCalls, call)
+							}
+						}
+					}
+					// Executed tool responses are progress, not outstanding
+					// confirmation requests. Preserve only unresolved call IDs.
+					if id := choice.Message.ToolID; id != "" && choice.Message.Role == model.RoleTool {
+						finishedToolCalls[id] = true
+						remaining := toolCalls[:0]
+						for _, call := range toolCalls {
+							if call.ID != id {
+								remaining = append(remaining, call)
+							}
+						}
+						toolCalls = remaining
 					}
 					if choice.Delta.Content != "" {
 						content.WriteString(choice.Delta.Content)
