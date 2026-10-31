@@ -3,13 +3,17 @@
 ## 000005 步骤级恢复的实际接入顺序
 
 1. Runner 核对原 envelope、顺序和 payload 后调用 taskflow Store.Open，以原输入 SHA-256、payload key version 和会话 fence 创建或接管计划。Redis 提交前检查也用于计划写入前资格检查。
-2. Recover 遍历已绑定工具步骤，读取同 tenant/request/tool-call 的工具账本。成功结果须通过工具名/版本、参数摘要、密文结果摘要及可选输出断言校验；成功结果存在但检查点尚未提交时，补齐步骤成功与证据。
+2. Recover 遍历已绑定工具步骤，读取同 tenant/request/tool-call 的工具账本。成功结果须通过工具名/版本、参数摘要、密文摘要、必需的步骤断言及适用的服务端可信断言；成功结果存在但检查点尚未提交时补齐步骤成功。不可恢复 failed/manual 未知先保存失败，停止模型重跑。
 3. 有冻结答案时继续已有结果分支；没有时，将 checkpoint 作为数据加入本轮 global instruction，保留原发布 instruction。已完成工具结果小于等于 8192 字节时内联，大结果使用 read_result 按 UTF-8 字节分块读取。原用户输入保持权威。
 4. Factory 添加代码自有 task_checkpoint 工具；Worker 仅对这个精确类型放行控制权限，名称被保留，租户工具不能冒名。工具动作有预算限制、上下文租户检查、长度限制、版本检查和写前资格检查。
 5. 模型通过 define/start/complete_analysis/inspect/read_result 管理步骤。define 只追加；普通工具在实际调用前由 GuardedCallable 将稳定操作与规范参数写入运行步骤，然后才走原工具 claim/恢复/授权协议。
 6. 工具成功结果提交后 RecordTool 再核对并更新计划。此处被杀时，下一 owner 的 Recover 从工具结果修复检查点；工具效果完成但结果未落库时，继续依赖原工具恢复策略。
 7. 模型给出最终答案后，先检查所有已声明义务，再结算治理预算、保存冻结答案；commitFrozenSuccess 验证并 Seal。terminal 数据库触发器最后检查封存状态、引用和 fence。
 8. `/ops/reliability` 增加最多 100 条计划元数据及检查点总数，不返回规范参数、笔记、密钥或解密正文。
+
+000006 在读取冻结结果之后、创建新模型运行之前调用 BeginAttempt，持久保存合同、起点和进展/尝试计数；超限直接进入失败收敛。ResumeInstruction 向模型展示非空计划和工具检查的强制要求，但最终判定由代码完成。运行 context 使用固定任务 deadline，模型持续不结束也受时间限制。
+
+失败路径由 worker/task_failure.go 负责：保存失败计划 → 幂等关闭治理预约并记 task_failure 决策 → 保存确定性失败文本 → 使用原 terminal reply 坐标提交 failed 与 reply/audit Outbox。重试从 failed 计划恢复，不开始新模型尝试，也不新建业务 request。管理快照增加 task_failures，仅返回原因码和关联元数据。
 
 已完成的分析有保存笔记；已完成工具有真实账本与结果。恢复不是重建模型内部思维，也不自动复活任意 Graph 栈。计划执行开关与 Store 在当前本地组合根一并装配，单独使用其他 Factory/Executor 的调用方须显式接入。
 

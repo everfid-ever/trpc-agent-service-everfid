@@ -13,6 +13,7 @@ import (
 
 	"github.com/liuzengh/trpc-agent-service/trpcservice/governance"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
 	servicetool "github.com/liuzengh/trpc-agent-service/trpcservice/tool"
 	agenttool "trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -61,6 +62,10 @@ type Writer interface {
 	Create(context.Context, Note) (Result, error)
 }
 type Tool struct{ Writer Writer }
+
+func (Tool) TaskEvidenceCheck() *taskflow.ResultCheck {
+	return &taskflow.ResultCheck{Path: []string{"status"}, EqualsJSON: `"created"`}
+}
 
 func (Tool) RecoveryPolicy() servicetool.RecoveryPolicy { return servicetool.RecoveryIdempotentKey }
 

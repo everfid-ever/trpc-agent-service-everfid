@@ -47,7 +47,7 @@ func TestCrashAfterToolResultBeforeCheckpointResumesWithoutRepeatingEffect(t *te
 	ctx := context.Background()
 	s, store, r := session(t)
 	p, err := s.Define(ctx, 1, []taskflow.Step{
-		{ID: "collect", Title: "collect", Criterion: "query receipt", Kind: "tool", ToolID: "query", ToolVersion: 1},
+		{ID: "collect", Title: "collect", Criterion: "query receipt", Kind: "tool", ToolID: "query", ToolVersion: 1, Check: &taskflow.ResultCheck{NonEmpty: true}},
 		{ID: "analyze", Title: "analyze", Criterion: "derive summary from receipt", Kind: "analysis", DependsOn: []string{"collect"}},
 	})
 	if err != nil {
@@ -62,7 +62,7 @@ func TestCrashAfterToolResultBeforeCheckpointResumesWithoutRepeatingEffect(t *te
 	}
 	args := []byte(`{"query":"rates"}`)
 	r.r = execution.Record{Key: execution.Key{TenantID: "t", RequestID: "r", ToolCallID: "op"}, ToolID: "query", ToolVersion: 1, ArgsDigest: taskflow.Digest(args), State: execution.Running}
-	if err = s.BeforeTool(ctx, r.r, args); err != nil {
+	if err = s.BeforeTool(ctx, r.r, args, &taskflow.ResultCheck{NonEmpty: true}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = s.ValidateCompletion(ctx); !errors.Is(err, taskflow.ErrIncomplete) {
@@ -117,7 +117,7 @@ func TestCrashAfterToolResultBeforeCheckpointResumesWithoutRepeatingEffect(t *te
 func TestPlanCannotForgeReceiptsRemoveObligationsOrChangeToolArguments(t *testing.T) {
 	ctx := context.Background()
 	s, _, r := session(t)
-	p, err := s.Define(ctx, 1, []taskflow.Step{{ID: "write", Title: "write", Criterion: "durable receipt", Kind: "tool", ToolID: "write", ToolVersion: 1, State: "succeeded", ResultRef: "fake", Note: "done"}})
+	p, err := s.Define(ctx, 1, []taskflow.Step{{ID: "write", Title: "write", Criterion: "durable receipt", Kind: "tool", ToolID: "write", ToolVersion: 1, State: "succeeded", ResultRef: "fake", Note: "done", Check: &taskflow.ResultCheck{NonEmpty: true}}})
 	if err != nil || p.Steps[0].State != "pending" || p.Steps[0].ResultRef != "" {
 		t.Fatal(p, err)
 	}
@@ -136,12 +136,12 @@ func TestPlanCannotForgeReceiptsRemoveObligationsOrChangeToolArguments(t *testin
 	}
 	args := []byte(`{}`)
 	r.r = execution.Record{Key: execution.Key{TenantID: "t", RequestID: "r", ToolCallID: "op"}, ToolID: "write", ToolVersion: 1, ArgsDigest: taskflow.Digest(args), State: execution.EffectUnknown}
-	if err = s.BeforeTool(ctx, r.r, args); err != nil {
+	if err = s.BeforeTool(ctx, r.r, args, &taskflow.ResultCheck{NonEmpty: true}); err != nil {
 		t.Fatal(err)
 	}
 	changed := r.r
 	changed.ToolCallID = "new-op"
-	if err = s.BeforeTool(ctx, changed, args); !errors.Is(err, runtime.ErrVersionMismatch) {
+	if err = s.BeforeTool(ctx, changed, args, &taskflow.ResultCheck{NonEmpty: true}); !errors.Is(err, runtime.ErrVersionMismatch) {
 		t.Fatal(err)
 	}
 	if _, err = s.ValidateCompletion(ctx); !errors.Is(err, taskflow.ErrIncomplete) {
@@ -188,7 +188,7 @@ func TestEvidencePredicateRejectsBusinessFailureAndReadsLargeResults(t *testing.
 	}
 	args := []byte(`{}`)
 	r.r = execution.Record{Key: execution.Key{TenantID: "t", RequestID: "r", ToolCallID: "op"}, ToolID: "write", ToolVersion: 1, ArgsDigest: taskflow.Digest(args), State: execution.Running}
-	if err = s.BeforeTool(ctx, r.r, args); err != nil {
+	if err = s.BeforeTool(ctx, r.r, args, &taskflow.ResultCheck{NonEmpty: true}); err != nil {
 		t.Fatal(err)
 	}
 	r.r.State = execution.Succeeded

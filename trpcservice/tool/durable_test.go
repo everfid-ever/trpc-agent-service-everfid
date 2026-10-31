@@ -89,6 +89,10 @@ type recoveringTool struct {
 }
 
 func (t *recoveringTool) RecoveryPolicy() RecoveryPolicy { return t.policy }
+
+func (t *recoveringTool) TaskEvidenceCheck() *taskflow.ResultCheck {
+	return &taskflow.ResultCheck{EqualsJSON: `"ok"`}
+}
 func (t *recoveringTool) RecoveryKey(ctx context.Context) (string, error) {
 	execution, _ := runtime.ExecutionContextFrom(ctx)
 	return execution.ToolCallID, nil
@@ -150,7 +154,7 @@ func TestDurableToolRequiresPlanAndSavesVerifiedStepEvidence(t *testing.T) {
 	if _, err := guard.Call(ctx, []byte(`{"a":1}`)); !errors.Is(err, taskflow.ErrIncomplete) || inner.calls != 0 {
 		t.Fatalf("unplanned call: %v effects=%d", err, inner.calls)
 	}
-	p, err := task.Define(ctx, 1, []taskflow.Step{{ID: "effect", Title: "create note", Criterion: "saved receipt", Kind: "tool", ToolID: "safe", ToolVersion: 1}})
+	p, err := task.Define(ctx, 1, []taskflow.Step{{ID: "effect", Title: "create note", Criterion: "saved receipt", Kind: "tool", ToolID: "safe", ToolVersion: 1, Check: &taskflow.ResultCheck{EqualsJSON: `"ok"`}}})
 	if err != nil {
 		t.Fatal(err)
 	}

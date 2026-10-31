@@ -1,24 +1,26 @@
 # 在途任务接管与幂等投递 — 参考实现
 
-## 步骤检查点增量契约（000005）
+## 步骤检查点与失败收敛增量契约（000005–000006）
 
-在本文原有 000001–000004 基础上应用 `migrations/000005_task_checkpoints.up.sql`。新表的直观字段和事务说明见 [design.md](design.md)；实现入口为 `trpcservice/taskflow/taskflow.go`、`tool.go`、`evidence.go` 与 `postgres/store.go`。
+在本文原有 000001–000004 基础上依次应用 `000005_task_checkpoints`、`000006_task_failure_convergence`。新表、合同、计数和数据库写入保护见 [design.md](design.md)；实现入口为 `trpcservice/taskflow/taskflow.go`、`policy.go`、`tool.go`、`evidence.go`、`postgres/store.go` 与 `trpcservice/worker/task_failure.go`。
 
 | 接口 | 必须实现的语义 |
 |---|---|
 | Store.Open(scope,digest,keyVersion) | 原 execution 必须对应当前会话输入闸门；固定原输入摘要/密钥版本，只允许同等或更高 fence 接管，不能重置原步骤和封存结果。 |
 | Store.Get(key) | 明确 tenant/request；解密时绑定该作用域与版本；密文和行 phase/ref/version 必须一致。 |
-| Store.Save(scope,expected,plan) | 仅当前 fence、当前版本、open 状态可写；版本递增，当前计划与加密历史快照同事务。 |
+| Store.Save(scope,expected,plan) | 当前 fence/版本 CAS，正常仅 open 可写；允许 sealed 安全失败，不重新开放。版本递增，当前计划与加密快照同事务；写入 admission_version、checkpoint_version、verified_steps 满足新约束。 |
 | Session.Define/Start/CompleteAnalysis | 计划只追加，步骤依赖先成功，同一时间一个活动步骤；分析完成必须保存非空笔记，不可冒充工具证据。 |
-| Session.BeforeTool/Recover | 调用前绑定稳定工具操作、规范参数；恢复时从原工具账本和密文结果核实，不能凭模型文字修改成功。 |
+| Session.BeforeTool/Recover | 调用前绑定稳定工具操作、规范参数与代码自有 trusted_check；恢复核对真实账本、结果和全部必需断言，永久失败/manual 效果未知转持久失败。 |
 | Session.ValidateCompletion/Seal | 全部声明步骤通过证据校验后，绑定唯一最终引用并封存；数据库触发器在成功 terminal 再检查 phase/ref/fence。 |
 | task_checkpoint 控制工具 | inspect/define/start/complete_analysis/read_result；使用可信运行上下文而非模型提交的 tenant/request；每次调用纳入工具预算。 |
+| Session.BeginAttempt/Deadline/Fail | 持久保存服务端合同、首次时刻、总尝试与无进展计数；实际运行受固定 deadline 限制。修订计划、换进程不能重置预算，失败原因可幂等重读。 |
+| RunnerExecutor.commitTaskFailure | 失败计划先持久化，再幂等保存固定失败结果并提交原 request 的 failed terminal + reply/audit Outbox；中途故障不重跑模型，不重复生成逻辑回复。 |
 
 步骤复用当前会话租约与工具操作账本，不新增另一套相互冲突的步骤租约。原 P4 渠道协议边界保持不变。计划封存与外部发送不在同一事务；封存后仍依赖原 result/terminal/Outbox/Ledger 链路。
 
 ## 复刻前提、迁移与实现范围
 
-本文给出本能力的实际表结构、SQL/Go 算法和配置契约。字段表优先见 design；本篇保留逐字 DDL。SQL 按依赖创建，以下是可靠性子系统摘录，不能作为一段无依赖 SQL 直接执行：tenant、agent_app、版本化配置/策略、授权等被引用的控制面表必须先存在。仓库部署使用完整迁移 000001，再依次 000002、000003、000004；不要把本文摘录再次应用到已迁移库。
+本文给出本能力的实际表结构、SQL/Go 算法和配置契约。字段表优先见 design；本篇保留逐字 DDL。SQL 按依赖创建，以下是可靠性子系统摘录，不能作为一段无依赖 SQL 直接执行：tenant、agent_app、版本化配置/策略、授权等被引用的控制面表必须先存在。仓库部署使用完整迁移 000001，再依次执行到 000006；不要把本文摘录再次应用到已迁移库。
 
 完整服务还需要渠道协议验签、SDK PostgreSQL backend、租户密钥解析器、Redis broker、版本化配置加载和真实模型/provider 适配。SDK 表由迁移创建，SDK WithSkipDBInit(true)、WithEnableAsyncPersist(false)，禁止启动时另造 schema。本文是当前能力的复刻契约；不会把省略的基础设施宣称为“复制一段示例即可启动全部系统”。
 

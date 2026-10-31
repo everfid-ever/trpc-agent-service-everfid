@@ -34,9 +34,12 @@ func TestSaveCheckpointsEncryptedAndAtomicWithFenceAndVersion(t *testing.T) {
 	defer db.Close()
 	s := New(db, keys{})
 	p := taskflow.Plan{Scope: taskflow.Scope{Key: taskflow.Key{TenantID: "t", RequestID: "r"}, Fence: 7}, Version: 1, InputDigest: taskflow.Digest([]byte("input")), KeyVersion: 1, Phase: "open", Steps: []taskflow.Step{{ID: "a", Title: "private goal", Kind: "analysis", State: "pending"}}}
+	p.Contract = taskflow.DefaultContract()
+	p.Attempts = 2
+	p.NoProgress = 1
 	c, n := &capture{}, &capture{}
 	m.ExpectBegin()
-	m.ExpectQuery("UPDATE task_plan SET version").WithArgs("t", "r", int64(7), int64(1), int64(2), "open", "", c, n, p.InputDigest, int64(1)).WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(2))
+	m.ExpectQuery("UPDATE task_plan SET version").WithArgs("t", "r", int64(7), int64(1), int64(2), "open", "", c, n, p.InputDigest, int64(1), 1, 0).WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(2))
 	m.ExpectExec("INSERT INTO task_checkpoint").WithArgs("t", "r", int64(2), int64(7), p.InputDigest, int64(1), "open", "", sqlmock.AnyArg(), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
 	m.ExpectCommit()
 	p, err = s.Save(context.Background(), p.Scope, 1, p)
@@ -52,7 +55,7 @@ func TestSaveCheckpointsEncryptedAndAtomicWithFenceAndVersion(t *testing.T) {
 	// A new owner changes the fence, not the immutable checkpoint ciphertext.
 	m.ExpectQuery("SELECT fence").WithArgs("t", "r").WillReturnRows(rows())
 	got, err := s.Get(context.Background(), p.Key)
-	if err != nil || got.Fence != 8 || got.Steps[0].Title != "private goal" {
+	if err != nil || got.Fence != 8 || got.Steps[0].Title != "private goal" || got.Contract != p.Contract || got.Attempts != 2 || got.NoProgress != 1 {
 		t.Fatal(got, err)
 	}
 	m.ExpectQuery("SELECT fence").WithArgs("other", "r").WillReturnRows(rows())

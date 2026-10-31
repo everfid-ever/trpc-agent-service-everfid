@@ -2,11 +2,13 @@
 
 ## 步骤级恢复升级与排障
 
-先执行 `000005_task_checkpoints` 再运行启用 TaskPlans 的应用。旧实例不理解计划封存时，可能被数据库门禁拒绝成功提交，不能在仍有新计划的环境无条件回滚到旧应用。保留两张新表、旧 payload key version 和原工具结果。
+先执行 `000005_task_checkpoints`、`000006_task_failure_convergence` 再运行当前应用。旧实例不理解合同版本、失败阶段与写入版本戳，会被新约束拒绝写新合同计划，不能在仍有新计划的环境无条件回滚到旧应用。保留两张新表、旧 payload key version 和原工具结果；新字段 down 迁移不删除失败记录，有 failed 记录时回退旧阶段约束会失败并整体回滚。
 
-`/ops/reliability` 返回 task_plans 的 request/fence/version/phase/final_ref/updated_at 与 task_checkpoints 总数。明细最多 100 条；状态存在不证明步骤业务正确。需要检查正文时使用授权的受控数据访问，不把解密计划写入普通日志。
+`/ops/reliability` 返回 task_plans 的 request/fence/version/phase/final_ref/updated_at、task_checkpoints 总数及 task_failures 原因码/策略版本/时间。明细最多 100 条；状态存在不证明步骤业务正确。需要检查正文时使用授权的受控数据访问，不把解密计划写入普通日志。
 
-若任务返回 task plan incomplete，按原 request 查未完成步骤、前序依赖和绑定工具；不要删除义务让任务过门禁。若原工具 succeeded 而步骤尚未成功，Recover 应核验回执后补齐；解密、摘要、工具身份或结果断言失败需保留证据。确定性断言不满足会以 task_evidence_rejected 安全失败，不能重新生成另一份回执掩盖业务失败。
+若任务返回 task plan incomplete，按原 request 查未完成步骤、前序依赖和绑定工具；不要删除义务让任务过门禁。连续无进展、总尝试及期限使用持久合同限额，重启不能重置。若工具 succeeded 而步骤尚未成功，Recover 应核验回执后补齐；解密、摘要、工具身份或结果断言失败需保留证据。不可恢复步骤、缺失/不满足证据及超限会保存失败原因，并按原链路投递失败回复，不会无期限把“正在重试”当作结束状态。
+
+新合同对所有启用 TaskPlans 的请求强制建计划，普通聊天也会增加计划/检查点调用开销。未声明可信完成契约的非 replay_safe 工具会在副作用前拒绝；部署前检查实际注册工具并补充相应适配，不能为了恢复可用性把写工具临时标为 replay_safe。
 
 计划串行执行且修订只追加；不支持任意修改已绑定工具参数、删除失败步骤、自动补偿外部效果、无限步骤或自动证明分析正确。业务需要新的效果时，应通过受控的新业务输入与授权流程执行，而非手工改当前 checkpoint。
 

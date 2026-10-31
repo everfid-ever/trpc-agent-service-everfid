@@ -13,10 +13,13 @@
 | version | bigint > 0 | 每次计划修改递增，Save 使用 expected version CAS。 |
 | input_digest | text，64 字符 | 固定本轮真实输入内容摘要；目标原文仍由原 payload 保存。 |
 | key_version | bigint > 0 | 租户 payload 密钥版本。 |
-| phase | open / sealed | open 可变；sealed 不再追加、启动或修改步骤。 |
+| phase | open / sealed / failed | open 可变；sealed 封存成功结果；failed 持久停止，禁止再启动或修改步骤。 |
 | final_ref | 可空 text | sealed 时必须绑定最终 result_ref。 |
 | ciphertext / nonce | bytea，nonce 为 12 字节 | 计划的加密 JSON 与 GCM nonce。 |
 | created_at / updated_at | timestamptz，默认数据库 now() | 创建与最后更新时刻。 |
+| admission_version | integer，默认 0，允许 0/1 | 000006 新增。旧记录为 0，新准入合同为 1。 |
+| checkpoint_version | bigint，默认 0 | 合同为 1 时必须等于 version；旧实例只更新密文/version 会被约束拒绝，不能擦掉新策略和计数。 |
+| verified_steps | integer，0–32，默认 0 | 新合同 sealed 必须大于 0，由新服务验证成功步骤后写入；旧实例不能空计划封存新任务。 |
 
 ### task_checkpoint：不可变的修改快照
 
@@ -24,7 +27,7 @@
 |---|---|---|
 | tenant_id / request_id / version | 联合主键，version > 1；引用 task_plan | 一次成功修改一份快照。 |
 | fence / input_digest / key_version | bigint / text / bigint | 保存当次修改资格与内容作用域。 |
-| phase / final_ref | text / 可空 text | 当次计划阶段与冻结结果关联。 |
+| phase / final_ref | text / 可空 text | 当次计划阶段（open/sealed/failed）与冻结结果关联。 |
 | ciphertext / nonce | bytea，nonce 为 12 字节 | 与当前计划同事务保存的加密快照。 |
 | created_at | timestamptz，默认数据库 now() | 修改时间。 |
 
@@ -37,7 +40,8 @@
 | id/title/criterion/kind | 模型定义稳定步骤 ID、描述、完成条件与 analysis/tool 类型；服务校验长度、唯一性和类型。 |
 | depends_on | 仅引用已存在或本次之前声明的步骤，禁止环；依赖未成功不能 Start。 |
 | tool_id/tool_version | tool 步骤固定精确工具；实际声明向模型提供 pinned version。 |
-| check | 可选确定性结果断言：对象字段 path，加 equals_json 或 non_empty 二选一。 |
+| check | 新准入合同中 tool 步骤必须提供的确定性结果断言：对象字段 path，加 equals_json 或 non_empty 二选一。 |
+| trusted_check | 来自代码自有 EvidenceDescriptor，模型不能设置或替换。非 replay_safe 工具必须提供；实际结果要同时满足模型断言与服务端断言。 |
 | state | 服务维护 pending/running/succeeded/effect_unknown/failed；调用方不能直接提交成功。 |
 | tool_call_id/args_digest/arguments | GuardedCallable 在外部调用前固定操作 ID、规范参数摘要与原参数；后续不可换参数冒充续办。 |
 | result_ref/evidence_digest | 从成功工具账本与解密校验后的结果填写，不接受模型自报回执。 |
@@ -49,7 +53,28 @@
 
 Runner 在治理结算与 PutResult 前 ValidateCompletion，避免未完成任务关闭预算预约并冻结假成功。校验所有声明步骤、依赖、分析摘要及工具结果；Seal 再绑定最终引用。`check_task_plan_terminal` 触发器在插入 succeeded session_commit 时锁定计划，检查 sealed、result_ref 和 fence 一致，防止应用遗漏门禁。
 
-分析笔记和可选结果断言不等于通用业务语义证明：未声明的子目标不会自动被发现；无 check 的工具步骤只证明取得真实成功回执。有外部业务完成标准时应声明输出断言，必要时增加真实读回校验步骤。manual/queryable 等原工具策略继续决定未知效果能否自动推进，计划不能授权盲重放。
+新合同在模型执行前确定：所有启用 TaskPlans 的请求必须有非空计划，纯文本也不例外；工具步骤缺少 check 时不能创建。工具执行前还检查实现的可信契约：非 replay_safe 工具没有 TaskEvidenceCheck 就拒绝执行，已绑定契约不能在恢复时被弱化。本地笔记工具固定核验 status="created"。其他写工具接入时须自行声明真实完成标准，不能默认把传输成功当业务完成。
+
+分析笔记和确定性断言仍不等于通用语义证明：未声明的自然语言子目标不会自动被发现，任意分析内容是否正确需要业务评估。有外部业务完成标准时应提供可信断言，必要时增加真实读回校验步骤；计划不能授权盲重放。
+
+### 000006：持久化限额与失败收敛
+
+合同与运行计数保存在加密计划/快照内，模型控制工具不接收这些字段。新计划使用服务端合同 version=1，RequirePlan/RequireToolChecks 均为 true。
+
+| 字段/默认策略 | 精确含义 |
+|---|---|
+| Contract.MaxAttempts=8 | 最多 8 次新的模型运行机会；第 9 次进入时停止。冻结成功答案的续提交不再开始模型尝试。 |
+| Contract.MaxNoProgress=3 | 两次运行机会之间没有新增已完成步骤证据计一次；连续 3 次则停止。仅创建/追加/启动步骤不算进展。 |
+| Contract.MaxAgeSeconds=1800 | 从首次 BeginAttempt 起计的持久截止；重加入不重置，运行 context 也受该 deadline 限制。 |
+| StartedAt / Attempts / NoProgress | 首次运行起点、尝试数、连续无进展数。 |
+| LastProgressDigest | 已成功步骤 ID 与证据摘要的稳定摘要；已完成证据增加才重置无进展计数。 |
+| FailureReason | task_no_progress、task_attempts_exhausted、task_deadline_exceeded、task_step_failed、task_effect_unknown_manual、task_evidence_required 或 task_evidence_rejected。 |
+
+不可恢复工具 failed、manual 效果未知会在 Recover 中停止；其他持续没有完成的状态受限额控制。失败先保存 phase/reason，再保存固定失败结果，最后以原 request 提交 failed terminal + reply/audit Outbox。任一边界中断后重放原结果与原 reply 身份，不重跑模型。失败回复仍使用原 Delivery Ledger，因此 P4 边界不变。
+
+工具 running 且租约未到期时，Recover 返回带到期时刻的 ToolBusyError，原队列工作等待后续回收，不开始模型尝试，也不增加无进展计数。等待仍受持久 StartedAt/任务期限限制；不能因旧工具租约晚于任务期限而无限等待。
+
+版本 0 的历史密文在进入新模型运行时升级为新合同；历史已冻结结果沿原恢复分支处理。新合同行的 checkpoint_version/verified_steps 数据库约束保护新写入，旧应用不能合法写回新合同记录。升级仍要求服务节点使用兼容版本，不把混合版本运行描述为完全无影响。
 
 ## 不变量、写入点与违反后的后果
 

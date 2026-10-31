@@ -10,6 +10,7 @@ import (
 	"github.com/liuzengh/trpc-agent-service/trpcservice/profile"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/runtime"
 	"github.com/liuzengh/trpc-agent-service/trpcservice/secrets"
+	"github.com/liuzengh/trpc-agent-service/trpcservice/taskflow"
 	agenttool "trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
@@ -207,6 +208,13 @@ type tenantBoundCallable struct {
 }
 
 func (t tenantBoundCallable) Declaration() *agenttool.Declaration { return t.inner.Declaration() }
+
+func (t tenantBoundCallable) TaskEvidenceCheck() *taskflow.ResultCheck {
+	if descriptor, ok := t.inner.(taskflow.EvidenceDescriptor); ok {
+		return descriptor.TaskEvidenceCheck()
+	}
+	return nil
+}
 
 func (t tenantBoundCallable) RecoveryPolicy() RecoveryPolicy {
 	if descriptor, ok := t.inner.(RecoveryDescriptor); ok {

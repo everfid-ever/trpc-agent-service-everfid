@@ -6,6 +6,10 @@
 
 `trpcservice/tool/durable_test.go` 检查无计划不能调用业务工具、实际成功结果才能完成步骤。`trpcservice/worker/taskflow_test.go` 经真实 SDK 的 task_checkpoint 工具构造未完成计划，确认不能提前冻结结果或结算治理预约；随后换 fence 完成步骤，在 result-before-commit 窗口中断，再换 fence 复用冻结结果提交，模型调用不增加。`runner_test.go` 检查工具结果事件会移除已完成调用，未决确认仍保留。
 
+`taskflow/policy_test.go` 检查空计划拒绝、跨 owner 无进展计数、仅新增完成证据可重置、总尝试/期限跨重启保留、缺少检查拒绝、弱模型断言不能覆盖可信断言、永久失败与 manual 未知停止。`worker/taskflow_test.go` 还让真实 SDK 模型连续返回无计划答案：前三次不冻结，第 4 次收敛失败；失败结果落库后模拟提交前失权，新 owner 无模型重跑即可完成 failed terminal，重复派发只保留一条逻辑 reply Outbox。
+
+上线前另检查 000006 的真实 PG 约束：旧式只改 version/密文的写入不能更新新合同记录；新合同 verified_steps=0 时不能 sealed；failed 记录使 down 回退旧阶段约束安全失败。SQL mock 检查调用参数和原子边界，不代替这些数据库执行证据。
+
 上述为代码层回归；SQL mock 不等于真实 PostgreSQL 故障演练。数据库触发器、真实渠道与外部工具效果的部署验收仍按独立环境证据判定。测试不声称机器已证明分析笔记或任意业务标准语义正确。
 
 ## 每个窗口必须保存的前后状态

@@ -264,8 +264,8 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 		}
 		task := &taskflow.Session{Store: w.TaskPlans, Tools: w.ToolExecutions, Results: results, Scope: scope, BeforeWrite: beforeCommit}
 		if _, err := task.Recover(ctx); err != nil {
-			if errors.Is(err, taskflow.ErrEvidenceRejected) {
-				return w.commitContinuationFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, "task_evidence_rejected")
+			if reason := taskflow.StopReason(err); reason != "" {
+				return w.commitTaskFailure(ctx, task, turn, envelope, head, fence, beforeCommit, modelRef, payload.KeyVersion, reason)
 			}
 			return err
 		}
@@ -290,6 +290,19 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 		if !errors.Is(readErr, runtime.ErrNotFound) {
 			return readErr
 		}
+	}
+	if task := taskflow.FromContext(ctx); task != nil {
+		if _, err := task.BeginAttempt(ctx); err != nil {
+			if reason := taskflow.StopReason(err); reason != "" {
+				return w.commitTaskFailure(ctx, task, turn, envelope, head, fence, beforeCommit, modelRef, payload.KeyVersion, reason)
+			}
+			return err
+		}
+		defer func() {
+			if reason := taskflow.StopReason(resultErr); reason != "" {
+				resultErr = w.commitTaskFailure(ctx, task, turn, envelope, head, fence, beforeCommit, modelRef, payload.KeyVersion, reason)
+			}
+		}()
 	}
 	message, err := w.Inputs.DecodeInput(ctx, envelope, payload.Content)
 	if err != nil {
@@ -340,6 +353,16 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 		})
 	}
 	var cancelBudget context.CancelFunc
+	var taskDeadline time.Time
+	if task := taskflow.FromContext(ctx); task != nil {
+		taskDeadline, err = task.Deadline(ctx)
+		if err != nil {
+			return err
+		}
+		var cancelTask context.CancelFunc
+		runCtx, cancelTask = context.WithDeadline(runCtx, taskDeadline)
+		defer cancelTask()
+	}
 	if envelope.ExecutionBudget.ExecutionTimeoutSeconds > 0 {
 		runCtx, cancelBudget = context.WithTimeout(runCtx, time.Duration(envelope.ExecutionBudget.ExecutionTimeoutSeconds)*time.Second)
 		defer cancelBudget()
@@ -556,6 +579,9 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	}
 	events, err = run.Run(runCtx, envelope.UserID, envelope.SessionID, message, runOptions...)
 	if err != nil {
+		if !taskDeadline.IsZero() && !time.Now().Before(taskDeadline) {
+			return taskflow.StoppedError{Reason: "task_deadline_exceeded"}
+		}
 		if violation := runtime.ExecutionBudgetViolation(runCtx); violation != nil {
 			return w.commitBudgetTerminal(ctx, turn, envelope, head, fence, beforeCommit, violation)
 		}
@@ -575,6 +601,9 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	if err != nil {
 		closeRunner(run, events, w.EventDrainTimeout)
 		runnerClosed = true
+		if !taskDeadline.IsZero() && !time.Now().Before(taskDeadline) {
+			return taskflow.StoppedError{Reason: "task_deadline_exceeded"}
+		}
 		if violation := runtime.ExecutionBudgetViolation(runCtx); violation != nil {
 			return w.commitBudgetTerminal(ctx, turn, envelope, head, fence, beforeCommit, violation)
 		}
@@ -593,6 +622,9 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 		if err := addUsage(&runResult.Usage, usageOffset); err != nil {
 			return err
 		}
+	}
+	if !taskDeadline.IsZero() && !time.Now().Before(taskDeadline) {
+		return taskflow.StoppedError{Reason: "task_deadline_exceeded"}
 	}
 	if len(runResult.ToolCalls) != 0 {
 		if w.Governance == nil || w.Confirmations == nil || len(runResult.ToolCalls) != 1 {
@@ -689,9 +721,6 @@ func (w RunnerExecutor) ExecuteWithLease(ctx context.Context, envelope runtime.E
 	// the next owner must be able to finish the outstanding obligations.
 	if task := taskflow.FromContext(ctx); task != nil {
 		if _, err := task.ValidateCompletion(ctx); err != nil {
-			if errors.Is(err, taskflow.ErrEvidenceRejected) {
-				return w.commitContinuationFailure(ctx, turn, envelope, head, fence, beforeCommit, modelRef, "task_evidence_rejected")
-			}
 			return err
 		}
 	}

@@ -66,7 +66,11 @@ func (g GuardedCallable) callDurable(ctx context.Context, args []byte, confirmed
 	}
 	in := toolexecution.Record{Key: toolexecution.Key{TenantID: execution.TenantID, RequestID: execution.RequestID, ToolCallID: execution.ToolCallID}, ToolID: g.Tool.ID, ToolVersion: g.Tool.Version, ArgsDigest: digest, Policy: string(policy), IdempotencyKey: key}
 	if task := taskflow.FromContext(ctx); task != nil {
-		if err := task.BeforeTool(ctx, in, canonical); err != nil {
+		var check *taskflow.ResultCheck
+		if descriptor, ok := g.Inner.(taskflow.EvidenceDescriptor); ok {
+			check = descriptor.TaskEvidenceCheck()
+		}
+		if err := task.BeforeTool(ctx, in, canonical, check); err != nil {
 			return nil, err
 		}
 	}

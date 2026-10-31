@@ -44,7 +44,7 @@ func (s *Store) Open(_ context.Context, scope taskflow.Scope, digest string, v i
 		}
 		p.Fence = scope.Fence
 	} else {
-		p = taskflow.Plan{Scope: scope, Version: 1, InputDigest: digest, KeyVersion: v, Phase: "open", Steps: []taskflow.Step{}}
+		p = taskflow.Plan{Scope: scope, Version: 1, InputDigest: digest, KeyVersion: v, Phase: "open", Steps: []taskflow.Step{}, Contract: taskflow.DefaultContract()}
 	}
 	s.plans[scope.Key] = clone(p)
 	return clone(p), nil
@@ -62,7 +62,7 @@ func (s *Store) Save(_ context.Context, scope taskflow.Scope, version int64, p t
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	old, ok := s.plans[scope.Key]
-	if !ok || old.Fence != scope.Fence || old.Version != version || old.Phase != "open" || p.Key != scope.Key || p.Fence != scope.Fence || p.InputDigest != old.InputDigest || p.KeyVersion != old.KeyVersion {
+	if !ok || old.Fence != scope.Fence || old.Version != version || (old.Phase != "open" && !(old.Phase == "sealed" && p.Phase == "failed")) || p.Key != scope.Key || p.Fence != scope.Fence || p.InputDigest != old.InputDigest || p.KeyVersion != old.KeyVersion {
 		return p, runtime.ErrVersionConflict
 	}
 	p.Version = version + 1

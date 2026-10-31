@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -33,7 +34,7 @@ type checkpointModel struct {
 	recovered bool
 }
 
-func (m *checkpointModel) GenerateContent(_ context.Context, r *model.Request) (<-chan *model.Response, error) {
+func (m *checkpointModel) GenerateContent(ctx context.Context, r *model.Request) (<-chan *model.Response, error) {
 	m.calls++
 	if _, ok := r.Tools[taskflow.ToolName]; !ok {
 		return nil, errors.New("checkpoint tool missing from SDK surface")
@@ -52,6 +53,17 @@ func (m *checkpointModel) GenerateContent(_ context.Context, r *model.Request) (
 	}
 	msg := model.NewAssistantMessage("answer: 5")
 	if command, ok := commands[m.calls]; ok {
+		p, err := taskflow.FromContext(ctx).Store.Get(ctx, taskflow.FromContext(ctx).Scope.Key)
+		if err != nil {
+			return nil, err
+		}
+		var input map[string]any
+		if err = json.Unmarshal([]byte(command), &input); err != nil {
+			return nil, err
+		}
+		input["expected_version"] = p.Version
+		encoded, _ := json.Marshal(input)
+		command = string(encoded)
 		msg = model.Message{Role: model.RoleAssistant, ToolCalls: []model.ToolCall{{ID: fmt.Sprintf("checkpoint-%d", m.calls), Type: "function", Function: model.FunctionDefinitionParam{Name: taskflow.ToolName, Arguments: []byte(command)}}}}
 	}
 	ch := make(chan *model.Response, 1)
@@ -140,5 +152,97 @@ func TestRunnerTaskCompletionGateAndFrozenRecoveryUseOriginalPlan(t *testing.T) 
 	terminal, err := sessions.GetTerminalByInputSeq(context.Background(), sessionstore.TerminalKey{SessionKey: sessionstore.SessionKey{TenantID: e.TenantID, AgentAppID: e.AgentAppID, SessionID: e.SessionID}, InputSeq: 1})
 	if err != nil || terminal.Outcome != runtime.OutcomeSucceeded || terminal.ResultRef != p.FinalRef {
 		t.Fatal(terminal, err)
+	}
+}
+
+type unplannedModel struct{ calls int }
+
+func (m *unplannedModel) GenerateContent(_ context.Context, _ *model.Request) (<-chan *model.Response, error) {
+	m.calls++
+	ch := make(chan *model.Response, 1)
+	ch <- &model.Response{ID: fmt.Sprintf("unplanned-%d", m.calls), Done: true, Choices: []model.Choice{{Message: model.NewAssistantMessage("I am done without planning.")}}}
+	close(ch)
+	return ch, nil
+}
+func (*unplannedModel) Info() model.Info { return model.Info{Name: "unplanned-model"} }
+
+func TestUnplannedTextTaskConvergesAndFailureReplySurvivesCrash(t *testing.T) {
+	ctx := context.Background()
+	e := runtime.ExecutionEnvelope{SchemaVersion: 1, TenantID: "tenant-a", TenantVersion: 1, AgentAppID: "app", AgentAppVersion: 1, AgentAppRevision: 1, AgentContentDigest: "digest", ConfigVersion: 1, PolicyVersion: 1, RequestID: "unplanned", SessionID: "session", UserID: "user", Channel: "fake", InputSeq: 1, PayloadRef: "payload://unplanned", CreatedAt: time.Now().UTC()}
+	k := profile.ExecutionProfileKey{TenantID: e.TenantID, TenantVersion: 1, AgentAppID: e.AgentAppID, AgentAppVersion: 1, AgentAppRevision: 1, ContentDigest: "digest", ConfigVersion: 1, PolicyVersion: 1}
+	snapshot := profile.ExecutionProfileSnapshot{Key: k, TenantVersion: 1, AgentAppVersion: 1, ContentDigest: "digest", AppName: "tenant-a/app", AgentKind: agentapp.AgentKindLLM, Instruction: "solve", ModelProfileRef: profile.VersionedRef{ID: "mock", Version: 1}}
+	profiles := profilememory.NewResolver(snapshot)
+	m := &unplannedModel{}
+	factory := serviceagent.Factory{Profiles: profiles, Models: staticModelResolver{model: m}, TaskPlans: true}
+	bundles := profilememory.NewBundleManager(func(ctx context.Context, _ profile.ExecutionProfileKey) (profile.RuntimeBundle, func(context.Context) error, error) {
+		root, err := factory.Build(ctx, snapshot)
+		return &serviceagent.Bundle{AppName: snapshot.AppName, Root: root}, nil, err
+	})
+	payloads := messagingmemory.New()
+	if err := payloads.PutPayload(ctx, messaging.PayloadRecord{TenantID: e.TenantID, RequestID: e.RequestID, PayloadRef: e.PayloadRef, Content: []byte(`{"text":"analyze a document, compare findings, then summarize"}`), ContentDigest: "digest", KeyVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+	plans := taskmemory.New()
+	sessions := sessionmemory.New()
+	guard := &taskRunGuard{confirmationRunGuard: confirmationRunGuard{policy: governance.PolicySnapshot{TenantID: e.TenantID, Version: 1, Policy: governance.PolicyV1{SchemaVersion: 1, DefaultAction: governance.ActionAllow}}}}
+	w := RunnerExecutor{Tasks: taskStub{envelope: e}, Profiles: profiles, Bundles: bundles, Sessions: sessions, SDKSessions: sdkmemory.NewSessionService(), Payloads: payloads, Inputs: JSONTextInputDecoder{}, TaskPlans: plans, ToolExecutions: unusedToolResults{}, Governance: guard}
+	for fence := uint64(1); fence <= 3; fence++ {
+		if err := w.ExecuteWithLease(ctx, e, fence, nil); !errors.Is(err, taskflow.ErrIncomplete) {
+			t.Fatalf("attempt %d: %v", fence, err)
+		}
+		if _, err := payloads.GetResult(ctx, e.TenantID, e.RequestID); !errors.Is(err, runtime.ErrNotFound) {
+			t.Fatal("unplanned answer frozen", err)
+		}
+	}
+	// Kill after the durable failure result, but before its terminal/outbox.
+	crash := func(ctx context.Context) error {
+		p, err := plans.Get(ctx, taskflow.Key{TenantID: e.TenantID, RequestID: e.RequestID})
+		if err == nil && p.Phase == "failed" {
+			if _, err = payloads.GetResult(ctx, e.TenantID, e.RequestID); err == nil {
+				return runtime.ErrLeaseLost
+			}
+		}
+		return nil
+	}
+	if err := w.ExecuteWithLease(ctx, e, 4, crash); !errors.Is(err, runtime.ErrLeaseLost) {
+		t.Fatal("missed failure crash boundary", err)
+	}
+	if m.calls != 3 || guard.finishes != 0 {
+		t.Fatalf("unbounded model/settlement: %d/%d", m.calls, guard.finishes)
+	}
+	if err := w.ExecuteWithLease(ctx, e, 5, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.ExecuteWithLease(ctx, e, 6, nil); err != nil {
+		t.Fatal("redelivery", err)
+	}
+	if m.calls != 3 {
+		t.Fatal("stopped task ran again")
+	}
+	p, err := plans.Get(ctx, taskflow.Key{TenantID: e.TenantID, RequestID: e.RequestID})
+	if err != nil || p.Phase != "failed" || p.FailureReason != "task_no_progress" || p.Attempts != 4 {
+		t.Fatal(p, err)
+	}
+	key := sessionstore.SessionKey{TenantID: e.TenantID, AgentAppID: e.AgentAppID, SessionID: e.SessionID}
+	terminal, err := sessions.GetTerminalByInputSeq(ctx, sessionstore.TerminalKey{SessionKey: key, InputSeq: 1})
+	if err != nil || terminal.Outcome != runtime.OutcomeFailed {
+		t.Fatal(terminal, err)
+	}
+	r, err := payloads.GetResult(ctx, e.TenantID, e.RequestID)
+	if err != nil || !strings.Contains(string(r.Content), "task_no_progress") || r.ResultRef != terminal.ResultRef {
+		t.Fatal(r, err)
+	}
+	_, outbox, _ := sessions.SnapshotEffects(key)
+	replies := 0
+	for _, event := range outbox {
+		if event.Kind == "reply" {
+			replies++
+			if event.PayloadRef != r.ResultRef {
+				t.Fatal(event)
+			}
+		}
+	}
+	if replies != 1 {
+		t.Fatalf("failure reply count=%d", replies)
 	}
 }

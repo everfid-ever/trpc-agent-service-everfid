@@ -97,8 +97,8 @@ func (s *Store) decode(ctx context.Context, k taskflow.Key, row scanner) (taskfl
 	if stored.Version != p.Version || stored.InputDigest != p.InputDigest || stored.Phase != phase || stored.FinalRef != ref {
 		return p, runtime.ErrVersionMismatch
 	}
-	p.Phase, p.FinalRef, p.Steps = phase, ref, stored.Steps
-	return p, nil
+	stored.Scope, stored.KeyVersion = p.Scope, p.KeyVersion
+	return stored, nil
 }
 
 const columns = "fence,version,input_digest,key_version,phase,COALESCE(final_ref,''),ciphertext,nonce"
@@ -113,15 +113,15 @@ func (s *Store) Open(ctx context.Context, scope taskflow.Scope, digest string, k
 	if scope.TenantID == "" || scope.RequestID == "" || scope.Fence == 0 || scope.Fence > math.MaxInt64 || len(digest) != 64 || keyVersion < 1 {
 		return taskflow.Plan{}, runtime.ErrInvalidEnvelope
 	}
-	p := taskflow.Plan{Scope: scope, Version: 1, InputDigest: digest, KeyVersion: keyVersion, Phase: "open", Steps: []taskflow.Step{}}
+	p := taskflow.Plan{Scope: scope, Version: 1, InputDigest: digest, KeyVersion: keyVersion, Phase: "open", Steps: []taskflow.Step{}, Contract: taskflow.DefaultContract()}
 	encrypted, nonce, err := s.encrypt(ctx, p)
 	if err != nil {
 		return p, err
 	}
 	// The input must still own the session's current input gate. A new runner
 	// advances the plan fence immediately, before any model/tool invocation.
-	row := s.DB.QueryRowContext(ctx, `INSERT INTO task_plan(tenant_id,request_id,fence,version,input_digest,key_version,phase,ciphertext,nonce)
-SELECT $1,$2,$3,1,$4,$5,'open',$6,$7 FROM execution_record e JOIN session_head h USING(tenant_id,agent_app_id,session_id)
+	row := s.DB.QueryRowContext(ctx, `INSERT INTO task_plan(tenant_id,request_id,fence,version,input_digest,key_version,phase,ciphertext,nonce,admission_version,checkpoint_version)
+SELECT $1,$2,$3,1,$4,$5,'open',$6,$7,1,1 FROM execution_record e JOIN session_head h USING(tenant_id,agent_app_id,session_id)
 WHERE e.tenant_id=$1 AND e.request_id=$2 AND e.input_seq=h.next_input_seq AND h.last_fence<=$3
 ON CONFLICT (tenant_id,request_id) DO UPDATE SET fence=EXCLUDED.fence,updated_at=now()
 WHERE task_plan.fence<=EXCLUDED.fence AND task_plan.input_digest=EXCLUDED.input_digest AND task_plan.key_version=EXCLUDED.key_version
@@ -133,10 +133,22 @@ RETURNING `+columns, scope.TenantID, scope.RequestID, int64(scope.Fence), digest
 	return p, err
 }
 func (s *Store) Save(ctx context.Context, scope taskflow.Scope, expected int64, p taskflow.Plan) (taskflow.Plan, error) {
-	if p.Key != scope.Key || p.Fence != scope.Fence || expected < 1 || expected == math.MaxInt64 || scope.Fence == 0 || scope.Fence > math.MaxInt64 || p.Version != expected || (p.Phase != "open" && p.Phase != "sealed") || (p.Phase == "sealed" && p.FinalRef == "") {
+	if p.Key != scope.Key || p.Fence != scope.Fence || expected < 1 || expected == math.MaxInt64 || scope.Fence == 0 || scope.Fence > math.MaxInt64 || p.Version != expected || (p.Phase != "open" && p.Phase != "sealed" && p.Phase != "failed") || (p.Phase == "sealed" && p.FinalRef == "") || (p.Phase == "failed" && (p.FailureReason == "" || p.FinalRef != "")) {
 		return p, runtime.ErrInvalidEnvelope
 	}
 	p.Version = expected + 1
+	verified := 0
+	if p.Phase == "sealed" {
+		for _, step := range p.Steps {
+			if step.State != "succeeded" {
+				return p, runtime.ErrInvariantViolation
+			}
+			verified++
+		}
+		if p.Contract.RequirePlan && verified == 0 {
+			return p, taskflow.ErrIncomplete
+		}
+	}
 	encrypted, nonce, err := s.encrypt(ctx, p)
 	if err != nil {
 		return p, err
@@ -147,8 +159,9 @@ func (s *Store) Save(ctx context.Context, scope taskflow.Scope, expected int64, 
 	}
 	defer tx.Rollback()
 	var version int64
-	err = tx.QueryRowContext(ctx, `UPDATE task_plan SET version=$5,phase=$6,final_ref=NULLIF($7,''),ciphertext=$8,nonce=$9,updated_at=now()
-WHERE tenant_id=$1 AND request_id=$2 AND fence=$3 AND version=$4 AND phase='open' AND input_digest=$10 AND key_version=$11 RETURNING version`, scope.TenantID, scope.RequestID, int64(scope.Fence), expected, p.Version, p.Phase, p.FinalRef, encrypted, nonce, p.InputDigest, p.KeyVersion).Scan(&version)
+	err = tx.QueryRowContext(ctx, `UPDATE task_plan SET version=$5,phase=$6,final_ref=NULLIF($7,''),ciphertext=$8,nonce=$9,updated_at=now(),
+admission_version=GREATEST(admission_version,$12),checkpoint_version=$5,verified_steps=$13
+WHERE tenant_id=$1 AND request_id=$2 AND fence=$3 AND version=$4 AND (phase='open' OR (phase='sealed' AND $6='failed')) AND input_digest=$10 AND key_version=$11 RETURNING version`, scope.TenantID, scope.RequestID, int64(scope.Fence), expected, p.Version, p.Phase, p.FinalRef, encrypted, nonce, p.InputDigest, p.KeyVersion, p.Contract.Version, verified).Scan(&version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, runtime.ErrVersionConflict
 	}
